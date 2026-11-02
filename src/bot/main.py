@@ -12,6 +12,7 @@
 import json
 import logging
 import os
+import time
 
 import httpx
 from dotenv import load_dotenv
@@ -33,6 +34,8 @@ BOT_SERVER_SECRET = os.environ["BOT_SERVER_SECRET"]  # 서버 .env와 같은 값
 BOT_PORT = int(os.environ.get("BOT_PORT", "3978"))
 
 _SERVER_DOWN_TEXT = "⚠️ 서버에 연결하지 못했어요. 잠시 후 다시 시도해줄래요?"
+# 서버는 작업 중이면 15초마다 ping을 보내고, 한 요청을 100초 안에 끝낸다. 그보다 오래 걸리면 서버가 멈춘 것으로 본다.
+BOT_TURN_DEADLINE_SECONDS = float(os.environ.get("BOT_TURN_DEADLINE_SECONDS", "150"))
 
 fastapi_app = FastAPI()
 adapter = FastAPIAdapter(app=fastapi_app)
@@ -59,9 +62,9 @@ _server_client: httpx.AsyncClient | None = None
 def _get_server_client() -> httpx.AsyncClient:
     global _server_client
     if _server_client is None:
-        # read 타임아웃은 "다음 이벤트가 올 때까지" 기다리는 시간이다. 노션 재귀 조회 + Groq가
-        # 겹치면 꽤 걸릴 수 있어서 넉넉히 둔다.
-        _server_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=90.0))
+        # read 타임아웃은 "다음 이벤트가 올 때까지" 기다리는 시간이다. 서버가 작업 중이면 15초마다 ping을
+        # 보내므로, 이 시간 동안 아무것도 안 오면 서버가 멈췄거나 연결이 끊긴 것이다.
+        _server_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=45.0))
     return _server_client
 
 
@@ -96,12 +99,30 @@ def _build_buttons_card(event: dict) -> AdaptiveCard:
 async def relay(ctx: ActivityContext, payload: dict) -> None:
     """서버에 한 턴을 보내고, 돌아오는 이벤트를 Teams 화면으로 옮긴다."""
     stream_open = False
+    started = time.monotonic()
 
     async def close_stream() -> None:
         nonlocal stream_open
         if stream_open:
             await ctx.stream.close()
             stream_open = False
+
+    async def tell_failure() -> None:
+        """실패를 사용자에게 꼭 알린다. 열린 스트림에 못 쓰면(만료 등) 새 메시지로 보낸다."""
+        nonlocal stream_open
+        if stream_open:
+            try:
+                ctx.stream.emit(_SERVER_DOWN_TEXT)
+                await ctx.stream.close()
+                stream_open = False
+                return
+            except Exception:
+                logging.exception("스트림으로 실패 안내를 못 보냄 — 새 메시지로 보낸다")
+                stream_open = False
+        try:
+            await ctx.send(_SERVER_DOWN_TEXT)
+        except Exception:
+            logging.exception("실패 안내 메시지도 보내지 못함")
 
     try:
         async with _get_server_client().stream(
@@ -113,6 +134,10 @@ async def relay(ctx: ActivityContext, payload: dict) -> None:
                     continue
                 event = json.loads(line)
                 kind = event.get("type")
+                if time.monotonic() - started > BOT_TURN_DEADLINE_SECONDS:
+                    raise TimeoutError("server kept the turn open too long")
+                if kind == "ping":
+                    continue  # 서버가 아직 작업 중
                 if kind == "status":
                     ctx.stream.update(event["text"])
                     stream_open = True
@@ -133,11 +158,7 @@ async def relay(ctx: ActivityContext, payload: dict) -> None:
                     await close_stream()
     except Exception:
         logging.exception("서버 전달 실패")
-        if stream_open:
-            ctx.stream.emit(_SERVER_DOWN_TEXT)
-            await close_stream()
-        else:
-            await ctx.send(_SERVER_DOWN_TEXT)
+        await tell_failure()
         return
 
     await close_stream()
