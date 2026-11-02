@@ -1,0 +1,975 @@
+{
+ "title": "Teams 봇 해부도",
+ "split_y": 4.25,
+ "layers": {
+  "bot": {
+   "name": "에코봇 (입력단)",
+   "token": "--c-entry"
+  },
+  "route": {
+   "name": "서버 교통정리",
+   "token": "--c-route"
+  },
+  "state": {
+   "name": "대화 상태",
+   "token": "--c-state"
+  },
+  "feat": {
+   "name": "기능",
+   "token": "--c-feat"
+  },
+  "store": {
+   "name": "저장소",
+   "token": "--c-store"
+  },
+  "ext": {
+   "name": "외부 서비스",
+   "token": "--c-ext"
+  },
+  "work": {
+   "name": "worklog",
+   "token": "--c-work"
+  }
+ },
+ "nodes": [
+  {
+   "id": "user",
+   "layer": "bot",
+   "pos": [
+    -1.6,
+    7.7,
+    0.4
+   ],
+   "label": "Teams 사용자",
+   "sum": "메시지를 보내거나 카드 버튼을 누르는 사람이에요. 대화형 흐름은 모두 여기서 시작해서 여기로 돌아와요.",
+   "ana": "리모컨 버튼을 누르는 손이에요.",
+   "points": [
+    "\"1\"을 텍스트로 보내든 1번 버튼을 누르든 에코봇이 똑같이 서버로 넘겨요.",
+    "사람은 이름이 아니라 aad_object_id로 구분해요. 이 값이 서버로 같이 넘어가요."
+   ],
+   "refs": [
+    "bot/main.py::_turn_payload"
+   ]
+  },
+  {
+   "id": "router",
+   "layer": "bot",
+   "pos": [
+    -1.6,
+    5.5,
+    0.4
+   ],
+   "label": "handle_message (에코봇)",
+   "sum": "에코봇은 아무것도 판단하지 않아요. 받은 걸 JSON으로 묶어 서버에 보내고, 서버가 흘려보내는 이벤트를 Teams 화면으로 옮겨요.",
+   "ana": "통역사예요. 내용은 판단하지 않고 Teams 말을 서버 말로, 서버 말을 Teams 말로 바꿔 전해요.",
+   "points": [
+    "보내는 것: kind, user(aad_id, 이름), team(id, 이름), text, value(버튼 data).",
+    "받는 것(한 줄에 JSON 하나): status → stream.update, chunk → stream.emit, message → 최종 답, buttons → 카드, done → 스트림 닫기.",
+    "상태를 하나도 들고 있지 않아서 재시작해도 잃는 게 없어요.",
+    "서버가 꺼져 있으면 \"서버에 연결하지 못했어요\"를 보여줘요."
+   ],
+   "refs": [
+    "bot/main.py::relay",
+    "bot/main.py::handle_message"
+   ]
+  },
+  {
+   "id": "turn",
+   "layer": "route",
+   "pos": [
+    -2.8,
+    2.9,
+    0.9
+   ],
+   "label": "/api/turn · handle_turn",
+   "sum": "서버의 입구이자 교통경찰이에요. 비밀값을 확인하고, 예전 handle_message가 하던 판단을 위에서부터 차례로 해요.",
+   "ana": "회사 안내데스크예요. 출입증(X-Bot-Secret)을 확인하고 \"회원가입 중이세요? 그럼 3번 창구로.\" 순서대로 물어봐요.",
+   "points": [
+    "검사 순서가 곧 우선순위예요: 카드 버튼 → 취소어 → 설정 진행 중 → 아이디 온보딩 중 → \"설정\" → 인사 → 1~4.",
+    "Turn 객체가 예전 ctx 자리를 대신해요. turn.send / turn.status / turn.chunk는 이벤트를 큐에 넣기만 해요.",
+    "처리는 별도 작업으로 돌아요. 에코봇 연결이 끊겨도 설정 저장 같은 일은 끝까지 가요.",
+    "새로 추가: 일반 대화 메시지는 라우팅 전에 worklog에 원문으로 저장해요. 메뉴 명령과 설정 답은 저장하지 않아요."
+   ],
+   "refs": [
+    "server/main.py::turn_endpoint",
+    "server/main.py::handle_turn"
+   ]
+  },
+  {
+   "id": "setup",
+   "layer": "state",
+   "pos": [
+    -6.3,
+    0.6,
+    -0.6
+   ],
+   "label": "설정 마법사",
+   "sum": "질문 7개를 하나씩 묻고, 답을 검사해서 저장하는 채팅식 설문이에요. 진행 상태(setup_sessions)는 서버 메모리에 있어요.",
+   "ana": "회원가입 폼을 한 칸씩 채팅으로 채우는 거예요. 틀리면 그 칸에 머물러요.",
+   "points": [
+    "SETUP_STEPS에 (질문, 검사 함수, 에러 문구)가 묶여 있어요. 함수 하나가 step 번호만 올리면서 7단계를 돌아요.",
+    "토큰은 형식만 보지 않고 실제 API를 호출해서 되는지 확인해요.",
+    "처음 설정한 사람(admin_aad_id)만 다시 설정할 수 있어요."
+   ],
+   "refs": [
+    "server/main.py::_handle_setup_message",
+    "server/main.py::SetupStep"
+   ]
+  },
+  {
+   "id": "onboard",
+   "layer": "state",
+   "pos": [
+    -3.8,
+    0.3,
+    2.1
+   ],
+   "label": "GitHub 아이디 묻기",
+   "sum": "3·4번이나 이슈 맡기에 GitHub 아이디가 필요한데 모르면, 원래 요청을 메모해두고 아이디부터 물어본 뒤 이어서 실행해요.",
+   "ana": "식당에서 \"주문 받아둘게요, 이름만 알려주세요\" 하고 이름을 들은 뒤 바로 주문을 넣는 거예요.",
+   "points": [
+    "메모 형태: {\"kind\": \"menu\", \"raw_text\": \"3\"} 또는 {\"kind\": \"claim\", \"issue_number\": 7}.",
+    "\"2\"처럼 숫자 한 글자가 오면 메뉴 번호 오타일 가능성이 커서 \"정말 맞아요?\"로 한 번 더 확인해요."
+   ],
+   "refs": [
+    "server/main.py::_handle_github_onboarding_message"
+   ]
+  },
+  {
+   "id": "runaction",
+   "layer": "route",
+   "pos": [
+    -0.2,
+    0.8,
+    0.6
+   ],
+   "label": "_run_action",
+   "sum": "메뉴 1~4를 실제 기능 함수에 연결하는 배전반이에요. 설정 확인 → 아이디 필요 여부 확인 → 기능 실행 → 결과 이벤트.",
+   "ana": "리모컨 신호를 받아서 TV, 에어컨, 조명 중 맞는 기계를 켜는 중계기예요.",
+   "points": [
+    "팀 설정이 없으면 \"설정하세요\"로 끝나요.",
+    "status 이벤트 다음에 오는 message는 에코봇이 같은 스트림에 채워서 \"확인하는 중...\"을 교체해요.",
+    "1번은 chunk 이벤트로 글자를 흘리고 done으로 닫아요."
+   ],
+   "refs": [
+    "server/main.py::_run_action"
+   ]
+  },
+  {
+   "id": "f1",
+   "layer": "feat",
+   "pos": [
+    -5,
+    -1.9,
+    -1.2
+   ],
+   "label": "1 팀/프로젝트 정보",
+   "sum": "팀 정보 페이지를 요약해요. Notion을 다시 읽지 않고, 등록할 때 저장해 둔 구조·원문(저장본)으로 답해요.",
+   "ana": "책을 매번 다시 읽지 않고, 책장에 꽂아 둔 복사본을 펴서 요약하는 거예요.",
+   "points": [
+    "저장본이 지난번과 같으면(해시 동일) Groq도 다시 안 불러요.",
+    "답 끝에 \"(Notion 기준 MM/DD HH:MM)\"로 언제 읽은 내용인지 붙여요.",
+    "저장본이 아직 없을 때만 한 번 Notion을 읽어요."
+   ],
+   "refs": [
+    "server/main.py::fetch_project_info",
+    "server/main.py::_summarize_snapshot"
+   ]
+  },
+  {
+   "id": "f2",
+   "layer": "feat",
+   "pos": [
+    -2.4,
+    -2,
+    1.7
+   ],
+   "label": "2 진행상황",
+   "sum": "회의 기록은 저장본에서, 이슈·커밋은 GitHub에서 가져와 완료/진행중/대기/미등록으로 나눠요.",
+   "ana": "회의록 할 일 목록을 들고 실제 작업장(GitHub)을 돌며 체크하는 감독관이에요.",
+   "points": [
+    "회의 기록 = '회의' 역할 섹션 + 설정된 회의록 페이지. 최근 수정된 것부터 8,000자까지.",
+    "분류 규칙: 이슈 번호 없음 → 미등록, closed → 완료, 커밋에 #번호 → 진행중, 나머지 → 대기.",
+    "담당자 없는 이슈는 buttons 이벤트로 보내고, 카드는 에코봇이 만들어요."
+   ],
+   "refs": [
+    "server/main.py::fetch_team_status",
+    "server/main.py::_classify_tasks_by_github_state"
+   ]
+  },
+  {
+   "id": "f3",
+   "layer": "feat",
+   "pos": [
+    0.3,
+    -2.1,
+    -1.6
+   ],
+   "label": "3 내 역할",
+   "sum": "나에게 배정된 GitHub 이슈와, 저장된 회의 기록 속 내 이름이 나온 줄을 합쳐 보여줘요.",
+   "ana": "내 사물함(GitHub)과 회의 메모(노션)를 동시에 열어보는 거예요.",
+   "points": [
+    "회의 기록은 저장본에서 찾아요(행 본문까지).",
+    "같은 #번호면 GitHub 쪽과 겹치는 줄은 빼요."
+   ],
+   "refs": [
+    "server/main.py::fetch_my_role"
+   ]
+  },
+  {
+   "id": "f4",
+   "layer": "feat",
+   "pos": [
+    2.7,
+    -1.9,
+    1.3
+   ],
+   "label": "4 완료 공유",
+   "sum": "내 이슈 중 최근 커밋에 언급된 것을 GitHub Project 보드에서 Done 칸으로 옮겨요.",
+   "ana": "\"내가 맡은 일\"과 \"최근에 손댄 일\"이 겹치는 것만 골라 완료 도장을 찍어요.",
+   "points": [
+    "핵심은 집합 교집합 한 줄이에요: my_issue_numbers & touched_numbers.",
+    "Project 보드는 REST API가 없어서 GraphQL 3단계예요: Status 필드 찾기 → 보드 아이템 찾기 → 값 바꾸기."
+   ],
+   "refs": [
+    "server/main.py::share_completed_work"
+   ]
+  },
+  {
+   "id": "claim",
+   "layer": "feat",
+   "pos": [
+    5.1,
+    -1.7,
+    -0.4
+   ],
+   "label": "이슈 맡기",
+   "sum": "담당자 없는 이슈 버튼을 누르면 나를 담당자로 지정해요.",
+   "ana": "빈 의자에 앉기 전에, 진짜 비어 있는지 다시 한번 눈으로 확인해요.",
+   "points": [
+    "직전에 캐시 없이 이슈를 다시 조회해요. 두 사람이 동시에 눌러도 중복 배정을 막기 위해서예요.",
+    "이미 담당자가 있으면 거절하고 이름을 알려줘요."
+   ],
+   "refs": [
+    "server/main.py::claim_issue"
+   ]
+  },
+  {
+   "id": "cfg",
+   "layer": "store",
+   "pos": [
+    -4.8,
+    -4.4,
+    0.8
+   ],
+   "label": "team_configs.json",
+   "sum": "팀마다(또는 1:1 채팅 상대마다) 연결 정보를 넣어두는 서랍이에요. 이제 서버만 이 파일을 읽어요.",
+   "ana": "팀별로 이름표가 붙은 서랍장이에요. 서랍 이름은 \"team:팀ID\" 또는 \"user:사람ID\".",
+   "points": [
+    "서랍 이름은 에코봇이 보낸 team과 user로 서버가 만들어요.",
+    "서랍이 비어 있으면 None을 돌려줘요. 남의 서랍을 빌려 쓰지 않아요."
+   ],
+   "warn": "토큰이 평문으로 저장돼요. 이 파일은 git에 올리면 안 돼요.",
+   "refs": [
+    "server/main.py::_get_config",
+    "server/main.py::_load_team_configs"
+   ]
+  },
+  {
+   "id": "mem",
+   "layer": "store",
+   "pos": [
+    -1.4,
+    -4.6,
+    -1.3
+   ],
+   "label": "member_profiles.json",
+   "sum": "사람마다 GitHub 아이디 하나. 팀과 상관없이 한 사람당 하나만 저장해요.",
+   "ana": "사원증이에요. 어느 팀 회의에 가든 같은 사원증을 써요.",
+   "points": [
+    "키는 aad_object_id, 값은 {\"github_id\": \"...\"}.",
+    "설정 마법사 3단계와 아이디 온보딩 두 곳에서 채워요."
+   ],
+   "refs": [
+    "server/main.py::_get_github_id",
+    "server/main.py::_set_github_id"
+   ]
+  },
+  {
+   "id": "cache",
+   "layer": "store",
+   "pos": [
+    2.2,
+    -4.4,
+    1.5
+   ],
+   "label": "캐시",
+   "sum": "비싸거나 잘 안 바뀌는 결과를 서버 메모리에 잠깐 보관해요. 정확해야 하는 값은 넣지 않아요.",
+   "ana": "자주 찾는 서류를 책상 위에 꺼내두는 거예요. 서버를 재시작하면 다 치워져요.",
+   "points": [
+    "시간 기준: 이슈·커밋 목록은 30초만 보관해요. 키에 토큰 지문도 넣어서 팀끼리 섞이지 않아요.",
+    "내용 기준: 회의록은 해시, 노션 페이지는 수정 시각이 같을 때만 재사용해요.",
+    "사실상 영구: Project 보드 구조와 아이템 ID."
+   ],
+   "refs": [
+    "server/main.py::_github_get_cached"
+   ]
+  },
+  {
+   "id": "wlstore",
+   "layer": "store",
+   "pos": [
+    7,
+    -4.8,
+    1.8
+   ],
+   "label": "worklog.sqlite3 · 저장본",
+   "sum": "원문, 섹션 지도, Task·Decision, 변경 후보, 이력이 이 파일 하나에 쌓여요. 메뉴 1~3도 Notion 대신 여기서 읽어요.",
+   "ana": "원본 서류함, 확정 장부, 결재 대기함, 결재 기록부를 한 캐비닛에 넣은 거예요.",
+   "points": [
+    "source_pages·source_sections: 페이지 구조 지문과 섹션별 역할.",
+    "sources·work_records: 원문과 분석 대기열(같은 위치 옛 버전은 superseded).",
+    "snapshot(): 1번용 팀 정보 / meeting_notes(): 2·3번용 회의 기록.",
+    "change_candidates·revisions: 판정 후보와 승인 이력."
+   ],
+   "warn": "팀 대화 원문이 평문으로 쌓여요. 보관 기간과 접근 권한을 정해야 해요.",
+   "refs": [
+    "server/worklog/sections.py::snapshot",
+    "server/worklog/sections.py::meeting_notes",
+    "server/worklog/db.py::initialize"
+   ]
+  },
+  {
+   "id": "notion",
+   "layer": "ext",
+   "pos": [
+    -3.7,
+    -7,
+    0.2
+   ],
+   "label": "Notion API",
+   "sum": "Notion 페이지는 블록 나무예요. 읽기 함수들이 여기 모여 있고, 모든 호출은 Notion 관문을 지나요.",
+   "ana": "폴더 안의 폴더를 끝까지 열어보는 탐색기예요. 다만 바로가기(하위 페이지)는 안 열어요.",
+   "points": [
+    "has_more·next_cursor로 마지막 장까지 넘겨요.",
+    "형제 블록은 단계당 3개씩 동시에 읽고, 순서는 유지돼요.",
+    "child_page는 안으로 들어가지 않고 제목만 써요."
+   ],
+   "refs": [
+    "server/notion_read.py::_fetch_notion_page_by_id",
+    "server/notion_read.py::_block_text"
+   ]
+  },
+  {
+   "id": "gate",
+   "layer": "ext",
+   "pos": [
+    -7.4,
+    -5.4,
+    -1.8
+   ],
+   "label": "Notion 관문",
+   "sum": "모든 Notion 호출이 지나는 토큰별 관문이에요. 한도(초당 약 3회)를 넘지 않게 줄 세우고, 백그라운드 수집보다 사용자 요청을 먼저 보내요.",
+   "ana": "은행 창구 번호표예요. 창구는 3개, 대량 업무(수집)는 1개 창구만 쓰게 해요.",
+   "points": [
+    "토큰별 초당 3회·동시 3개.",
+    "백그라운드는 초당 1회까지만, 몰아 쏘지 않고 고르게.",
+    "관문 없이 동시에 쏘면 429로 수십 초씩 늦어졌어요."
+   ],
+   "refs": [
+    "server/notion_read.py::notion_client_for",
+    "server/notion_read.py::_Gate"
+   ]
+  },
+  {
+   "id": "groq",
+   "layer": "ext",
+   "pos": [
+    0,
+    -7.2,
+    -1
+   ],
+   "label": "Groq LLM",
+   "sum": "글을 요약하거나(1번) 회의록을 확정/미정으로 나눠요(2번).",
+   "ana": "글 잘 쓰는 비서예요. 연락이 안 되면 원문을 그대로 건네서 일이 멈추지는 않아요.",
+   "points": [
+    "1번 요약은 스트리밍이에요. Groq 조각 → turn.chunk → 에코봇 → 화면 순서로 흘러가요.",
+    "실패하면 원문이나 빈 결과로 폴백해요."
+   ],
+   "refs": [
+    "server/main.py::_summarize_project_info",
+    "server/worklog_bridge.py::groq_extract",
+    "server/worklog_bridge.py::groq_classify_sections"
+   ]
+  },
+  {
+   "id": "github",
+   "layer": "ext",
+   "pos": [
+    3.7,
+    -7,
+    0.6
+   ],
+   "label": "GitHub API",
+   "sum": "이슈·커밋 조회(REST), 담당자 지정(PATCH), Project 보드 변경(GraphQL)을 맡아요.",
+   "ana": "작업장 그 자체예요. 서버는 여기서 일이 어떻게 됐는지 보고, 가끔 도장을 찍어요.",
+   "points": [
+    "AsyncClient 하나를 계속 재사용하고, 서버 종료 때 닫아요.",
+    "GraphQL은 에러가 나도 HTTP 200이 와요. 그래서 errors 필드를 직접 확인해요."
+   ],
+   "refs": [
+    "server/main.py::_github_graphql",
+    "server/main.py::_github_get"
+   ]
+  },
+  {
+   "id": "loop",
+   "layer": "work",
+   "pos": [
+    9.2,
+    1.6,
+    -1
+   ],
+   "label": "_worklog_loop",
+   "sum": "서버가 켜지고 60초 뒤부터 도는 백그라운드 작업이에요. 1시간마다 Notion 지도를 맞추고, 5분마다 분석할 묶음을 확인해요.",
+   "ana": "1분마다 우편함을 확인하는 당번이에요. 편지가 충분히 모였거나 한동안 새 편지가 없으면 정리를 시작해요.",
+   "points": [
+    "Notion 수집은 관문의 백그라운드 몫(초당 1회)만 써서 메뉴 응답을 막지 않아요.",
+    "분석 확인은 로컬 DB 조회뿐이라 비용이 없어요.",
+    "WORKLOG_LOOP=0으로 끌 수 있어요."
+   ],
+   "refs": [
+    "server/main.py::_worklog_loop",
+    "server/main.py::_sync_notion_maps"
+   ]
+  },
+  {
+   "id": "bridge",
+   "layer": "work",
+   "pos": [
+    8.4,
+    -1.4,
+    1.6
+   ],
+   "label": "worklog_bridge",
+   "sum": "main.py와 worklog 패키지 사이 연결부예요. 원문 저장 호출, Groq 프롬프트, 분석 주기 같은 설정이 여기 모여 있어요.",
+   "ana": "통역 겸 비서예요. worklog는 Groq나 Teams를 모르고, 이 파일이 대신 전화를 걸어줘요.",
+   "points": [
+    "record(): 원문 한 건 저장. 실패해도 봇 응답을 막지 않아요.",
+    "groq_extract / groq_judge: 항목 뽑기와 기존 항목 비교.",
+    "groq_classify_sections: 새로 생긴 섹션의 역할 판정(내용 앞부분까지 보고).",
+    "team_snapshot / meeting_notes: 메뉴 1~3이 쓰는 저장본."
+   ],
+   "refs": [
+    "server/worklog_bridge.py::analyze_due",
+    "server/worklog_bridge.py::record"
+   ]
+  },
+  {
+   "id": "nmap",
+   "layer": "work",
+   "pos": [
+    7.0,
+    0.2,
+    -2.6
+   ],
+   "label": "notion_map · 구조 지도",
+   "sum": "팀 정보·회의록 페이지를 큰 제목 단위 섹션으로 나눠 지도로 저장하고, 지도대로 바뀐 곳만 읽어 원문으로 쌓아요.",
+   "ana": "건물 안내도를 한 번 그려두고, 매번은 문패(수정 시각)만 확인하는 경비원이에요.",
+   "points": [
+    "접근마다 수정 시각 → (바뀌었으면) 구조 지문만 비교. 다를 때만 그 페이지를 다시 스캔.",
+    "제목 아래 글·하위 페이지·인라인 DB·전체 DB·머리말을 각각 맞게 읽어요.",
+    "새 섹션 역할은 LLM이 내용을 보고 판정, 애매하면 보관만.",
+    "회의록이 팀 정보 안에 있으면 다시 읽지 않아요."
+   ],
+   "refs": [
+    "server/notion_map.py::sync_roots",
+    "server/notion_map.py::sync",
+    "server/notion_map.py::scan_page"
+   ]
+  },
+  {
+   "id": "wlcore",
+   "layer": "work",
+   "pos": [
+    10.6,
+    -3.8,
+    -0.4
+   ],
+   "label": "worklog/core.py",
+   "sum": "새 기능의 본체예요. 원문을 묶어 분석하고, 기존 Task·Decision과 비교해서 변경 후보를 만들고, 승인되면 반영해요. Teams·Notion·Groq는 몰라요.",
+   "ana": "서류 심사관이에요. 판단 초안(후보)은 만들지만 도장은 사람이 찍어야 해요.",
+   "points": [
+    "분석 정책: 15분 조용함, 또는 20개 메시지·3,000토큰이 쌓이면 분석해요.",
+    "질문·의견·미확정 결정은 빼고, 목표·범위·아키텍처·예산·일정이거나 Task 2개 이상에 영향을 주는 결정만 올려요.",
+    "변경 유형: unchanged / supplementary / proposed / conflicting / superseding.",
+    "모든 후보에 원문 인용과 비교 대상 ID가 남아요. 승인 전에는 Task·Decision이 그대로예요."
+   ],
+   "refs": [
+    "server/worklog/core.py::analyze_batch",
+    "server/worklog/core.py::approve",
+    "server/worklog/core.py::due_batches"
+   ]
+  },
+  {
+   "id": "approver",
+   "layer": "work",
+   "pos": [
+    11.8,
+    -0.6,
+    1.4
+   ],
+   "label": "사람 · python -m worklog",
+   "sum": "사람이 하는 일은 두 가지예요. 변경 후보를 승인·거절하고, 판정이 틀린 섹션 역할만 고쳐요.",
+   "ana": "결재권자예요. 승인하면 이름이 결재 기록에 남아요.",
+   "points": [
+    "approve/reject: 승인하면 Task·Decision이 바뀌고 이력에 이름이 남아요.",
+    "map: 섹션별 역할 보기 / map-set: 역할 바꾸기(이름으로 지정, 한국어 역할명).",
+    "trace: 원문까지 거슬러 보기."
+   ],
+   "refs": [
+    "server/worklog/__main__.py::main"
+   ]
+  }
+ ],
+ "scenarios": [
+  {
+   "id": "relay",
+   "name": "에코봇 왕복",
+   "desc": "모든 흐름에 공통인 바깥 고리예요. 이것부터 보면 분리 구조가 잡혀요.",
+   "steps": [
+    {
+     "node": "user",
+     "text": "아무 메시지나 보내요."
+    },
+    {
+     "node": "router",
+     "text": "에코봇은 판단하지 않아요. aad_id·이름·팀·텍스트·버튼 값을 JSON 하나로 묶어 서버 /api/turn에 POST해요."
+    },
+    {
+     "node": "turn",
+     "text": "서버가 X-Bot-Secret을 확인하고 Turn 객체를 만들어요. 처리는 별도 작업으로 돌고, 결과는 큐에 이벤트로 쌓여요."
+    },
+    {
+     "node": "router",
+     "from": "turn",
+     "text": "서버가 이벤트를 한 줄씩 흘려보내요. 에코봇은 status → \"확인하는 중\" 표시, chunk → 글자 이어붙이기, message → 최종 답, buttons → 카드로 옮겨요."
+    },
+    {
+     "node": "user",
+     "text": "사용자는 분리 전과 똑같은 화면을 봐요. 서버가 꺼져 있으면 \"서버에 연결하지 못했어요\"가 떠요."
+    }
+   ]
+  },
+  {
+   "id": "s1",
+   "name": "1번 팀 정보",
+   "desc": "Notion을 다시 읽지 않고 저장본으로 답하는 흐름이에요.",
+   "steps": [
+    {
+     "node": "user",
+     "text": "\"1\"을 누르거나 보내요."
+    },
+    {
+     "node": "router",
+     "text": "서버로 넘겨요."
+    },
+    {
+     "node": "turn",
+     "text": "메뉴 선택이에요. _run_action으로 보내요."
+    },
+    {
+     "node": "runaction",
+     "text": "fetch_project_info에 turn.status와 turn.chunk를 넘겨요."
+    },
+    {
+     "node": "f1",
+     "text": "저장본을 찾아요."
+    },
+    {
+     "node": "wlstore",
+     "text": "팀 정보 페이지 섹션들의 최신 원문을 페이지 순서대로 엮어요(snapshot). Notion 호출 0회."
+    },
+    {
+     "node": "groq",
+     "from": "f1",
+     "text": "원문이 지난번과 다를 때만 요약해요. 조각마다 chunk로 흘려요."
+    },
+    {
+     "node": "router",
+     "from": "groq",
+     "text": "에코봇이 stream.emit으로 화면에 붙여요."
+    },
+    {
+     "node": "user",
+     "text": "요약과 \"(Notion 기준 시각)\"을 받아요."
+    }
+   ]
+  },
+  {
+   "id": "s2",
+   "name": "2번 진행상황",
+   "desc": "가장 많은 부품을 지나가는 흐름이에요.",
+   "steps": [
+    {
+     "node": "user",
+     "text": "\"2️⃣ 진행상황 조회\" 버튼을 눌러요."
+    },
+    {
+     "node": "router",
+     "text": "버튼 data를 value에 실어 서버로 보내요."
+    },
+    {
+     "node": "turn",
+     "text": "value의 action이 \"menu\"예요."
+    },
+    {
+     "node": "runaction",
+     "text": "\"🔍 진행상황을 확인하는 중...\"을 먼저 보내요."
+    },
+    {
+     "node": "f2",
+     "from": "runaction",
+     "text": "fetch_team_status가 시작돼요."
+    },
+    {
+     "node": [
+      "wlstore",
+      "github"
+     ],
+     "from": "f2",
+     "text": "회의 기록은 저장본에서, 이슈 목록은 GitHub에서 동시에 가져와요."
+    },
+    {
+     "node": "groq",
+     "from": "f2",
+     "text": "회의 기록을 [확정]/[미정]으로 나눠요(같으면 캐시)."
+    },
+    {
+     "node": "github",
+     "from": "f2",
+     "text": "최근 커밋에서 #번호를 모아요."
+    },
+    {
+     "node": "f2",
+     "from": "github",
+     "text": "완료/진행중/대기/미등록으로 나눠요."
+    },
+    {
+     "node": "router",
+     "from": "f2",
+     "text": "결과와 \"맡기\" 버튼 카드가 에코봇으로 가요."
+    },
+    {
+     "node": "user",
+     "text": "결과를 받아요."
+    }
+   ]
+  },
+  {
+   "id": "s3",
+   "name": "3번, 아이디 모를 때",
+   "desc": "요청을 잠깐 멈췄다가 이어서 실행하는 흐름이에요.",
+   "steps": [
+    {
+     "node": "user",
+     "text": "\"3\"을 보내요."
+    },
+    {
+     "node": "router",
+     "text": "서버로 넘겨요."
+    },
+    {
+     "node": "turn",
+     "text": "1~4 중 하나예요. _run_action으로 보내요."
+    },
+    {
+     "node": "runaction",
+     "text": "3번은 GitHub 아이디가 필요해요."
+    },
+    {
+     "node": "mem",
+     "text": "사원증 파일에 아이디가 없어요."
+    },
+    {
+     "node": "onboard",
+     "from": "runaction",
+     "text": "원래 요청 {\"kind\": \"menu\", \"raw_text\": \"3\"}을 메모하고 아이디를 물어봐요."
+    },
+    {
+     "node": "router",
+     "from": "onboard",
+     "text": "질문이 에코봇을 거쳐 사용자에게 가요."
+    },
+    {
+     "node": "user",
+     "text": "\"thdwlndjs\"라고 답해요."
+    },
+    {
+     "node": "router",
+     "text": "다시 서버로 넘겨요."
+    },
+    {
+     "node": "turn",
+     "text": "온보딩 진행 중이에요. 서버 교통정리 4순위."
+    },
+    {
+     "node": "onboard",
+     "text": "형식 검사 통과. 메모를 지우고 아이디를 저장해요."
+    },
+    {
+     "node": "mem",
+     "text": "사원증 파일에 기록돼요."
+    },
+    {
+     "node": "runaction",
+     "from": "onboard",
+     "text": "메모해둔 \"3\"을 그대로 다시 실행해요."
+    },
+    {
+     "node": "f3",
+     "text": "fetch_my_role이 시작돼요."
+    },
+    {
+     "node": [
+      "github",
+      "wlstore"
+     ],
+     "text": "배정된 이슈(GitHub)와 저장된 회의 기록을 동시에 가져와요."
+    },
+    {
+     "node": "runaction",
+     "from": "f3",
+     "text": "결과를 message 이벤트로 보내요."
+    },
+    {
+     "node": "router",
+     "text": "에코봇이 스트림에 채워 넣어요."
+    },
+    {
+     "node": "user",
+     "text": "내 이슈와 회의록 언급을 받아요."
+    }
+   ]
+  },
+  {
+   "id": "setup",
+   "name": "처음 설정",
+   "desc": "'설정'이라고 보낸 순간부터 저장될 때까지예요.",
+   "steps": [
+    {
+     "node": "user",
+     "text": "\"설정\"이라고 보내요."
+    },
+    {
+     "node": "router",
+     "text": "서버로 넘겨요."
+    },
+    {
+     "node": "turn",
+     "text": "\"설정\" → _start_setup."
+    },
+    {
+     "node": "setup",
+     "text": "질문을 하나씩 보내고 답을 검사해요."
+    },
+    {
+     "node": "github",
+     "from": "setup",
+     "text": "GitHub 토큰은 실제로 호출해서 확인해요."
+    },
+    {
+     "node": "gate",
+     "from": "setup",
+     "text": "노션 페이지 접근 확인도 관문을 지나요."
+    },
+    {
+     "node": "nmap",
+     "from": "setup",
+     "text": "팀 정보·회의록 페이지를 등록하는 순간 백그라운드로 지도와 원문을 만들어요. 마법사는 기다리지 않아요."
+    },
+    {
+     "node": "wlstore",
+     "from": "nmap",
+     "text": "구조와 원문이 저장돼요. 이후 메뉴 1~3이 이걸 써요."
+    },
+    {
+     "node": "cfg",
+     "from": "setup",
+     "text": "7단계가 끝나면 팀 설정을 저장해요."
+    },
+    {
+     "node": "user",
+     "from": "setup",
+     "text": "\"✅ 설정 완료\"를 받아요."
+    }
+   ]
+  },
+  {
+   "id": "wl-record",
+   "name": "원문 저장",
+   "desc": "일반 대화 메시지가 응답과 별개로 worklog에 쌓이는 흐름이에요.",
+   "steps": [
+    {
+     "node": "user",
+     "text": "팀 채널에서 \"배포는 금요일로 확정했어요\"라고 보내요."
+    },
+    {
+     "node": "router",
+     "text": "에코봇이 대화 ID, 메시지 ID, 보낸 시각을 함께 실어 서버로 넘겨요."
+    },
+    {
+     "node": "turn",
+     "text": "메뉴 번호도, \"설정\"도, 설정 마법사 답도 아니에요. 팀 기록으로 남길 메시지예요."
+    },
+    {
+     "node": "bridge",
+     "from": "turn",
+     "text": "응답하기 전에 record()로 원문을 넘겨요. 실패해도 봇 응답은 막지 않아요."
+    },
+    {
+     "node": "wlstore",
+     "text": "sources에 원문을 저장하고 work_records에 분석 대기로 올려요. 같은 메시지가 다시 와도 한 번만 저장돼요."
+    },
+    {
+     "node": "turn",
+     "from": "wlstore",
+     "text": "그다음은 예전과 똑같이 라우팅해요."
+    },
+    {
+     "node": "router",
+     "text": "응답 이벤트를 에코봇이 받아요."
+    },
+    {
+     "node": "user",
+     "text": "사용자가 보는 응답은 바뀌지 않아요."
+    }
+   ]
+  },
+  {
+   "id": "wl-analyze",
+   "name": "분석 → 변경 후보",
+   "desc": "AI 판단이 후보로만 남고 Task·Decision은 그대로인 흐름이에요.",
+   "steps": [
+    {
+     "node": "loop",
+     "text": "1시간마다 Notion 지도를 맞춰요."
+    },
+    {
+     "node": "nmap",
+     "text": "페이지마다 수정 시각만 확인하고, 바뀐 페이지만 구조 지문을 비교해요."
+    },
+    {
+     "node": "gate",
+     "from": "nmap",
+     "text": "호출은 관문의 백그라운드 몫(초당 1회)으로만 나가요."
+    },
+    {
+     "node": "notion",
+     "from": "gate",
+     "text": "바뀐 섹션·하위 페이지·DB 행만 본문까지 읽어요."
+    },
+    {
+     "node": "wlstore",
+     "from": "nmap",
+     "text": "원문으로 쌓여요. 같은 행 옛 버전은 superseded."
+    },
+    {
+     "node": "wlcore",
+     "from": "loop",
+     "text": "5분마다: 대화 60분 조용함 / Notion 수정 후 2시간 / 20개·3,000토큰 조건을 봐요."
+    },
+    {
+     "node": "bridge",
+     "from": "wlcore",
+     "text": "extract 콜백을 불러요."
+    },
+    {
+     "node": "groq",
+     "from": "bridge",
+     "text": "task·decision·progress·opinion·question을 뽑아요."
+    },
+    {
+     "node": "wlcore",
+     "from": "groq",
+     "text": "질문·의견·미확정 결정을 빼고 기존 항목과 비교해요."
+    },
+    {
+     "node": "wlstore",
+     "from": "wlcore",
+     "text": "변경 후보로만 저장해요. Task·Decision은 그대로예요."
+    }
+   ]
+  },
+  {
+   "id": "wl-approve",
+   "name": "승인 → 반영",
+   "desc": "사람이 승인해야만 Task·Decision이 바뀌는 흐름이에요.",
+   "steps": [
+    {
+     "node": "approver",
+     "text": "python -m worklog candidates로 대기 중인 후보와 근거, 영향받을 Task를 봐요."
+    },
+    {
+     "node": "wlcore",
+     "from": "approver",
+     "text": "approve: 후보가 pending인지, 비교했던 항목이 그사이 바뀌지 않았는지 확인해요."
+    },
+    {
+     "node": "wlstore",
+     "from": "wlcore",
+     "text": "결정 대체라면 기존 결정을 superseded로 바꾸고 새 결정을 만들어요. 영향 Task도 새 결정에 다시 연결해요."
+    },
+    {
+     "node": "wlcore",
+     "from": "wlstore",
+     "text": "revisions에 승인자 이름과 사유가 남아요. 후보에 붙어 있던 원문 근거도 새 항목에 연결돼요."
+    },
+    {
+     "node": "approver",
+     "from": "wlcore",
+     "text": "영향받는 Task 목록을 돌려받아요. trace로 원문까지 거슬러 볼 수 있어요."
+    }
+   ]
+  }
+ ],
+ "edges": [
+  [
+   "claim",
+   "github"
+  ],
+  [
+   "f4",
+   "github"
+  ],
+  [
+   "turn",
+   "claim"
+  ],
+  [
+   "runaction",
+   "f4"
+  ],
+  [
+   "f4",
+   "cache"
+  ],
+  [
+   "user",
+   "router"
+  ],
+  [
+   "loop",
+   "bridge"
+  ],
+  [
+   "gate",
+   "notion"
+  ],
+  [
+   "nmap",
+   "gate"
+  ]
+ ],
+ "_help": "사람이 쓰는 부분입니다. refs는 '경로 끝부분::함수·클래스 이름' 형식이고, build.py가 코드 조각·줄 링크·호출 연결선을 채웁니다."
+}

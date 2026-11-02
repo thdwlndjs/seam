@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Teams 봇 해부도</title>
+<meta name="description" content="Teams 봇 코드의 부품과 요청 흐름을 3D로 보는 해부도. 저장소에 푸시할 때마다 코드에서 다시 만들어진다.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+html{-webkit-text-size-adjust:100%}
+body{margin:0}
+/* 레이아웃: 상단 제목+층 범례, 아래 [3D 실험대 | 설명 패널] 2단 — 900px 이하에선 1단으로 쌓는다 */
+:root{
+  --bg:#eef1f5; --surface:#ffffff; --surface-2:#f5f7fa; --fg:#172031; --muted:#59647a; --line:#c4ccd8;
+  --accent:#2457d6; --accent-ink:#ffffff;
+  --c-entry:#d0502c; --c-route:#2457d6; --c-state:#8a4fd1; --c-feat:#0c8a74; --c-store:#a37206; --c-ext:#5a6a82; --c-work:#b5306c;
+  --font-body:"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#10151f; --surface:#171e2b; --surface-2:#1d2533; --fg:#e5eaf2; --muted:#9aa5b8; --line:#2e394c;
+    --accent:#7aa2ff; --accent-ink:#0d1320;
+    --c-entry:#ff8866; --c-route:#7aa2ff; --c-state:#bb8fff; --c-feat:#3fd0b2; --c-store:#e6b649; --c-ext:#97a7c0; --c-work:#ff7fb5;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#10151f; --surface:#171e2b; --surface-2:#1d2533; --fg:#e5eaf2; --muted:#9aa5b8; --line:#2e394c;
+  --accent:#7aa2ff; --accent-ink:#0d1320;
+  --c-entry:#ff8866; --c-route:#7aa2ff; --c-state:#bb8fff; --c-feat:#3fd0b2; --c-store:#e6b649; --c-ext:#97a7c0; --c-work:#ff7fb5;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{
+  background:var(--bg); color:var(--fg); font-family:var(--font-body); font-size:15px; line-height:1.6;
+  padding-left:max(16px, env(safe-area-inset-left, 0px));
+  padding-right:max(16px, env(safe-area-inset-right, 0px));
+  padding-block:20px 36px;
+}
+.wrap{max-width:1380px; margin:0 auto; display:flex; flex-direction:column; gap:16px}
+header{display:flex; flex-direction:column; gap:8px}
+.eyebrow{font:600 12px/1 var(--font-mono); letter-spacing:.06em; color:var(--muted)}
+h1{margin:0; font-size:clamp(1.55rem, 1.1rem + 1.6vw, 2.25rem); line-height:1.2; letter-spacing:-.025em; font-weight:700; text-wrap:balance}
+.lede{margin:0; max-width:68ch; color:var(--muted)}
+.layers{display:flex; flex-wrap:wrap; align-items:center; gap:6px 4px; font-size:13px; margin-top:4px}
+.layers span{display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px; background:var(--surface); border:1px solid var(--line)}
+.layers span i{width:9px; height:9px; border-radius:50%; background:var(--dot)}
+.layers b{color:var(--muted); font-weight:400; padding:0 2px}
+
+.app{display:grid; grid-template-columns:minmax(0,1.45fr) minmax(0,1fr); gap:16px; align-items:start}
+@media (max-width:900px){ .app{grid-template-columns:minmax(0,1fr)} }
+
+.stage{position:relative; height:clamp(400px,76vh,800px); border:1px solid var(--line); border-radius:14px; overflow:hidden; background:var(--bg)}
+@media (max-width:900px){ .stage{height:clamp(360px,62vh,560px)} }
+#c{display:block; width:100%; height:100%; touch-action:none; cursor:grab}
+#c.grabbing{cursor:grabbing}
+#c.hovering{cursor:pointer}
+.labels{position:absolute; inset:0; pointer-events:none; overflow:hidden}
+.lbl{
+  position:absolute; left:0; top:0; pointer-events:auto; cursor:pointer;
+  display:inline-flex; align-items:center; gap:6px; white-space:nowrap;
+  font:500 12px/1.2 var(--font-body); color:var(--fg);
+  background:var(--surface); border:1px solid var(--line); border-radius:999px; padding:3px 9px 3px 7px;
+  transition:opacity .25s, border-color .2s;
+}
+.lbl i{width:8px; height:8px; border-radius:50%; background:var(--dot); flex:none}
+.lbl.dim{opacity:.32}
+.lbl.on{border-color:var(--dot); box-shadow:0 0 0 2px color-mix(in srgb, var(--dot) 28%, transparent)}
+.lbl:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.hint{position:absolute; left:10px; bottom:10px; font-size:12px; color:var(--muted); background:color-mix(in srgb, var(--surface) 85%, transparent); border:1px solid var(--line); padding:4px 10px; border-radius:8px; pointer-events:none}
+.split-lbl{position:absolute; left:0; top:0; display:flex; flex-direction:column; gap:2px; font:600 11px/1.2 var(--font-mono); color:var(--c-entry); pointer-events:none; white-space:nowrap}
+.fallback{position:absolute; inset:0; display:grid; place-items:center; padding:24px; text-align:center; color:var(--muted)}
+
+.panel{display:flex; flex-direction:column; gap:14px; min-width:0}
+.box{background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:16px 18px; display:flex; flex-direction:column; gap:12px; min-width:0}
+.box-title{font:600 12px/1 var(--font-mono); letter-spacing:.06em; color:var(--muted)}
+.chips{display:flex; flex-wrap:wrap; gap:6px}
+.chip{font:500 13px/1.2 var(--font-body); color:var(--fg); background:var(--surface-2); border:1px solid var(--line); border-radius:999px; padding:7px 12px; cursor:pointer}
+.chip:hover{border-color:var(--accent)}
+.chip[aria-pressed="true"]{background:var(--accent); color:var(--accent-ink); border-color:var(--accent)}
+.chip:focus-visible,.btn:focus-visible,.dot:focus-visible,.nb:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.sc-desc{margin:0; font-size:14px; color:var(--muted)}
+.caption{border-left:3px solid var(--step, var(--accent)); padding:2px 0 2px 12px; min-height:6.2em; display:flex; flex-direction:column; gap:4px}
+.caption .meta{font:12px/1.3 var(--font-mono); color:var(--muted); font-variant-numeric:tabular-nums}
+.caption .who{font-weight:600}
+.caption p{margin:0}
+.controls{display:flex; flex-wrap:wrap; align-items:center; gap:8px}
+.btn{font:600 13px/1 var(--font-body); color:var(--fg); background:var(--surface-2); border:1px solid var(--line); border-radius:9px; padding:9px 14px; cursor:pointer}
+.btn:hover{border-color:var(--fg)}
+.btn.primary{background:var(--fg); color:var(--bg); border-color:var(--fg); min-width:84px}
+.btn:disabled{opacity:.4; cursor:default}
+.dots{display:flex; flex-wrap:wrap; gap:4px}
+.dot{width:20px; height:6px; border-radius:3px; border:0; padding:0; background:var(--line); cursor:pointer}
+.dot.done{background:color-mix(in srgb, var(--accent) 45%, var(--line))}
+.dot.now{background:var(--accent)}
+
+.card .layer{display:inline-flex; align-items:center; gap:6px; font:600 12px/1 var(--font-mono); color:var(--muted)}
+.card .layer i{width:9px; height:9px; border-radius:50%; background:var(--dot)}
+.card h2{margin:0; font-size:1.4rem; line-height:1.25; letter-spacing:-.015em; text-wrap:balance}
+.code-name{font:13px/1.4 var(--font-mono); color:var(--muted); overflow-wrap:anywhere}
+.sum{margin:0; font-size:1rem}
+.analogy{background:var(--surface-2); border-radius:10px; padding:10px 12px; font-size:14px}
+.analogy b{display:block; font:600 11px/1 var(--font-mono); color:var(--muted); margin-bottom:6px; letter-spacing:.05em}
+.points{margin:0; padding-left:1.15em; display:flex; flex-direction:column; gap:6px; font-size:14.5px}
+.points li::marker{color:var(--dot)}
+pre{margin:0; overflow-x:auto; background:var(--surface-2); border:1px solid var(--line); border-radius:10px; padding:12px 14px; font:12.5px/1.6 var(--font-mono); color:var(--fg)}
+.warn{font-size:14px; padding:10px 12px; border-radius:10px; border:1px dashed var(--c-entry); color:var(--fg)}
+.warn b{color:var(--c-entry)}
+.nbs{display:flex; flex-wrap:wrap; gap:6px}
+.nb{font:500 12px/1.2 var(--font-body); color:var(--fg); background:transparent; border:1px solid var(--line); border-radius:999px; padding:5px 10px 5px 8px; display:inline-flex; gap:6px; align-items:center; cursor:pointer}
+.nb i{width:7px; height:7px; border-radius:50%; background:var(--dot)}
+.nb:hover{border-color:var(--dot)}
+@media (prefers-reduced-motion: reduce){ *{transition:none !important} }
+.build{font:12px/1.5 var(--font-mono); color:var(--muted)}
+.build a{color:var(--accent)}
+.code-refs{display:flex; flex-direction:column; gap:4px}
+.code-refs a,.code-refs span{font:13px/1.4 var(--font-mono); color:var(--accent); overflow-wrap:anywhere; text-decoration:none}
+.code-refs a:hover{text-decoration:underline}
+.code-refs .gone{color:var(--c-entry); text-decoration:line-through}
+.code-refs small{display:block; color:var(--muted); font:12px/1.4 var(--font-body)}
+.lbl.stale{border-style:dashed; border-color:var(--c-entry)}
+details.audit summary{cursor:pointer; font:600 12px/1.4 var(--font-mono); color:var(--muted); letter-spacing:.04em}
+details.audit ul{margin:8px 0 0; padding-left:1.1em; font-size:13px; display:flex; flex-direction:column; gap:4px}
+details.audit code{font:12px var(--font-mono); overflow-wrap:anywhere}
+.audit-ok{color:var(--c-feat)}
+.audit-bad{color:var(--c-entry)}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow" id="eyebrow"></div>
+    <h1>Teams 봇 해부도</h1>
+    <p class="lede">맨 위 두 부품이 에코봇(Teams 입력단)이고, 가운데 반투명한 면 아래는 전부 서버예요. 공을 누르면 그 부품 설명과 실제 코드가 나오고, 오른쪽에서 흐름을 고르면 요청 하나가 어디를 거쳐 가는지 빛이 따라가요. 코드 조각과 줄 링크는 저장소에 푸시할 때마다 코드에서 다시 만들어져요.</p>
+    <div class="build" id="build"></div>
+    <div class="layers" id="layers"></div>
+  </header>
+
+  <main class="app">
+    <div class="stage" id="stage">
+      <canvas id="c" aria-label="봇 부품을 공으로 배치한 3D 지도"></canvas>
+      <div class="labels" id="labels"></div>
+      <div class="hint" id="hint">드래그 회전 · 휠/두 손가락 확대 · 공을 누르면 설명</div>
+    </div>
+
+    <aside class="panel">
+      <section class="box" aria-labelledby="tour-title">
+        <div class="box-title" id="tour-title">흐름 따라가기</div>
+        <div class="chips" id="scChips" role="group" aria-label="시나리오 선택"></div>
+        <p class="sc-desc" id="scDesc"></p>
+        <div class="caption" id="caption" aria-live="polite">
+          <div class="meta" id="capMeta"></div>
+          <div class="who" id="capWho"></div>
+          <p id="capText"></p>
+        </div>
+        <div class="controls">
+          <button class="btn" id="prev" type="button">이전</button>
+          <button class="btn primary" id="play" type="button">재생</button>
+          <button class="btn" id="next" type="button">다음</button>
+        </div>
+        <div class="dots" id="dots" aria-label="단계"></div>
+      </section>
+
+      <article class="box card" id="card">
+        <div class="layer" id="cLayer"><i></i><span></span></div>
+        <h2 id="cTitle"></h2>
+        <div class="code-refs" id="cRefs"></div>
+        <div class="warn" id="cStale"><b>코드와 다름</b> <span></span></div>
+        <p class="sum" id="cSum"></p>
+        <div class="analogy" id="cAna"><b>쉽게 말하면</b><span></span></div>
+        <ul class="points" id="cPoints"></ul>
+        <pre id="cSnip"></pre>
+        <div class="warn" id="cWarn"><b>주의</b> <span></span></div>
+        <div class="box-title">연결된 부품</div>
+        <div class="nbs" id="cNbs"></div>
+      </article>
+
+      <details class="box audit" id="audit">
+        <summary id="auditSummary">코드 점검</summary>
+        <div id="auditBody"></div>
+      </details>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<!--ANATOMY_DATA-->
+<script>
+(function () {
+"use strict";
+
+// 데이터는 build.py가 anatomy.json(사람이 쓴 설명)과 현재 코드를 합쳐 이 페이지에 넣는다.
+const DATA = JSON.parse(document.getElementById("anatomy-data").textContent);
+const META = DATA.meta || {};
+const LAYERS = DATA.layers;
+const SPLIT_Y = DATA.split_y;
+const NODES = DATA.nodes;
+const SCENARIOS = DATA.scenarios;
+
+const byId = {};
+NODES.forEach(n => { byId[n.id] = n; });
+const targets = st => Array.isArray(st.node) ? st.node : [st.node];
+const primary = st => targets(st)[0];
+function hopsFor(sc, i) {
+  if (i <= 0) return [];
+  const st = sc.steps[i];
+  const from = st.from || primary(sc.steps[i - 1]);
+  return targets(st).filter(t => t !== from).map(t => [from, t]);
+}
+const ekey = (a, b) => a < b ? a + "|" + b : b + "|" + a;
+
+// 구조 연결(시나리오에 안 나오지만 코드상 이어진 것)
+const EXTRA_EDGES = [...(DATA.edges || []), ...(DATA.code_edges || [])];
+const EDGE_KEYS = new Set();
+EXTRA_EDGES.forEach(([a, b]) => EDGE_KEYS.add(ekey(a, b)));
+SCENARIOS.forEach(sc => sc.steps.forEach((_, i) => hopsFor(sc, i).forEach(([a, b]) => EDGE_KEYS.add(ekey(a, b)))));
+const NEIGHBORS = {};
+NODES.forEach(n => { NEIGHBORS[n.id] = []; });
+EDGE_KEYS.forEach(k => { const [a, b] = k.split("|"); NEIGHBORS[a].push(b); NEIGHBORS[b].push(a); });
+
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// ── 헤더 범례 ──
+const layersEl = document.getElementById("layers");
+const order = ["bot", "route", "state", "feat", "store", "ext", "work"];
+order.forEach((k, i) => {
+  const s = document.createElement("span");
+  s.style.setProperty("--dot", "var(" + LAYERS[k].token + ")");
+  s.innerHTML = "<i></i>";
+  s.appendChild(document.createTextNode(LAYERS[k].name));
+  layersEl.appendChild(s);
+  if (i < order.length - 1) { const b = document.createElement("b"); b.textContent = i === 0 ? "⇄ HTTP ⇄" : i === order.length - 2 ? "+" : "→"; layersEl.appendChild(b); }
+});
+
+// ── 설명 카드 ──
+const card = {
+  layer: document.querySelector("#cLayer span"), dotHost: document.getElementById("card"),
+  title: document.getElementById("cTitle"), refs: document.getElementById("cRefs"), stale: document.getElementById("cStale"),
+  sum: document.getElementById("cSum"),
+  ana: document.getElementById("cAna"), points: document.getElementById("cPoints"), snip: document.getElementById("cSnip"),
+  warn: document.getElementById("cWarn"), nbs: document.getElementById("cNbs"),
+};
+let selectedId = null, manualPick = false;
+function showCard(id) {
+  const n = byId[id];
+  selectedId = id;
+  card.dotHost.style.setProperty("--dot", "var(" + LAYERS[n.layer].token + ")");
+  card.layer.textContent = LAYERS[n.layer].name;
+  card.title.textContent = n.label;
+  card.refs.replaceChildren(...(n.code_refs || []).map(r => {
+    const el = document.createElement(r.url ? "a" : "span");
+    el.textContent = r.label + (r.line ? " : " + r.line : "");
+    if (r.url) { el.href = r.url; el.target = "_blank"; el.rel = "noopener"; }
+    if (r.missing) el.className = "gone";
+    if (r.doc) { const d = document.createElement("small"); d.textContent = r.doc; el.appendChild(d); }
+    return el;
+  }));
+  card.stale.hidden = !(n.missing && n.missing.length);
+  card.stale.querySelector("span").textContent = (n.missing || []).length
+    ? "설명에 적힌 코드를 지금 저장소에서 찾을 수 없어요: " + n.missing.join(", ") + ". anatomy.json을 고쳐 주세요." : "";
+  card.sum.textContent = n.sum;
+  card.ana.hidden = !n.ana;
+  card.ana.querySelector("span").textContent = n.ana || "";
+  card.points.replaceChildren(...n.points.map(p => { const li = document.createElement("li"); li.textContent = p; return li; }));
+  card.snip.textContent = n.snippet || "";
+  card.snip.hidden = !n.snippet;
+  card.warn.hidden = !n.warn;
+  card.warn.querySelector("span").textContent = n.warn || "";
+  card.nbs.replaceChildren(...NEIGHBORS[id].map(nid => {
+    const m = byId[nid];
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "nb";
+    b.style.setProperty("--dot", "var(" + LAYERS[m.layer].token + ")");
+    b.innerHTML = "<i></i>";
+    b.appendChild(document.createTextNode(m.label));
+    b.addEventListener("click", () => select(nid));
+    return b;
+  }));
+  labelEls.forEach((el, k) => el.classList.toggle("on", k === id));
+}
+function select(id) { manualPick = true; showCard(id); autoRotate = false; }
+
+// ── 라벨(HTML, 3D 위치를 화면에 투영) ──
+const labelsEl = document.getElementById("labels");
+const labelEls = new Map();
+NODES.forEach(n => {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "lbl";
+  b.style.setProperty("--dot", "var(" + LAYERS[n.layer].token + ")");
+  b.innerHTML = "<i></i>";
+  b.appendChild(document.createTextNode((n.missing && n.missing.length ? "⚠ " : "") + n.label));
+  if (n.missing && n.missing.length) { b.classList.add("stale"); b.title = "설명에 적힌 코드를 찾을 수 없음"; }
+  b.addEventListener("click", () => select(n.id));
+  labelsEl.appendChild(b);
+  labelEls.set(n.id, b);
+});
+
+// ── 시나리오 패널 ──
+const chipsEl = document.getElementById("scChips"), descEl = document.getElementById("scDesc");
+const capMeta = document.getElementById("capMeta"), capWho = document.getElementById("capWho"), capText = document.getElementById("capText");
+const captionEl = document.getElementById("caption"), dotsEl = document.getElementById("dots");
+const prevBtn = document.getElementById("prev"), nextBtn = document.getElementById("next"), playBtn = document.getElementById("play");
+let sc = SCENARIOS[0], stepI = 0, playing = false, timer = null;
+const STEP_MS = 3400, HOP_MS = reduceMotion ? 0 : 750;
+
+SCENARIOS.forEach(s => {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "chip"; b.textContent = s.name; b.dataset.id = s.id;
+  b.addEventListener("click", () => { loadScenario(s); setPlaying(true); });
+  chipsEl.appendChild(b);
+});
+
+function loadScenario(s) {
+  sc = s;
+  [...chipsEl.children].forEach(c => c.setAttribute("aria-pressed", String(c.dataset.id === s.id)));
+  descEl.textContent = s.desc;
+  dotsEl.replaceChildren(...s.steps.map((_, i) => {
+    const d = document.createElement("button");
+    d.type = "button"; d.className = "dot"; d.setAttribute("aria-label", (i + 1) + "단계");
+    d.addEventListener("click", () => { setPlaying(false); goStep(i); });
+    return d;
+  }));
+  goStep(0);
+}
+
+function goStep(i) {
+  stepI = Math.max(0, Math.min(sc.steps.length - 1, i));
+  const st = sc.steps[stepI];
+  const names = targets(st).map(t => byId[t].label).join(" + ");
+  capMeta.textContent = (stepI + 1) + " / " + sc.steps.length + " 단계";
+  capWho.textContent = names;
+  capText.textContent = st.text;
+  captionEl.style.setProperty("--step", "var(" + LAYERS[byId[primary(st)].layer].token + ")");
+  [...dotsEl.children].forEach((d, k) => { d.className = "dot" + (k < stepI ? " done" : k === stepI ? " now" : ""); });
+  prevBtn.disabled = stepI === 0;
+  nextBtn.disabled = stepI === sc.steps.length - 1;
+  manualPick = false;
+  showCard(primary(st));
+  if (scene3d) scene3d.onStep(sc, stepI);
+}
+
+function setPlaying(on) {
+  playing = on;
+  playBtn.textContent = on ? "일시정지" : (stepI === sc.steps.length - 1 ? "처음부터" : "재생");
+  clearTimeout(timer);
+  if (on) schedule();
+}
+function schedule() {
+  clearTimeout(timer);
+  timer = setTimeout(() => {
+    if (!playing) return;
+    if (stepI < sc.steps.length - 1) { goStep(stepI + 1); schedule(); }
+    else setPlaying(false);
+  }, STEP_MS);
+}
+playBtn.addEventListener("click", () => {
+  if (playing) { setPlaying(false); return; }
+  if (stepI === sc.steps.length - 1) goStep(0);
+  setPlaying(true);
+});
+prevBtn.addEventListener("click", () => { setPlaying(false); goStep(stepI - 1); });
+nextBtn.addEventListener("click", () => { setPlaying(false); goStep(stepI + 1); if (stepI === sc.steps.length - 1) playBtn.textContent = "처음부터"; });
+document.addEventListener("keydown", e => {
+  if (e.target.closest && e.target.closest("input,textarea")) return;
+  if (e.key === "ArrowRight") { setPlaying(false); goStep(stepI + 1); }
+  if (e.key === "ArrowLeft") { setPlaying(false); goStep(stepI - 1); }
+});
+
+// ── 3D 장면 ──
+let scene3d = null, autoRotate = !reduceMotion;
+const stage = document.getElementById("stage"), canvas = document.getElementById("c");
+
+function build3D() {
+  if (!window.THREE) throw new Error("no three");
+  const THREE = window.THREE;
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 200);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.62));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.75); dl.position.set(6, 12, 9); scene.add(dl);
+
+  const grid = new THREE.GridHelper(30, 30);
+  grid.position.y = -8.2;
+  grid.material.vertexColors = false; grid.material.transparent = true; grid.material.opacity = 0.55;
+  scene.add(grid);
+
+  // 에코봇 / 서버 분리면
+  const splitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false });
+  const splitPlane = new THREE.Mesh(new THREE.PlaneGeometry(26, 9), splitMat);
+  splitPlane.rotation.x = -Math.PI / 2; splitPlane.position.y = SPLIT_Y; scene.add(splitPlane);
+  const splitEdge = new THREE.LineSegments(new THREE.EdgesGeometry(splitPlane.geometry), new THREE.LineBasicMaterial({ transparent: true, opacity: 0.7 }));
+  splitEdge.rotation.copy(splitPlane.rotation); splitEdge.position.copy(splitPlane.position); scene.add(splitEdge);
+  const splitAnchor = new THREE.Vector3(-10.5, SPLIT_Y, 4.5);
+  const splitLbl = document.createElement("div");
+  splitLbl.className = "split-lbl";
+  splitLbl.innerHTML = "<span>▲ 에코봇</span><span>▼ 서버</span>";
+  labelsEl.appendChild(splitLbl);
+
+  const sphere = new THREE.SphereGeometry(0.56, 32, 20);
+  const ringGeo = new THREE.TorusGeometry(0.9, 0.045, 8, 56);
+  const meshes = [];
+  NODES.forEach(n => {
+    const mat = new THREE.MeshStandardMaterial({ roughness: 0.42, metalness: 0.08, emissiveIntensity: 0.15, transparent: true });
+    const m = new THREE.Mesh(sphere, mat);
+    m.position.set(n.pos[0], n.pos[1], n.pos[2]);
+    m.userData.id = n.id;
+    scene.add(m); meshes.push(m); n.mesh = m;
+    const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 }));
+    ring.position.copy(m.position); scene.add(ring); n.ring = ring;
+    // 바닥까지 내려오는 가는 기둥: 층 높이를 읽기 쉽게
+    const g = new THREE.BufferGeometry().setFromPoints([m.position.clone(), new THREE.Vector3(n.pos[0], -8.2, n.pos[2])]);
+    n.stem = new THREE.Line(g, new THREE.LineBasicMaterial({ transparent: true, opacity: 0.25 }));
+    scene.add(n.stem);
+  });
+
+  const edges = new Map();
+  EDGE_KEYS.forEach(k => {
+    const [a, b] = k.split("|");
+    const g = new THREE.BufferGeometry().setFromPoints([byId[a].mesh.position, byId[b].mesh.position]);
+    const line = new THREE.Line(g, new THREE.LineBasicMaterial({ transparent: true, opacity: 0.5 }));
+    scene.add(line); edges.set(k, line);
+  });
+
+  const particles = [];
+  for (let i = 0; i < 4; i++) {
+    const core = new THREE.Mesh(new THREE.SphereGeometry(0.17, 16, 12), new THREE.MeshBasicMaterial());
+    const glow = new THREE.Mesh(new THREE.SphereGeometry(0.36, 16, 12), new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.28 }));
+    core.add(glow); core.visible = false; scene.add(core);
+    particles.push({ mesh: core, glow, a: null, b: null, start: 0 });
+  }
+
+  let T = {};
+  let scNodes = new Set(), scEdges = new Set(), hopEdges = new Set(), activeIds = new Set();
+  function applyTheme() {
+    T = { bg: css("--bg"), line: css("--line"), accent: css("--accent"), muted: css("--muted") };
+    scene.background = new THREE.Color(T.bg);
+    grid.material.color.set(T.line);
+    splitMat.color.set(css("--c-entry")); splitEdge.material.color.set(css("--c-entry"));
+    NODES.forEach(n => {
+      const c = new THREE.Color(css(LAYERS[n.layer].token));
+      n.mesh.material.color.copy(c); n.mesh.material.emissive.copy(c);
+      n.ring.material.color.copy(c); n.stem.material.color.copy(c);
+    });
+    particles.forEach(p => { p.mesh.material.color.set(T.accent); p.glow.material.color.set(T.accent); });
+    paint();
+  }
+  function paint() {
+    edges.forEach((line, k) => {
+      const hot = hopEdges.has(k);
+      line.material.color.set(hot ? T.accent : T.line);
+      line.material.opacity = hot ? 1 : scEdges.has(k) ? 0.85 : 0.22;
+    });
+    NODES.forEach(n => {
+      const inSc = scNodes.has(n.id);
+      n.mesh.material.opacity = inSc ? 1 : 0.28;
+      n.mesh.material.emissiveIntensity = activeIds.has(n.id) ? 0.75 : 0.14;
+      n.stem.material.opacity = inSc ? 0.3 : 0.08;
+      labelEls.get(n.id).classList.toggle("dim", !inSc);
+    });
+  }
+
+  function onStep(s, i) {
+    scNodes = new Set(); scEdges = new Set();
+    s.steps.forEach((st, k) => { targets(st).forEach(t => scNodes.add(t)); hopsFor(s, k).forEach(([a, b]) => scEdges.add(ekey(a, b))); });
+    const hops = hopsFor(s, i);
+    hopEdges = new Set(hops.map(([a, b]) => ekey(a, b)));
+    activeIds = new Set(targets(s.steps[i]));
+    const now = performance.now();
+    particles.forEach(p => { p.mesh.visible = false; p.a = null; });
+    hops.slice(0, particles.length).forEach(([a, b], k) => {
+      const p = particles[k];
+      p.a = byId[a].mesh.position; p.b = byId[b].mesh.position; p.start = now;
+    });
+    if (T.bg) paint();
+  }
+
+  // 카메라 궤도
+  let theta = 0.45, phi = 1.22, radius = 22;
+  const target = new THREE.Vector3(2.2, 0.2, 0);
+  function placeCamera() {
+    camera.position.set(
+      target.x + radius * Math.sin(phi) * Math.sin(theta),
+      target.y + radius * Math.cos(phi),
+      target.z + radius * Math.sin(phi) * Math.cos(theta));
+    camera.lookAt(target);
+  }
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  let W = 1, H = 1;
+  function resize() {
+    W = stage.clientWidth; H = stage.clientHeight;
+    renderer.setSize(W, H, false);
+    camera.aspect = W / H; camera.updateProjectionMatrix();
+    if (!resize.done) { radius = W / H < 0.9 ? 36 : W / H < 1.2 ? 30 : 26; resize.done = true; }
+  }
+  new ResizeObserver(resize).observe(stage);
+  resize();
+
+  // 포인터: 드래그 회전, 두 손가락 확대, 짧은 탭 = 선택
+  const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2();
+  const pts = new Map(); let moved = 0, pinch = 0;
+  const dist = () => { const [p, q] = [...pts.values()]; return Math.hypot(p.x - q.x, p.y - q.y) || 1; };
+  function hit(e) {
+    const r = canvas.getBoundingClientRect();
+    ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    raycaster.setFromCamera(ndc, camera);
+    const h = raycaster.intersectObjects(meshes)[0];
+    return h ? h.object.userData.id : null;
+  }
+  canvas.addEventListener("pointerdown", e => {
+    canvas.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size === 1) moved = 0;
+    if (pts.size === 2) pinch = dist();
+    autoRotate = false; canvas.classList.add("grabbing");
+  });
+  canvas.addEventListener("pointermove", e => {
+    if (!pts.has(e.pointerId)) {
+      if (e.pointerType === "mouse") canvas.classList.toggle("hovering", !!hit(e));
+      return;
+    }
+    const p = pts.get(e.pointerId);
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size === 1) {
+      theta -= dx * 0.0065; phi = clamp(phi - dy * 0.0065, 0.35, 2.55);
+      moved += Math.abs(dx) + Math.abs(dy);
+    } else if (pts.size === 2) {
+      const d = dist(); radius = clamp(radius * pinch / d, 9, 40); pinch = d; moved += 20;
+    }
+  });
+  function up(e) {
+    if (!pts.has(e.pointerId)) return;
+    pts.delete(e.pointerId);
+    if (pts.size === 0) {
+      canvas.classList.remove("grabbing");
+      if (moved < 6 && e.type === "pointerup") { const id = hit(e); if (id) select(id); }
+    }
+  }
+  canvas.addEventListener("pointerup", up);
+  canvas.addEventListener("pointercancel", up);
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault(); autoRotate = false;
+    radius = clamp(radius * (1 + Math.sign(e.deltaY) * 0.08), 9, 40);
+  }, { passive: false });
+
+  const v = new THREE.Vector3();
+  function frame(now) {
+    if (autoRotate && pts.size === 0) theta += 0.0011;
+    placeCamera();
+    particles.forEach(p => {
+      if (!p.a) return;
+      const t = HOP_MS ? Math.min(1, (now - p.start) / HOP_MS) : 1;
+      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      p.mesh.position.lerpVectors(p.a, p.b, e);
+      p.mesh.visible = t < 1;
+    });
+    NODES.forEach(n => {
+      const act = activeIds.has(n.id), sel = n.id === selectedId;
+      const s = act ? 1.2 + (reduceMotion ? 0 : 0.06 * Math.sin(now / 240)) : 1;
+      n.mesh.scale.setScalar(s);
+      n.ring.lookAt(camera.position);
+      const want = sel ? 0.95 : act ? 0.45 : 0;
+      n.ring.material.opacity += (want - n.ring.material.opacity) * 0.18;
+      n.ring.scale.setScalar(sel ? 1.08 : 1);
+    });
+    renderer.render(scene, camera);
+    NODES.forEach(n => {
+      v.copy(n.mesh.position).project(camera);
+      const el = labelEls.get(n.id);
+      const x = (v.x * 0.5 + 0.5) * W, y = (-v.y * 0.5 + 0.5) * H;
+      el.style.transform = "translate(" + x.toFixed(1) + "px," + y.toFixed(1) + "px) translate(-50%, 16px)";
+      el.style.zIndex = String(Math.round(1000 - camera.position.distanceTo(n.mesh.position) * 10));
+      el.style.visibility = v.z > 1 ? "hidden" : "visible";
+    });
+    v.copy(splitAnchor).project(camera);
+    splitLbl.style.transform = "translate(" + ((v.x * 0.5 + 0.5) * W).toFixed(1) + "px," + ((-v.y * 0.5 + 0.5) * H).toFixed(1) + "px) translate(0, -50%)";
+    splitLbl.style.visibility = v.z > 1 ? "hidden" : "visible";
+    requestAnimationFrame(frame);
+  }
+
+  applyTheme();
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+  new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  requestAnimationFrame(frame);
+  return { onStep };
+}
+
+try {
+  scene3d = build3D();
+} catch (err) {
+  const f = document.createElement("div");
+  f.className = "fallback";
+  f.textContent = "이 브라우저에서 3D를 그릴 수 없어요. 오른쪽 흐름과 설명은 그대로 쓸 수 있어요.";
+  stage.appendChild(f);
+  labelsEl.hidden = true;
+}
+if (window.matchMedia("(pointer: coarse)").matches) document.getElementById("hint").textContent = "드래그 회전 · 두 손가락 확대 · 공을 누르면 설명";
+
+// ── 머리말·빌드 정보·코드 점검 ──
+document.getElementById("eyebrow").textContent =
+  "부품 " + NODES.length + "개 · 흐름 " + SCENARIOS.length + "개 · 함수 " + (META.symbols || 0) + "개 중 " + (META.mapped || 0) + "개 연결";
+(function renderBuild() {
+  const el = document.getElementById("build");
+  const when = META.built_at ? new Date(META.built_at).toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" }) : "";
+  if (META.repo_url && META.sha) {
+    const repo = document.createElement("a"); repo.href = META.repo_url; repo.target = "_blank"; repo.rel = "noopener"; repo.textContent = META.repo;
+    const commit = document.createElement("a"); commit.href = META.repo_url + "/commit/" + META.sha; commit.target = "_blank"; commit.rel = "noopener";
+    commit.textContent = META.short;
+    el.append(repo, " @ ", commit, (META.message ? " · " + META.message : "") + (when ? " · " + when + " 기준" : ""));
+  } else {
+    el.textContent = when ? "로컬 빌드 · " + when : "";
+  }
+})();
+(function renderAudit() {
+  const stale = NODES.filter(n => n.missing && n.missing.length);
+  const unmapped = META.unmapped || [];
+  const unmappedCount = unmapped.reduce((sum, f) => sum + f.names.length, 0);
+  const summary = document.getElementById("auditSummary");
+  summary.textContent = "코드 점검 · " + (stale.length ? "코드와 다른 부품 " + stale.length + "개 · " : "모든 부품이 코드와 맞음 · ")
+    + "연결 안 된 함수 " + unmappedCount + "개";
+  summary.className = stale.length ? "audit-bad" : "audit-ok";
+  const body = document.getElementById("auditBody");
+  const add = (title, items) => {
+    if (!items.length) return;
+    const t = document.createElement("div"); t.className = "box-title"; t.style.marginTop = "10px"; t.textContent = title;
+    const ul = document.createElement("ul");
+    items.forEach(([label, code]) => { const li = document.createElement("li"); li.append(label + " "); const c = document.createElement("code"); c.textContent = code; li.append(c); ul.append(li); });
+    body.append(t, ul);
+  };
+  add("설명에 적혔지만 코드에서 사라진 함수", stale.flatMap(n => n.missing.map(m => [n.label + ":", m])));
+  add("어느 부품에도 연결 안 된 함수 (설명을 보강할 곳)", unmapped.map(f => [f.path + ":", f.names.join(", ")]));
+})();
+
+loadScenario(SCENARIOS[0]);
+playBtn.textContent = "재생";
+})();
+</script>
+</body>
+</html>
