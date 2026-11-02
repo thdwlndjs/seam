@@ -4,7 +4,7 @@ name: anatomy
 
 on:
   push:
-    branches: [main, refactor/split-bot-server]
+    branches: [main]
   pull_request:          # PR에서는 만들어 보기만 하고(설명에 적힌 함수가 사라졌는지 확인), 배포는 안 한다
   workflow_dispatch:     # Actions 탭에서 손으로 다시 돌리기
 
