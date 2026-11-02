@@ -68,12 +68,18 @@ def _get_server_client() -> httpx.AsyncClient:
 def _turn_payload(ctx: ActivityContext, kind: str = "message", text: str = "", value: dict | None = None) -> dict:
     activity = ctx.activity
     team = activity.team
+    conversation = activity.conversation
+    timestamp = getattr(activity, "timestamp", None)
     return {
         "kind": kind,
         "user": {"aad_id": activity.from_.aad_object_id, "name": activity.from_.name},
         "team": {"id": team.id, "name": team.name} if team and team.id else None,
         "text": text,
         "value": value,
+        # 서버가 원문을 기록할 때 쓰는 위치 정보 (같은 메시지가 두 번 와도 한 번만 저장되게)
+        "conversation": {"id": conversation.id, "type": conversation.conversation_type} if conversation else None,
+        "message_id": getattr(activity, "id", None),
+        "sent_at": timestamp.isoformat() if hasattr(timestamp, "isoformat") else timestamp,
     }
 
 

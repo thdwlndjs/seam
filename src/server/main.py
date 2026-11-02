@@ -42,6 +42,9 @@ from fastapi.responses import StreamingResponse
 from notion_client import Client
 from pydantic import BaseModel
 
+import notion_map
+import worklog_bridge
+
 # ── 설정 ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 load_dotenv(os.environ.get("ENV_FILE"))
@@ -83,12 +86,21 @@ class TurnTeam(BaseModel):
     name: str | None = None
 
 
+class TurnConversation(BaseModel):
+    id: str
+    type: str | None = None  # "personal" | "channel" | "groupChat"
+
+
 class TurnRequest(BaseModel):
     kind: str = "message"  # "message" | "welcome"
     user: TurnUser
     team: TurnTeam | None = None
     text: str = ""
     value: dict | None = None
+    # 원문 기록용 (예전 에코봇은 안 보낸다 — 없으면 기록 키를 사용자 기준으로 만든다)
+    conversation: TurnConversation | None = None
+    message_id: str | None = None
+    sent_at: str | None = None
 
 
 class Turn:
@@ -395,6 +407,9 @@ async def handle_turn(turn: Turn) -> None:
     raw_text = turn.req.text.strip()
     aad_id = turn.aad_id
 
+    if _is_team_record(aad_id, raw_text):
+        await asyncio.to_thread(_record_turn_text, turn, raw_text)
+
     if raw_text.lower() in _CANCEL_TRIGGERS and _cancel_pending_sessions(aad_id):
         await turn.send("취소했어요. 처음부터 다시 하려면 원하는 메뉴나 '설정'을 입력해주세요.")
         return
@@ -420,6 +435,38 @@ async def handle_turn(turn: Turn) -> None:
         return
 
     await _run_action(turn, raw_text)
+
+
+def _is_team_record(aad_id: str, raw_text: str) -> bool:
+    """팀 기록으로 남길 메시지인지. 메뉴 명령·인사, 그리고 토큰이 오갈 수 있는 설정/온보딩 답은 남기지 않는다."""
+    if not raw_text or aad_id in setup_sessions or aad_id in github_onboarding_sessions:
+        return False
+    lowered = raw_text.lower()
+    return not (
+        lowered in _CANCEL_TRIGGERS
+        or raw_text in ("설정", "0")
+        or re.fullmatch(r"[1-4]", raw_text)
+        or _GREETING_RE.fullmatch(raw_text)
+    )
+
+
+def _record_turn_text(turn: Turn, raw_text: str) -> None:
+    req = turn.req
+    conversation_id = req.conversation.id if req.conversation else turn.team_key
+    message_ref = req.message_id or db_safe_hash(f"{turn.aad_id}|{req.sent_at}|{raw_text}")
+    worklog_bridge.record(
+        scope=turn.team_key,
+        kind="teams_message",
+        conversation_key=f"teams:{conversation_id}",
+        locator=f"teams:{conversation_id}:{message_ref}",
+        text=raw_text,
+        author=turn.user_name or turn.aad_id,
+        sent_at=req.sent_at,
+    )
+
+
+def db_safe_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
 def _cancel_pending_sessions(aad_id: str) -> bool:
@@ -693,112 +740,11 @@ async def _github_graphql(query: str, token: str, variables: dict | None = None)
     return data["data"]
 
 
-# ── 노션 페이지 읽기 ───────────────────────────────
-def _rich_text(block: dict) -> str:
-    return "".join(item.get("plain_text", "") for item in block.get("rich_text", []))
-
-
-def _map_parallel(fn: Callable[[dict], list[str]], items: list[dict]) -> list[list[str]]:
-    """형제 블록/행끼리 병렬 처리. 호출마다 자기 풀을 만들고 닫아서 데드락이 없고, 순서는 보존된다."""
-    if len(items) <= 1:
-        return [fn(item) for item in items]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(items)) as pool:
-        return list(pool.map(fn, items))
-
-
-def _list_child_blocks(block_id: str, notion_client: Client) -> list[dict]:
-    blocks: list[dict] = []
-    cursor: str | None = None
-    while True:
-        response = notion_client.blocks.children.list(block_id, start_cursor=cursor)
-        blocks.extend(response["results"])
-        if not response.get("has_more"):
-            return blocks
-        cursor = response.get("next_cursor")
-
-
-def _query_database_rows(database_id: str, notion_client: Client) -> list[dict]:
-    """Notion API 2025-09부터는 데이터베이스 안의 data source를 조회한다."""
-    db = notion_client.databases.retrieve(database_id)
-    data_source_id = db["data_sources"][0]["id"]
-
-    rows: list[dict] = []
-    cursor: str | None = None
-    while True:
-        response = notion_client.data_sources.query(data_source_id, start_cursor=cursor)
-        rows.extend(response["results"])
-        if not response.get("has_more"):
-            return rows
-        cursor = response.get("next_cursor")
-
-
-def _inline_database_lines(database_id: str, notion_client: Client, depth: int) -> list[str]:
-    def _row_lines(row: dict) -> list[str]:
-        row_lines: list[str] = []
-        title = ""
-        for prop in row.get("properties", {}).values():
-            if prop.get("type") == "title":
-                title = "".join(t.get("plain_text", "") for t in prop.get("title", []))
-                break
-        if title:
-            row_lines.append("  " * depth + title)
-        for child in _list_child_blocks(row["id"], notion_client):
-            row_lines.extend(_block_text(child, notion_client, depth + 1))
-        return row_lines
-
-    rows = _query_database_rows(database_id, notion_client)
-    lines: list[str] = []
-    for row_lines in _map_parallel(_row_lines, rows):
-        lines.extend(row_lines)
-    return lines
-
-
-def _block_text(block: dict, notion_client: Client, depth: int = 0) -> list[str]:
-    block_type = block["type"]
-    data = block.get(block_type, {})
-    indent = "  " * depth
-
-    if block_type == "child_database":
-        return _inline_database_lines(block["id"], notion_client, depth)
-
-    if block_type == "child_page":
-        # 다른 문서로 가는 바로가기 — 안으로 들어가지 않고 제목만 남긴다.
-        title = block.get("child_page", {}).get("title", "")
-        return [indent + f"📄 {title}"] if title else []
-
-    if block_type in {"bulleted_list_item", "numbered_list_item"}:
-        prefix = "- " if block_type == "bulleted_list_item" else "1. "
-        text = prefix + _rich_text(data)
-    elif block_type == "to_do":
-        checked = "[x]" if data.get("checked") else "[ ]"
-        text = f"{checked} {_rich_text(data)}"
-    elif block_type == "divider":
-        text = "---"
-    else:
-        text = _rich_text(data)
-
-    lines = [indent + text] if text else []
-    if block.get("has_children"):
-        children = _list_child_blocks(block["id"], notion_client)
-        for child_lines in _map_parallel(lambda c: _block_text(c, notion_client, depth + 1), children):
-            lines.extend(child_lines)
-    return lines
-
-
-def _fetch_notion_page_by_id(page_id: str, notion_client: Client) -> str:
-    page = notion_client.pages.retrieve(page_id)
-    blocks = _list_child_blocks(page_id, notion_client)
-    lines: list[str] = []
-    for block_lines in _map_parallel(lambda b: _block_text(b, notion_client), blocks):
-        lines.extend(block_lines)
-
-    title = ""
-    for property_data in page.get("properties", {}).values():
-        if property_data.get("type") == "title":
-            title = "".join(item.get("plain_text", "") for item in property_data.get("title", []))
-            break
-
-    return "\n".join(([title] if title else []) + lines) or "Notion 페이지에 표시할 내용이 없습니다."
+# ── 노션 페이지 읽기 (notion_read.py) ───────────────────────────────
+from notion_read import (  # noqa: E402
+    _block_text, _fetch_notion_page_by_id, _inline_database_lines, _list_child_blocks, _map_parallel,
+    _query_database_rows, _rich_text,
+)
 
 
 # ── 1. 팀/프로젝트 정보 (Groq 스트리밍 요약) ─────────────────────
@@ -1010,24 +956,69 @@ def _page_property_text(properties: dict, prop_type: str) -> list[str]:
     return texts
 
 
-def _fetch_meeting_notes_lines(meeting_notes_page_id: str, notion_client: Client) -> list[str]:
+def _fetch_meeting_note_records(meeting_notes_page_id: str, notion_client: Client) -> list[tuple[str, str]]:
+    """회의록을 (원문 위치, 텍스트) 목록으로. 데이터베이스면 행마다, 일반 페이지면 페이지 전체 한 건."""
     try:
         rows = _query_database_rows(meeting_notes_page_id, notion_client)
     except Exception:
         try:
-            return _fetch_notion_page_by_id(meeting_notes_page_id, notion_client).splitlines()
+            text = _fetch_notion_page_by_id(meeting_notes_page_id, notion_client)
         except Exception:
             return []
+        return [(f"notion:{meeting_notes_page_id}", text)]
 
-    lines: list[str] = []
+    records: list[tuple[str, str]] = []
     for row in rows:
         properties = row.get("properties", {})
         title_parts = _page_property_text(properties, "title")
         summary_parts = _page_property_text(properties, "rich_text")
         row_text = " / ".join(p for p in (" ".join(title_parts), " ".join(summary_parts)) if p)
         if row_text:
-            lines.append(row_text)
-    return lines
+            records.append((f"notion:{meeting_notes_page_id}:{row.get('id', '')}", row_text))
+    return records
+
+
+def _fetch_meeting_notes_lines(meeting_notes_page_id: str, notion_client: Client) -> list[str]:
+    records = _fetch_meeting_note_records(meeting_notes_page_id, notion_client)
+    if len(records) == 1 and records[0][0] == f"notion:{meeting_notes_page_id}":
+        return records[0][1].splitlines()  # 일반 페이지: 예전처럼 줄 단위
+    return [text for _, text in records]
+
+
+# ── 팀 기록 수집·분석 (worklog) ─────────────────────────────
+def _sync_notion_maps() -> dict[str, dict]:
+    """설정된 모든 팀의 '팀 정보 페이지'를 루트로, 구조 지문 확인 → 바뀐 곳만 재스캔 → 지도대로 원문 수집.
+    Notion은 읽기만 한다."""
+    results: dict[str, dict] = {}
+    for team_key, config in _load_team_configs().items():
+        root = config.get("notion_page_id")
+        if not root or not config.get("notion_token"):
+            continue
+        try:
+            results[team_key] = notion_map.sync(worklog_bridge.WORKLOG_STORE, team_key, root, _notion_client_for(config),
+                                                classify=worklog_bridge.groq_classify_sections)
+        except Exception:
+            traceback.print_exc()
+    return results
+
+
+async def _worklog_loop() -> None:
+    last_collect = 0.0
+    while True:
+        try:
+            if time.monotonic() - last_collect >= worklog_bridge.NOTION_COLLECT_SECONDS:
+                last_collect = time.monotonic()
+                await asyncio.to_thread(_sync_notion_maps)
+            await asyncio.to_thread(worklog_bridge.analyze_due)
+        except Exception:
+            traceback.print_exc()
+        await asyncio.sleep(worklog_bridge.ANALYZE_TICK_SECONDS)
+
+
+@app.on_event("startup")
+async def _start_worklog() -> None:
+    if os.environ.get("WORKLOG_LOOP", "1") != "0":
+        _spawn(_worklog_loop())
 
 
 # ── 2. 팀 진행상황 조회 ─────────────────────────────
