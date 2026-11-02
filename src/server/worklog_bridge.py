@@ -29,6 +29,8 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # 분석할 묶음이 있는지 확인하는 주기. 확인 자체는 로컬 DB 조회뿐이라 비용이 없고, 분석 시점의 오차만 정한다.
 ANALYZE_TICK_SECONDS = int(os.environ.get("WORKLOG_TICK_SECONDS", "300"))
+# 서버가 켜진 뒤 첫 수집까지 기다리는 시간(켜자마자 들어오는 사용자 요청과 겹치지 않게).
+START_DELAY_SECONDS = int(os.environ.get("WORKLOG_START_DELAY_SECONDS", "60"))
 # Notion 접근 주기. 접근할 때마다 페이지 수정 시각 → (바뀌었으면) 구조 지문을 먼저 확인한다.
 NOTION_COLLECT_SECONDS = int(os.environ.get("WORKLOG_NOTION_SECONDS", "3600"))
 POLICY = worklog.AnalysisPolicy(
@@ -146,3 +148,17 @@ def analyze_due() -> list[dict]:
         else:
             log.info("분석 완료: 후보 %d건, 제외 %d건", len(result["candidates"]), len(result["ignored"]))
     return results
+
+
+def team_snapshot(scope: str, root_id: str | None = None, max_chars: int = 12000) -> dict | None:
+    """저장된 팀 정보 페이지 원문(1번 메뉴 요약용). 아직 수집 전이면 None."""
+    from worklog import sections
+
+    return sections.snapshot(WORKLOG_STORE, scope, root_id=root_id, max_chars=max_chars)
+
+
+def meeting_notes(scope: str, notes_id: str | None, max_chars: int = 8000) -> dict | None:
+    """저장된 회의 기록(2·3번 메뉴용). 아직 수집 전이면 None."""
+    from worklog import sections
+
+    return sections.meeting_notes(WORKLOG_STORE, scope, notes_id, max_chars=max_chars)

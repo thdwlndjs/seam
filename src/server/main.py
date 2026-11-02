@@ -17,12 +17,16 @@
     {"type": "buttons", "title": "...", "emphasis": bool,
      "buttons": [{"title": "...", "data": {...}}]}       → 에코봇: 버튼 카드로 만들어 전송
     {"type": "done"}                                     → 열린 스트림 닫기
+    {"type": "ping"}                                     → 아직 작업 중 (화면 표시 없음, KEEPALIVE_SECONDS마다)
+
+한 요청은 TURN_DEADLINE_SECONDS(100초) 안에 끝난다. 넘으면 안내 메시지를 보내고 그만둔다.
 
 Teams SDK에 전혀 의존하지 않는다. 카드 모양도 "제목 + 버튼 목록"이라는 의미만 보내고,
 실제 Adaptive Card는 에코봇이 만든다.
 """
 
 import asyncio
+from datetime import datetime
 import concurrent.futures
 import hashlib
 import json
@@ -30,6 +34,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -52,6 +57,15 @@ BOT_SERVER_SECRET = os.environ["BOT_SERVER_SECRET"]  # 에코봇↔서버 간 �
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+DISPLAY_TZ = os.environ.get("DISPLAY_TZ", "Asia/Seoul")  # 사용자에게 보여주는 시각의 시간대
+# Groq 한 번에 보내는 원문 상한(추정 토큰). 무료 등급은 분당 8,000토큰이라, 이보다 크면 413(요청이 너무 큼)으로 거절된다.
+GROQ_INPUT_TOKENS = int(os.environ.get("GROQ_INPUT_TOKENS", "4000"))
+# 위 토큰 예산을 한국어 글자 수로 바꾼 값(한글 1자 = UTF-8 3바이트, 4바이트 ≈ 1토큰으로 어림)
+_GROQ_INPUT_CHARS = GROQ_INPUT_TOKENS * 4 // 3
+# 한 요청의 최대 처리 시간과, 그동안 에코봇에 "아직 작업 중" 신호를 보내는 간격.
+TURN_DEADLINE_SECONDS = float(os.environ.get("TURN_DEADLINE_SECONDS", "100"))
+KEEPALIVE_SECONDS = float(os.environ.get("KEEPALIVE_SECONDS", "15"))
+_TURN_TIMEOUT_TEXT = "⏳ Notion·GitHub 응답이 늦어 이번 요청을 마치지 못했어요.\n잠시 후 다시 시도해 줄래요?"
 
 _ISSUE_REF_RE = re.compile(r"#(\d+)")
 
@@ -70,6 +84,7 @@ def _spawn(coro) -> asyncio.Task:
 _project_status_field_cache: dict[tuple[str, int], tuple[str, str, str] | None] = {}
 _project_item_id_cache: dict[tuple[str, int], str | None] = {}
 _meeting_notes_classification_cache: dict[str, dict] = {}
+# team_key -> {"hash": 요약한 원문의 해시, "summary": 요약} — 저장된 팀 정보 원문이 같으면 Groq를 다시 부르지 않는다.
 _project_summary_cache: dict[str, dict] = {}
 
 app = FastAPI()
@@ -150,7 +165,10 @@ async def turn_endpoint(req: TurnRequest, x_bot_secret: str | None = Header(None
 
     async def run() -> None:
         try:
-            await handle_turn(turn)
+            # 외부 API가 아무리 느려도 한 요청은 이 시간 안에 끝낸다. 넘으면 사용자에게 알리고 그만둔다.
+            await asyncio.wait_for(handle_turn(turn), timeout=TURN_DEADLINE_SECONDS)
+        except asyncio.TimeoutError:
+            await turn.send(_TURN_TIMEOUT_TEXT)
         except Exception as exc:
             traceback.print_exc()
             await turn.send(f"⚠️ 처리 중 오류가 발생했어요: {exc}")
@@ -162,7 +180,12 @@ async def turn_endpoint(req: TurnRequest, x_bot_secret: str | None = Header(None
 
     async def events():
         while True:
-            event = await turn.queue.get()
+            try:
+                event = await asyncio.wait_for(turn.queue.get(), timeout=KEEPALIVE_SECONDS)
+            except asyncio.TimeoutError:
+                # 아직 작업 중이라는 신호. 에코봇은 이걸로 "끊김"과 "느림"을 구분한다(화면엔 안 보임).
+                yield '{"type": "ping"}\n'
+                continue
             if event is None:
                 break
             yield json.dumps(event, ensure_ascii=False) + "\n"
@@ -221,8 +244,9 @@ def _get_config(team_key: str) -> dict | None:
     return _load_team_configs().get(team_key)
 
 
-def _notion_client_for(config: dict) -> Client:
-    return Client(auth=config["notion_token"])
+def _notion_client_for(config: dict, background: bool = False):
+    """Notion 클라이언트는 항상 토큰별 관문을 지나는 것으로 만든다(notion_read.notion_client_for 참고)."""
+    return notion_client_for(config["notion_token"], background=background)
 
 
 # ── 설정 마법사 입력값 파싱 ──────────────────────────────
@@ -520,7 +544,7 @@ async def _handle_setup_message(turn: Turn, raw_text: str) -> None:
         return
 
     if key in ("notion_page_id", "meeting_notes_page_id"):
-        notion_client = Client(auth=session["data"]["notion_token"])
+        notion_client = notion_client_for(session["data"]["notion_token"])
         accessible = await asyncio.to_thread(_notion_page_accessible, value, notion_client)
         if not accessible:
             await turn.send(
@@ -531,7 +555,12 @@ async def _handle_setup_message(turn: Turn, raw_text: str) -> None:
             )
             return
         if key == "notion_page_id":
-            _spawn(_prewarm_project_summary(value, notion_client))
+            # 팀 정보 페이지를 등록한 순간 구조·원문을 읽어 저장해 둔다 → 1번은 이걸로 바로 답한다.
+            _spawn(_register_team_map(session["team_key"], [value], session["data"]["notion_token"]))
+        else:
+            # 회의록 페이지도 등록한 순간 읽어 둔다(팀 정보 안에 있으면 다시 읽지 않는다) → 2·3번이 바로 답한다.
+            _spawn(_register_team_map(session["team_key"], [session["data"]["notion_page_id"], value],
+                                      session["data"]["notion_token"]))
 
     session["data"][key] = value
     step_index += 1
@@ -573,19 +602,19 @@ async def _run_action(turn: Turn, raw_text: str) -> None:
     try:
         if raw_text == "1":
             # 요약 글자가 chunk 이벤트로 흘러가고, done으로 스트림을 닫는다.
-            await fetch_project_info(config, on_stage=turn.status, on_chunk=turn.chunk)
+            await fetch_project_info(config, turn.team_key, on_stage=turn.status, on_chunk=turn.chunk)
             turn.done()
             return
         elif raw_text == "2":
             turn.status("🔍 진행상황을 확인하는 중...")
-            reply_text, unassigned_issues = await fetch_team_status(config)
+            reply_text, unassigned_issues = await fetch_team_status(config, turn.team_key, on_stage=turn.status)
             await turn.send(reply_text)
             if unassigned_issues:
                 await turn.send_buttons(*_claim_buttons(unassigned_issues), emphasis=True)
             return
         elif raw_text == "3":
             turn.status("🔍 내 역할을 확인하는 중...")
-            reply_text = await fetch_my_role(github_id, turn.user_name, config)
+            reply_text = await fetch_my_role(github_id, turn.user_name, config, turn.team_key, on_stage=turn.status)
         elif raw_text == "4":
             turn.status("🔍 완료된 작업을 확인하는 중...")
             reply_text = await share_completed_work(config, github_id)
@@ -742,15 +771,28 @@ async def _github_graphql(query: str, token: str, variables: dict | None = None)
 
 # ── 노션 페이지 읽기 (notion_read.py) ───────────────────────────────
 from notion_read import (  # noqa: E402
-    _block_text, _fetch_notion_page_by_id, _inline_database_lines, _list_child_blocks, _map_parallel,
+    notion_client_for, _block_text, _fetch_notion_page_by_id, _inline_database_lines, _list_child_blocks, _map_parallel,
     _query_database_rows, _rich_text,
 )
 
 
 # ── 1. 팀/프로젝트 정보 (Groq 스트리밍 요약) ─────────────────────
-async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None] | None = None) -> str:
+def _fit_for_groq(text: str, keep: str = "head") -> str:
+    """Groq 입력 예산(GROQ_INPUT_TOKENS)에 맞게 자른다. keep="tail"이면 뒤쪽(최근 것)을 남긴다."""
+    budget = GROQ_INPUT_TOKENS * 4  # 추정: 4바이트 ≈ 1토큰
+    data = text.encode("utf-8")
+    if len(data) <= budget:
+        return text
+    if keep == "tail":
+        return "(앞부분 생략)\n" + data[-budget:].decode("utf-8", errors="ignore")
+    return data[:budget].decode("utf-8", errors="ignore") + "\n(이하 생략)"
+
+
+async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None] | None = None) -> str | None:
+    """요약을 돌려준다. Groq 키가 없거나 실패하면 None — 호출부가 원문 앞부분을 보여주고 캐시하지 않는다."""
     if not GROQ_API_KEY or not raw_text.strip():
-        return raw_text
+        return None
+    raw_text = _fit_for_groq(raw_text)
 
     system_prompt = (
         "너는 팀 소개/프로젝트 정보 페이지 원문을 읽고 핵심만 간결하게 요약하는 도우미야.\n"
@@ -787,38 +829,53 @@ async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None]
                         full_text += delta
                         if on_chunk:
                             on_chunk(delta)
-        return full_text.strip()
+        return full_text.strip() or None
     except Exception:
         traceback.print_exc()
-        return raw_text
+        return None
 
 
-async def _get_project_summary(
-    page_id: str,
-    notion_client: Client,
-    on_stage: Callable[[str], None] | None = None,
-    on_chunk: Callable[[str], None] | None = None,
-) -> str:
-    """수정 시각(last_edited_time)이 지난번과 같으면 재귀 조회와 Groq 호출을 모두 건너뛴다."""
-    if on_stage:
-        on_stage("🔍 변경 여부를 확인하는 중...")
-    page_meta = await asyncio.to_thread(notion_client.pages.retrieve, page_id)
-    last_edited = page_meta.get("last_edited_time")
+def _team_roots(config: dict) -> list[str]:
+    """지도에 담을 루트: 팀 정보 페이지(기준)와 회의록 페이지. 회의록이 팀 정보 안에 있으면 따로 읽지 않는다."""
+    return [r for r in (config.get("notion_page_id"), config.get("meeting_notes_page_id")) if r]
 
-    cached = _project_summary_cache.get(page_id)
-    if cached and cached["last_edited"] == last_edited:
+
+_team_sync_locks: dict[str, threading.Lock] = {}
+_team_sync_locks_guard = threading.Lock()
+
+
+def _sync_team_map(team_key: str, roots: list[str], token: str, background: bool) -> dict:
+    """팀 정보·회의록 페이지의 구조·원문을 worklog 저장소에 맞춘다(바뀐 곳만 읽는다).
+    같은 팀을 동시에 두 번 맞추지 않는다(등록 직후·첫 메뉴·백그라운드 수집이 겹칠 때). 뒤에 온 쪽은 앞의 결과를
+    이어받아 바뀐 곳만 본다."""
+    with _team_sync_locks_guard:
+        lock = _team_sync_locks.setdefault(team_key, threading.Lock())
+    with lock:
+        return notion_map.sync_roots(worklog_bridge.WORKLOG_STORE, team_key, roots,
+                                     notion_client_for(token, background=background),
+                                     classify=worklog_bridge.groq_classify_sections)
+
+
+def _format_as_of(iso: str | None) -> str:
+    if not iso:
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+
+        when = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ZoneInfo(DISPLAY_TZ))
+        return when.strftime("%m/%d %H:%M")
+    except Exception:
+        return iso
+
+
+async def _summarize_snapshot(team_key: str, snapshot: dict, on_chunk: Callable[[str], None] | None = None) -> str:
+    """저장된 팀 정보 원문을 요약한다. 원문이 지난번과 같으면(해시 동일) Groq를 다시 부르지 않는다."""
+    content_hash = hashlib.sha256(snapshot["text"].encode("utf-8")).hexdigest()
+    cached = _project_summary_cache.get(team_key)
+    if cached and cached["hash"] == content_hash:
         if on_chunk:
             on_chunk(cached["summary"])
         return cached["summary"]
-
-    if on_stage:
-        on_stage("🔍 프로젝트 정보를 가져오는 중...")
-    raw_text = await asyncio.to_thread(_fetch_notion_page_by_id, page_id, notion_client)
-
-    if on_stage:
-        on_stage("🧠 요약 정리하는 중...")
-
-    # Groq 실패로 원문 폴백이 나면 조각이 하나도 안 흘러간다. 그때는 결과 전체를 한 번에 흘려준다.
     streamed = False
 
     def _track(delta: str) -> None:
@@ -827,27 +884,84 @@ async def _get_project_summary(
         if on_chunk:
             on_chunk(delta)
 
-    text = await _summarize_project_info(raw_text, on_chunk=_track)
-    if on_chunk and not streamed:
-        on_chunk(text)
-    _project_summary_cache[page_id] = {"last_edited": last_edited, "summary": text}
+    text = await _summarize_project_info(snapshot["text"], on_chunk=_track)
+    if text is None:
+        # 요약 실패(키 없음·Groq 오류): 원문 앞부분만 보여주고, 캐시하지 않아 다음에 다시 요약을 시도한다.
+        preview = snapshot["text"][:1500] + ("\n…" if len(snapshot["text"]) > 1500 else "")
+        fallback = f"⚠️ 요약을 만들지 못해 저장된 원문 앞부분을 보여줘요.\n\n{preview}"
+        if on_chunk and not streamed:
+            on_chunk(fallback)
+        return fallback
+    _project_summary_cache[team_key] = {"hash": content_hash, "summary": text}
     return text
 
 
-async def _prewarm_project_summary(page_id: str, notion_client: Client) -> None:
+async def _register_team_map(team_key: str, roots: list[str], token: str) -> None:
+    """설정에서 팀 정보·회의록 페이지를 등록한 순간, 구조와 원문을 한 번 읽어 저장하고 요약까지 만들어 둔다.
+    설정 마법사는 기다리지 않는다(백그라운드). 실패해도 메뉴를 처음 누를 때 다시 시도한다."""
     try:
-        await _get_project_summary(page_id, notion_client)
+        await asyncio.to_thread(_sync_team_map, team_key, roots, token, False)
+        snapshot = await asyncio.to_thread(worklog_bridge.team_snapshot, team_key, roots[0], _GROQ_INPUT_CHARS)
+        if snapshot:
+            await _summarize_snapshot(team_key, snapshot)
     except Exception:
         traceback.print_exc()
 
 
+async def _first_read(config: dict, team_key: str, on_stage: Callable[[str], None] | None) -> None:
+    """등록 때 읽기가 아직 안 끝났거나 실패했을 때만: 지금 한 번 읽는다(사용자 요청 우선순위)."""
+    if on_stage:
+        on_stage("🔍 Notion 페이지를 처음 읽는 중이에요 (한 번만 걸려요)...")
+    await asyncio.to_thread(_sync_team_map, team_key, _team_roots(config), config["notion_token"], False)
+
+
+async def _stored_notes(config: dict, team_key: str, on_stage: Callable[[str], None] | None = None) -> dict:
+    """2·3번용 회의 기록. Notion을 다시 읽지 않고 저장본을 쓴다(처음 한 번만 읽음)."""
+    notes_id = config.get("meeting_notes_page_id")
+    notes = await asyncio.to_thread(worklog_bridge.meeting_notes, team_key, notes_id, _GROQ_INPUT_CHARS)
+    if notes is None:
+        await _first_read(config, team_key, on_stage)
+        notes = await asyncio.to_thread(worklog_bridge.meeting_notes, team_key, notes_id, _GROQ_INPUT_CHARS)
+    return notes or {"texts": [], "as_of": None, "omitted": 0}
+
+
+def _note_footer(notes: dict) -> list[str]:
+    as_of = _format_as_of(notes.get("as_of"))
+    return ["", f"(Notion 기준 {as_of})"] if as_of else []
+
+
+def _brief(text: str, limit: int = 120) -> str:
+    """저장된 원문 한 건을 한 줄로: 머리줄([역할] 경로)을 빼고 내용 줄들을 이어 붙인다."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    body = " · ".join(lines[1:] or lines)
+    return body if len(body) <= limit else body[: limit - 1] + "…"
+
+
 async def fetch_project_info(
     config: dict,
+    team_key: str,
     on_stage: Callable[[str], None] | None = None,
     on_chunk: Callable[[str], None] | None = None,
 ) -> str:
-    notion_client = _notion_client_for(config)
-    return await _get_project_summary(config["notion_page_id"], notion_client, on_stage, on_chunk)
+    """팀/프로젝트 정보 — 저장해 둔 구조·원문으로 답한다(Notion을 다시 읽지 않음).
+    저장분은 등록할 때 처음 만들어지고, 이후 백그라운드 수집이 바뀐 곳만 갱신한다."""
+    root = config["notion_page_id"]
+    snapshot = await asyncio.to_thread(worklog_bridge.team_snapshot, team_key, root, _GROQ_INPUT_CHARS)
+    if snapshot is None:
+        await _first_read(config, team_key, on_stage)
+        snapshot = await asyncio.to_thread(worklog_bridge.team_snapshot, team_key, root, _GROQ_INPUT_CHARS)
+    if snapshot is None:
+        text = "팀 정보 페이지에서 읽을 내용을 찾지 못했어요."
+        if on_chunk:
+            on_chunk(text)
+        return text
+    if on_stage:
+        on_stage("🧠 요약 정리하는 중...")
+    summary = await _summarize_snapshot(team_key, snapshot, on_chunk)
+    as_of = _format_as_of(snapshot.get("as_of"))
+    if as_of and on_chunk:
+        on_chunk(f"\n\n(Notion 기준 {as_of})")
+    return summary
 
 
 # ── 회의록 → 확정 / 미정 분류 (Groq) ─────────────────────
@@ -856,7 +970,7 @@ async def _classify_meeting_notes(note_lines: list[str], cache_key: str) -> dict
     if not GROQ_API_KEY or not note_lines:
         return empty
 
-    raw_text = "\n".join(note_lines)
+    raw_text = _fit_for_groq("\n".join(note_lines), keep="tail")  # 최근 회의가 남도록 뒤쪽을 남긴다
     content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     cached = _meeting_notes_classification_cache.get(cache_key)
     if cached and cached["hash"] == content_hash:
@@ -944,47 +1058,6 @@ def _classify_tasks_by_github_state(
     return {"done": done, "in_progress": in_progress, "not_started": not_started, "unlinked": unlinked}
 
 
-def _page_property_text(properties: dict, prop_type: str) -> list[str]:
-    texts: list[str] = []
-    for prop in properties.values():
-        if prop.get("type") != prop_type:
-            continue
-        for item in prop.get(prop_type, []):
-            plain = item.get("plain_text", "")
-            if plain:
-                texts.append(plain)
-    return texts
-
-
-def _fetch_meeting_note_records(meeting_notes_page_id: str, notion_client: Client) -> list[tuple[str, str]]:
-    """회의록을 (원문 위치, 텍스트) 목록으로. 데이터베이스면 행마다, 일반 페이지면 페이지 전체 한 건."""
-    try:
-        rows = _query_database_rows(meeting_notes_page_id, notion_client)
-    except Exception:
-        try:
-            text = _fetch_notion_page_by_id(meeting_notes_page_id, notion_client)
-        except Exception:
-            return []
-        return [(f"notion:{meeting_notes_page_id}", text)]
-
-    records: list[tuple[str, str]] = []
-    for row in rows:
-        properties = row.get("properties", {})
-        title_parts = _page_property_text(properties, "title")
-        summary_parts = _page_property_text(properties, "rich_text")
-        row_text = " / ".join(p for p in (" ".join(title_parts), " ".join(summary_parts)) if p)
-        if row_text:
-            records.append((f"notion:{meeting_notes_page_id}:{row.get('id', '')}", row_text))
-    return records
-
-
-def _fetch_meeting_notes_lines(meeting_notes_page_id: str, notion_client: Client) -> list[str]:
-    records = _fetch_meeting_note_records(meeting_notes_page_id, notion_client)
-    if len(records) == 1 and records[0][0] == f"notion:{meeting_notes_page_id}":
-        return records[0][1].splitlines()  # 일반 페이지: 예전처럼 줄 단위
-    return [text for _, text in records]
-
-
 # ── 팀 기록 수집·분석 (worklog) ─────────────────────────────
 def _sync_notion_maps() -> dict[str, dict]:
     """설정된 모든 팀의 '팀 정보 페이지'를 루트로, 구조 지문 확인 → 바뀐 곳만 재스캔 → 지도대로 원문 수집.
@@ -995,14 +1068,15 @@ def _sync_notion_maps() -> dict[str, dict]:
         if not root or not config.get("notion_token"):
             continue
         try:
-            results[team_key] = notion_map.sync(worklog_bridge.WORKLOG_STORE, team_key, root, _notion_client_for(config),
-                                                classify=worklog_bridge.groq_classify_sections)
+            results[team_key] = _sync_team_map(team_key, _team_roots(config), config["notion_token"], background=True)
         except Exception:
             traceback.print_exc()
     return results
 
 
 async def _worklog_loop() -> None:
+    # 서버가 켜지자마자 수집을 시작하면 첫 사용자 요청과 겹친다. 잠시 기다렸다 시작한다.
+    await asyncio.sleep(worklog_bridge.START_DELAY_SECONDS)
     last_collect = 0.0
     while True:
         try:
@@ -1022,22 +1096,18 @@ async def _start_worklog() -> None:
 
 
 # ── 2. 팀 진행상황 조회 ─────────────────────────────
-async def fetch_team_status(config: dict) -> tuple[str, list[dict]]:
-    notion_client = _notion_client_for(config)
+async def fetch_team_status(config: dict, team_key: str,
+                            on_stage: Callable[[str], None] | None = None) -> tuple[str, list[dict]]:
+    """회의 기록은 저장본(worklog)에서, 이슈·커밋은 GitHub에서 읽는다. Notion은 다시 읽지 않는다."""
     github_token = config["github_token"]
     repo = config["github_repo"]
-
-    async def _fetch_notes() -> list[str]:
-        try:
-            return await asyncio.to_thread(_fetch_meeting_notes_lines, config["meeting_notes_page_id"], notion_client)
-        except Exception:
-            return []
 
     async def _fetch_issues() -> dict | list[dict]:
         return await _github_get_cached(repo, "/issues", github_token, {"state": "all", "per_page": 30})
 
-    note_lines, issues = await asyncio.gather(_fetch_notes(), _fetch_issues())
-    note_lines = [line.strip() for line in note_lines if line.strip()]
+    notes, issues = await asyncio.gather(_stored_notes(config, team_key, on_stage), _fetch_issues())
+    note_lines = [text.strip() for text in notes["texts"] if text.strip()]
+    footer = _note_footer(notes)
     issue_state_by_number: dict[int, str] = {i["number"]: i["state"] for i in issues if "pull_request" not in i}
 
     unassigned_open = [
@@ -1055,14 +1125,14 @@ async def fetch_team_status(config: dict) -> tuple[str, list[dict]]:
                 by_assignee.setdefault(a["login"], []).append(f"{i['title']} [{i['state']}]")
         lines = [f"{name}: {', '.join(tasks)}" for name, tasks in by_assignee.items()]
         result = ["👥 팀 진행상황", "\n".join(lines) if lines else "(회의록도 없고 등록된 이슈도 없어요)"]
-        return "\n".join(result + unassigned_hint), unassigned_open
+        return "\n".join(result + unassigned_hint + footer), unassigned_open
 
     classified = await _classify_meeting_notes(note_lines, config["meeting_notes_page_id"])
     confirmed, undecided = classified["confirmed"], classified["undecided"]
 
     if not confirmed and not undecided:
-        text = "👥 팀 진행상황 (요약 실패, 회의록 원문)\n" + "\n".join(f"- {line}" for line in note_lines[-10:])
-        return "\n".join([text] + unassigned_hint), unassigned_open
+        text = "👥 팀 진행상황 (요약 실패, 회의록 원문)\n" + "\n".join(f"- {_brief(t)}" for t in note_lines[-10:])
+        return "\n".join([text] + unassigned_hint + footer), unassigned_open
 
     commit_touched = await _get_commit_touched_issues(repo, github_token)
     tasks = _classify_tasks_by_github_state(confirmed, issue_state_by_number, commit_touched)
@@ -1078,15 +1148,16 @@ async def fetch_team_status(config: dict) -> tuple[str, list[dict]]:
         result += ["", "🆕 이슈 미등록 (회의에서만 언급됨)", *[f"- {t}" for t in tasks["unlinked"]]]
     if undecided:
         result += ["", "🤔 아직 정해야 할 사안", *[f"- {t}" for t in undecided[:10]]]
-    result += unassigned_hint
+    result += unassigned_hint + footer
 
     return "\n".join(result), unassigned_open
 
 
 # ── 3. 내 역할 조회 ─────────────────────────────
-async def fetch_my_role(github_id: str | None, display_name: str | None, config: dict) -> str:
+async def fetch_my_role(github_id: str | None, display_name: str | None, config: dict, team_key: str,
+                        on_stage: Callable[[str], None] | None = None) -> str:
+    """배정된 이슈는 GitHub에서, 회의록 속 내 이름은 저장본(worklog)에서 찾는다. Notion은 다시 읽지 않는다."""
     github_token = config["github_token"]
-    notion_client = _notion_client_for(config)
 
     async def _fetch_github_lines() -> tuple[list[str], set[int]]:
         if not github_id:
@@ -1103,17 +1174,14 @@ async def fetch_my_role(github_id: str | None, display_name: str | None, config:
             numbers.add(issue["number"])
         return lines, numbers
 
-    async def _fetch_note_lines() -> list[str]:
+    async def _fetch_notes() -> dict:
         if not display_name:
-            return []
-        try:
-            return await asyncio.to_thread(_fetch_meeting_notes_lines, config["meeting_notes_page_id"], notion_client)
-        except Exception:
-            return []
+            return {"texts": [], "as_of": None}
+        return await _stored_notes(config, team_key, on_stage)
 
-    (github_lines, github_issue_numbers), raw_note_lines = await asyncio.gather(
-        _fetch_github_lines(), _fetch_note_lines()
-    )
+    (github_lines, github_issue_numbers), notes = await asyncio.gather(_fetch_github_lines(), _fetch_notes())
+    # 원문 한 건의 첫 줄은 "[역할] 경로" 머리줄이라 빼고, 내용 줄 단위로 내 이름을 찾는다.
+    raw_note_lines = [line for text in notes["texts"] for line in text.splitlines()[1:]]
     if not github_lines:
         github_lines.append("- (배정된 GitHub 이슈가 없어요)")
 
@@ -1128,10 +1196,11 @@ async def fetch_my_role(github_id: str | None, display_name: str | None, config:
                 continue
             meeting_lines.append(f"- {stripped}")
 
+    meeting_lines = list(dict.fromkeys(meeting_lines))  # 같은 줄이 여러 기록에 있으면 한 번만
     result = ["👤 내 역할", "📌 GitHub 담당 이슈", *github_lines]
     if meeting_lines:
         result += ["📝 회의록 언급", *meeting_lines]
-    return "\n".join(result)
+    return "\n".join(result + _note_footer(notes))
 
 
 # ── 4. 완료된 작업 공유 ─────────────────────────────

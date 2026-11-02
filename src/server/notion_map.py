@@ -14,7 +14,10 @@
      판정은 바로 쓴다. 사람의 확인은 뒤쪽 변경 후보 승인에서 한다(같은 안전장치를 두 번 두지 않는다).
      애매한 것(확신 낮음, 판정 못 함, LLM 없음)은 분석하지 않고 원문만 보관한다. 상위 제목의 역할은 물려받는다.
      잘못된 판정은 `python -m worklog map-set`으로 고치면 되고, 보관해 둔 원문도 그에 맞게 풀린다.
+   - 첫 제목 위의 글(팀 소개 등)은 "(머리말)" 섹션이 된다.
 3. 수집
+   - 모든 섹션의 원문을 저장한다. 분석은 진행 기록·회의 섹션만 하고, 나머지는 보관만 한다.
+     저장된 원문은 1번 메뉴(팀/프로젝트 정보)가 Notion을 다시 읽지 않고 답하는 데 쓰인다.
    - 지도대로, 수정 시각이 바뀐 섹션·하위 페이지·DB 행만 본문까지 읽어 worklog에 원문으로 저장한다.
 """
 
@@ -51,6 +54,14 @@ def _title(block: dict) -> str:
     if kind == "child_database":
         return block.get("child_database", {}).get("title", "")
     return _rich_text(block.get(kind, {}))
+
+
+def intro_id(page_id: str) -> str:
+    return f"{page_id}:intro"
+
+
+def _is_text(block: dict) -> bool:
+    return block["type"] not in HEADINGS and block["type"] not in {"child_page", "child_database"} | UNREADABLE | CONTAINERS
 
 
 def _is_toggle(block: dict) -> bool:
@@ -102,6 +113,11 @@ def scan_page(page_id: str, path: str, blocks: list[dict], depth: int) -> tuple[
                    "layout": {"inline": inline, "pages": [], "databases": [], "unreadable": []}}
         found.append(section)
         return section
+
+    # 첫 제목 위에 적힌 글(팀 소개 등)도 하나의 섹션으로 둔다. 1번 메뉴(팀 정보)에 필요하다.
+    first = next((i for i, b in enumerate(blocks) if b["type"] in HEADINGS and HEADINGS[b["type"]] in boundary), len(blocks))
+    if any(_is_text(b) for b in blocks[:first]):
+        new_section(intro_id(page_id), "(머리말)", f"{path} > (머리말)", True, None)
 
     for block in blocks:
         kind = block["type"]
@@ -158,8 +174,14 @@ def _sample(client: Client, section: dict, blocks: list[dict]) -> str:
     """판정용 내용 앞부분. 본문을 재귀로 읽지 않고, 이미 받은 블록과 DB 앞쪽 몇 행만 본다."""
     layout = section["layout"]
     pieces: list[str] = []
-    index = next((i for i, b in enumerate(blocks) if b["id"] == section["id"]), None)
-    if index is not None and layout.get("inline"):
+    index = -1 if section["id"].endswith(":intro") else next((i for i, b in enumerate(blocks) if b["id"] == section["id"]), None)
+    if index == -1:
+        boundary = set(sorted({HEADINGS[b["type"]] for b in blocks if b["type"] in HEADINGS})[:2])
+        for block in blocks:
+            if block["type"] in HEADINGS and HEADINGS[block["type"]] in boundary:
+                break
+            pieces.append(_plain(block))
+    elif index is not None and layout.get("inline"):
         heading = blocks[index]
         if _is_toggle(heading):
             pieces += [_plain(b) for b in _list_child_blocks(heading["id"], client)]
@@ -278,28 +300,100 @@ def _query_rows(client: Client, database_id: str, since: str | None) -> list[dic
 
 def _inline_text(client: Client, blocks: list[dict], section_id: str) -> str:
     """제목 블록부터 다음 같은 급(이상) 제목 전까지. 하위 페이지·DB는 따로 모으므로 뺀다."""
-    index = next((i for i, b in enumerate(blocks) if b["id"] == section_id), None)
-    if index is None:
-        return ""
-    heading = blocks[index]
     boundary = set(sorted({HEADINGS[b["type"]] for b in blocks if b["type"] in HEADINGS})[:2])
-    lines = _block_text(heading, client)
-    if _is_toggle(heading):
-        return "\n".join(line for line in lines if line.strip())  # 내용은 토글 안쪽뿐
+    if section_id.endswith(":intro"):  # 머리말: 페이지 처음부터 첫 제목 전까지
+        index, lines = -1, []
+    else:
+        index = next((i for i, b in enumerate(blocks) if b["id"] == section_id), None)
+        if index is None:
+            return ""
+        heading = blocks[index]
+        lines = _block_text(heading, client)
+        if _is_toggle(heading):
+            return "\n".join(line for line in lines if line.strip()) if len(lines) > 1 else ""  # 내용은 토글 안쪽뿐
     for block in blocks[index + 1:]:
         if block["type"] in HEADINGS and HEADINGS[block["type"]] in boundary:
             break
         if block["type"] in {"child_page", "child_database"} | UNREADABLE:
             continue
         lines.extend(_block_text(block, client))
-    return "\n".join(line for line in lines if line.strip())
+    body = [line for line in lines if line.strip()]
+    if index >= 0 and len(body) <= 1:
+        return ""  # 제목만 있고 내용이 없으면 저장할 원문이 없다
+    return "\n".join(body)
 
 
-def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classifier | None = None) -> dict[str, Any]:
-    """구조 확인 → (바뀐 페이지만) 재스캔 → 지도대로 수집. 한 번 호출이 한 번의 접근이다."""
+def _covered_ids(store: Path, scope: str) -> set[str]:
+    """지도에 이미 들어 있는 페이지·하위 페이지·DB의 ID."""
+    ids = {p["page_id"] for p in wsections.pages(store, scope)}
+    for section in wsections.sections(store, scope):
+        ids.add(section["id"])
+        ids.update(item["id"] for key in ("pages", "databases") for item in section["layout"].get(key, []))
+    return ids
+
+
+def sync_roots(store: Path, scope: str, roots: list[str], client: Client, classify: Classifier | None = None) -> dict[str, Any]:
+    """루트 여러 개(팀 정보 페이지, 회의록 페이지)를 차례로 맞춘다.
+
+    - 첫 루트(팀 정보 페이지)가 기준이다. 다음 루트가 이미 그 안에 들어 있으면(하위 페이지·DB로) 따로 읽지 않는다.
+    - 설정에서 빠진 루트의 지도는 정리한다(쌓인 원문과 이력은 남는다).
+    """
+    roots = [r for i, r in enumerate(roots) if r and r not in roots[:i]]
+    stats: dict[str, Any] = {"pages_checked": 0, "structure_changed": [], "sections_added": [], "sections_removed": [],
+                             "judged": 0, "records_new": 0, "superseded": 0, "roots": {}}
+    for page_id, old in [(p["page_id"], p) for p in wsections.pages(store, scope) if p["root_id"] not in roots]:
+        wsections.save_page(store, scope, page_id, old["root_id"], old["path"], old["last_edited"], old["fingerprint"], status="gone")
+        stats["sections_removed"] += _remove_page_sections(store, scope, page_id, keep=set())
+    for index, root in enumerate(roots):
+        if index > 0 and root in _covered_ids(store, scope) - {p["page_id"] for p in wsections.pages(store, scope) if p["root_id"] == root}:
+            stats["roots"][root] = "inside first root"
+            continue
+        try:
+            one = sync(store, scope, root, client, classify, retire_other_roots=False)
+        except Exception as error:
+            if index == 0:
+                raise  # 팀 정보 페이지를 못 읽으면 실패로 알린다
+            stats["roots"][root] = f"error: {error}"  # 회의록 페이지를 못 읽어도 팀 정보는 그대로 쓴다
+            continue
+        stats["roots"][root] = "synced"
+        for key, value in one.items():
+            if key in stats and isinstance(value, (int, list)):
+                stats[key] += value
+    return stats
+
+
+def _sync_database_root(store: Path, scope: str, database_id: str, client: Client, classify: Classifier | None,
+                        stats: dict[str, Any]) -> None:
+    """루트가 페이지가 아니라 데이터베이스(예: 회의록 DB)일 때: DB 전체가 한 섹션이다."""
+    meta = client.databases.retrieve(database_id)
+    title = "".join(t.get("plain_text", "") for t in meta.get("title", [])) or "데이터베이스"
+    stored = next((p for p in wsections.pages(store, scope) if p["page_id"] == database_id), None)
+    fp = wdb.sha256(["database", database_id, title])
+    if not stored or stored["fingerprint"] != fp:
+        stats["structure_changed"].append(title)
+        section = {"id": database_id, "page_id": database_id, "title": title, "path": title, "inherit_from": None,
+                   "inherit_id": None, "layout": {"inline": False, "pages": [], "databases": [{"id": database_id, "title": title}],
+                                                  "unreadable": []}}
+        before = {s["id"] for s in wsections.sections(store, scope, database_id)}
+        stats["judged"] += _judge_sections(store, scope, client, [section], [], title, classify)
+        wsections.save_section(store, scope, section)
+        stats["sections_added"] += [] if database_id in before else [title]
+    wsections.save_page(store, scope, database_id, database_id, title, meta.get("last_edited_time"), fp)
+
+
+def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classifier | None = None,
+         retire_other_roots: bool = True) -> dict[str, Any]:
+    """루트 하나: 구조 확인 → (바뀐 페이지만) 재스캔 → 지도대로 수집. 한 번 호출이 한 번의 접근이다.
+    루트를 바꿨으면 옛 루트의 지도는 정리한다. 루트가 여러 개면 sync_roots를 쓴다."""
     stats: dict[str, Any] = {"pages_checked": 0, "structure_changed": [], "sections_added": [], "sections_removed": [],
                              "judged": 0, "records_new": 0, "superseded": 0}
-    known = {p["page_id"]: p for p in wsections.pages(store, scope)}
+    all_pages = {p["page_id"]: p for p in wsections.pages(store, scope)}
+    if retire_other_roots:  # 루트 하나로 부를 때: 루트가 바뀌었으면 옛 지도 정리(sync_roots는 직접 정리한다)
+        for page_id, old in all_pages.items():
+            if old["root_id"] != root_id:
+                wsections.save_page(store, scope, page_id, old["root_id"], old["path"], old["last_edited"], old["fingerprint"], status="gone")
+                stats["sections_removed"] += _remove_page_sections(store, scope, page_id, keep=set())
+    known = {pid: p for pid, p in all_pages.items() if p["root_id"] == root_id}
     queue: list[tuple[str, str | None, int]] = [(root_id, None, 0)]
     queue += [(pid, p["path"], p["path"].count(" > ")) for pid, p in known.items() if pid != root_id]
     seen_pages: set[str] = set()
@@ -316,7 +410,8 @@ def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classi
             meta = client.pages.retrieve(page_id)
         except Exception:
             if page_id == root_id:
-                raise
+                _sync_database_root(store, scope, root_id, client, classify, stats)  # 루트가 데이터베이스(회의록 DB 등)
+                continue
             wsections.save_page(store, scope, page_id, root_id, path or page_id, None, None, status="gone")
             stats["sections_removed"] += _remove_page_sections(store, scope, page_id, keep=set())
             continue
@@ -358,9 +453,10 @@ def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classi
             wsections.save_page(store, scope, page_id, root_id, stored["path"], stored["last_edited"], stored["fingerprint"], status="gone")
             stats["sections_removed"] += _remove_page_sections(store, scope, page_id, keep=set())
 
+    mine = {p["page_id"] for p in wsections.pages(store, scope) if p["root_id"] == root_id}
     for section in wsections.sections(store, scope):
         hold = wsections.hold_for(section)
-        if hold is False:
+        if hold is False or section["page_id"] not in mine:  # 다른 루트의 섹션은 그 루트를 맞출 때 모은다
             continue
         new, superseded = _collect_section(store, scope, client, section, fresh_blocks, hold)
         stats["records_new"] += new

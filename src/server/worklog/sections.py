@@ -7,7 +7,7 @@ Notion API는 모른다. 어떤 섹션이 있는지는 server/notion_map.py가 �
 - progress  (팀원별 진행 기록) → 역할·작업으로 분석
 - meeting   (회의록)           → 결정·작업으로 분석
 - reference (멘토링, WBS 등)   → 원문만 보관, 분석 안 함
-- unknown / ignore             → 수집 안 함
+- ignore    (소개, 규칙, 양식) → 원문만 보관 (1번 메뉴 팀 정보에는 쓰임), 분석 안 함
 
 판정은 server/notion_map.py가 LLM으로 하고 바로 쓴다(별도 확인 단계 없음 — 사람 확인은 변경 후보 승인에서 한다).
 - 애매한 섹션은 notion_map이 reference(보관만)로 정해 둔다.
@@ -26,10 +26,10 @@ from .core import release
 from .db import NotFoundError, ValidationError, to_json
 
 ANALYZE_ROLES = {"progress", "meeting"}
-ROLE_NAMES = {"progress": "진행 기록", "meeting": "회의", "reference": "보관만", "ignore": "수집 안 함", "unknown": "모름"}
+ROLE_NAMES = {"progress": "진행 기록", "meeting": "회의", "reference": "보관만", "ignore": "분석 제외", "unknown": "모름"}
 # 명령에서 한국어로도 역할을 쓸 수 있게
 ROLE_ALIASES = {"진행": "progress", "진행 기록": "progress", "회의": "meeting", "보관": "reference", "보관만": "reference",
-                "참고": "reference", "제외": "ignore", "수집 안 함": "ignore", **{r: r for r in ("progress", "meeting", "reference", "ignore")}}
+                "참고": "reference", "제외": "ignore", "분석 제외": "ignore", **{r: r for r in ("progress", "meeting", "reference", "ignore")}}
 SOURCE_NAMES = {"llm": "LLM", "inherit": "상위 제목", "human": "사람", "none": "판정 못 함"}
 ROLES = ANALYZE_ROLES | {"reference", "unknown", "ignore"}
 SECTION_STATUSES = {"active", "inactive"}
@@ -40,10 +40,11 @@ def conversation_key(section_id: str) -> str:
 
 
 def hold_for(section: dict[str, Any]) -> str | None | bool:
-    """이 섹션의 원문을 어떻게 저장할지. False면 수집하지 않는다."""
-    if section["status"] == "inactive" or section["role"] in {"unknown", "ignore"}:
+    """이 섹션의 원문을 어떻게 저장할지. 모든 섹션을 저장하고(팀 정보 요약에 쓰임), 분석은 진행 기록·회의만 한다.
+    False면 수집하지 않는다(사라진 섹션)."""
+    if section["status"] == "inactive":
         return False
-    return "reference" if section["role"] == "reference" else None
+    return None if section["role"] in ANALYZE_ROLES else "reference"
 
 
 def _section(row: Any) -> dict[str, Any]:
@@ -79,7 +80,9 @@ def save_page(store: Path, scope: str, page_id: str, root_id: str, path: str, la
 # ---------------------------------------------------------------- sections
 
 
-def sections(store: Path, scope: str, page_id: str | None = None, include_inactive: bool = False) -> list[dict[str, Any]]:
+def sections(store: Path, scope: str, page_id: str | None = None, include_inactive: bool = False,
+             page_order: bool = False) -> list[dict[str, Any]]:
+    """page_order=True면 페이지에 나온 순서(스캔 순서)로, 아니면 경로 순으로."""
     db.initialize(store)
     sql, args = "SELECT * FROM source_sections WHERE scope = ?", [scope]
     if page_id is not None:
@@ -87,7 +90,7 @@ def sections(store: Path, scope: str, page_id: str | None = None, include_inacti
     if not include_inactive:
         sql += " AND status != 'inactive'"
     with closing(db.connect(store)) as c:
-        return [_section(r) for r in c.execute(sql + " ORDER BY path, rowid", args)]
+        return [_section(r) for r in c.execute(sql + (" ORDER BY rowid" if page_order else " ORDER BY path, rowid"), args)]
 
 
 def save_section(store: Path, scope: str, section: dict[str, Any]) -> dict[str, Any]:
@@ -242,3 +245,82 @@ def role_table(store: Path, scope: str) -> list[dict[str, Any]]:
     return [{"id": s["id"], "section": s["path"], "role": s["role"], "role_name": ROLE_NAMES.get(s["role"], s["role"]),
              "decided_by": s.get("decided_by") if s["role_source"] == "human" else SOURCE_NAMES.get(s["role_source"], s["role_source"]),
              "why": s.get("role_note")} for s in sections(store, scope)]
+
+
+def _latest_records(c: Any, section_id: str) -> list[dict[str, Any]]:
+    """섹션의 원문 중 위치(하위 페이지·행)마다 최신 버전 하나씩."""
+    latest: dict[str, dict[str, Any]] = {}
+    for row in c.execute(
+            """SELECT s.locator, s.content, s.captured_at FROM work_records w JOIN sources s ON s.id = w.source_id
+               WHERE w.conversation_key = ? AND (w.hold IS NULL OR w.hold != 'superseded') ORDER BY w.rowid""",
+            (conversation_key(section_id),)):
+        latest[row["locator"]] = dict(row)
+    return list(latest.values())
+
+
+def _root_pages(c: Any, scope: str, root_id: str) -> set[str]:
+    return {r["page_id"] for r in c.execute(
+        "SELECT page_id FROM source_pages WHERE scope = ? AND root_id = ? AND status = 'active'", (scope, root_id))}
+
+
+def meeting_notes(store: Path, scope: str, notes_id: str | None, max_chars: int = 8000,
+                  per_record: int = 2000) -> dict[str, Any] | None:
+    """2·3번 메뉴용 회의 기록: 회의 역할 섹션 + 설정된 회의록 페이지(또는 DB)에 속한 섹션의 저장된 원문.
+    최근 수정된 것부터 max_chars까지 담아 시간순으로 돌려준다(Notion 호출 없음). 아직 수집 전이면 None.
+    한 건이 아주 길어도(회의록 한 행이 1만 자 넘는 경우) per_record까지만 담아, 최근 몇 건이 고르게 들어가게 한다."""
+    db.initialize(store)
+    found = sections(store, scope, page_order=True)
+    if not found:
+        return None
+    with closing(db.connect(store)) as c:
+        notes_pages = _root_pages(c, scope, notes_id) if notes_id else set()
+        chosen = [s for s in found if s["role"] == "meeting" or s["page_id"] in notes_pages or s["id"] == notes_id
+                  or any(item["id"] == notes_id for key in ("pages", "databases") for item in s["layout"].get(key, []))]
+        records = [r for s in chosen for r in _latest_records(c, s["id"])]
+        as_of = c.execute("SELECT MAX(checked_at) FROM source_pages WHERE scope = ? AND status = 'active'", (scope,)).fetchone()[0]
+    records.sort(key=lambda r: r["captured_at"] or "", reverse=True)
+    picked: list[str] = []
+    total = 0
+    for record in records:
+        content = record["content"]
+        if len(content) > per_record:
+            content = content[:per_record] + "\n…(이하 생략)"
+        if total + len(content) > max_chars:
+            if not picked:
+                picked.append(content[:max_chars])  # 첫 건도 상한을 넘으면 잘라서라도 넣는다
+            break
+        picked.append(content)
+        total += len(content)
+    return {"texts": list(reversed(picked)), "as_of": as_of, "omitted": len(records) - len(picked)}
+
+
+def snapshot(store: Path, scope: str, max_chars: int = 12000, per_section: int = 1500,
+             root_id: str | None = None) -> dict[str, Any] | None:
+    """저장된 원문으로 팀 정보 페이지 전체를 다시 엮는다(Notion 호출 없음). 1번 메뉴 요약용.
+    root_id를 주면 그 루트(팀 정보 페이지) 아래 섹션만. 섹션마다 위치별 최신 버전만 쓰고,
+    너무 길면 섹션별·전체 길이를 자른다. 아직 수집 전이면 None."""
+    db.initialize(store)
+    found = sections(store, scope, page_order=True)
+    if root_id:
+        with closing(db.connect(store)) as c:
+            mine = _root_pages(c, scope, root_id)
+        found = [s for s in found if s["page_id"] in mine]
+    if not found:
+        return None
+    parts: list[str] = []
+    total = 0
+    with closing(db.connect(store)) as c:
+        for section in found:
+            latest = _latest_records(c, section["id"])
+            if not latest:
+                continue
+            text = "\n".join(r["content"] for r in latest)[:per_section]
+            if total + len(text) > max_chars:
+                parts.append("(이하 생략)")
+                break
+            parts.append(text)
+            total += len(text)
+        as_of = c.execute("SELECT MAX(checked_at) FROM source_pages WHERE scope = ? AND status = 'active'", (scope,)).fetchone()[0]
+    if not parts:
+        return None
+    return {"text": "\n\n".join(parts), "as_of": as_of}
