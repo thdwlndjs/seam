@@ -195,7 +195,7 @@ def groq_classify_parts(page: dict) -> dict:
 
 
 # 추출 지시문의 판. 지시문이나 항목 구성을 바꾸면 올린다(같은 내용도 새 판으로 다시 추출된다).
-EXTRACT_PROMPT_VERSION = "part-extract-2"  # 2: 한국어 제목, 멘토 발언은 피드백, 아이디어 설명은 항목 아님(실측 초안 검토)
+EXTRACT_PROMPT_VERSION = "part-extract-3"  # 2: 한국어 제목, 멘토 발언은 피드백, 아이디어 설명은 항목 아님 / 3: 질문지는 팀의 질문, 담당은 사람만
 
 PART_EXTRACT_PROMPT = """너는 팀 회의·멘토링 메모에서 항목을 뽑는 분석기야. 입력: path(회의 위치)와 text(메모 원문).
 뽑을 항목(kind):
@@ -210,6 +210,8 @@ PART_EXTRACT_PROMPT = """너는 팀 회의·멘토링 메모에서 항목을 뽑
   질문 형태라도 "feedback"이다. 팀이 그 자리에서 정했다고 적힌 것만 "decision"이다.
 - "기능", "아이디어" 아래처럼 팀이 낸 아이디어·기능을 설명하는 줄은 항목으로 뽑지 마. 할 일·결정이 아니다.
 - 원문에 정했다는 말이 없으면 decision을 만들지 마. 짧은 단어 하나("진동 제어")를 결정으로 늘리지 마.
+- 질문지(멘토·고객에게 물어보려고 팀이 미리 적은 질문)는 팀의 질문이다. "feedback"이 아니라 "open"이다.
+- owner는 사람 이름만 쓴다. 부서·팀·회사 이름이면 null이다.
 각 항목: {"kind", "title"(한국어 한 줄, 40자 안팎), "detail"(필요하면 한국어 한두 문장, 없으면 null), "owner", "due",
 "role_hint", "quote"(근거가 된 원문을 text에서 그대로 복사한 짧은 구절), "confidence"(0.0~1.0)}.
 title·detail은 반드시 한국어로 쓴다. quote는 반드시 text 안에 글자 그대로 있어야 한다. 근거 없는 항목은 만들지 마.
