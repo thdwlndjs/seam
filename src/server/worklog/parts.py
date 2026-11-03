@@ -270,6 +270,7 @@ def _remove_ranges(md: str, ranges: list[tuple[int, int]]) -> str:
 
 JUDGE_BUDGET_TOKENS = 4000  # [가정] 동기화 한 번에 판정에 쓰는 토큰(추정). 메뉴가 쓸 분당 한도를 남긴다
 PROMPT_TOKENS = 450  # 판정 지시문 몫(추정)
+RETRIES = 3  # 쉬어 가는 모드(reindex)에서 한도 초과 뒤 다시 시도하는 횟수
 
 
 def estimate_tokens(payload: Any) -> int:
@@ -318,10 +319,17 @@ def judge_pending(store: Path, scope: str, classify: PartClassifier | None,
             cost = estimate_tokens(payload["parts"])
             if budget_tokens is not None and spent and spent + cost > budget_tokens:
                 return judged  # 이번 몫을 다 씀: 남은 것은 다음 동기화에서
-            try:
-                answer = classify(payload) or {}
-            except Exception:
-                return judged  # 한도 초과(429) 등: 이번에는 멈추고 남은 것은 다음 동기화에서 판정한다
+            answer = None
+            for attempt in range(RETRIES + 1 if tokens_per_minute else 1):
+                try:
+                    answer = classify(payload) or {}
+                    break
+                except Exception:
+                    if not tokens_per_minute or attempt == RETRIES:
+                        return judged  # 한도 초과(429) 등: 이번에는 멈추고 남은 것은 다음 동기화에서 판정한다
+                    (sleep or __import__("time").sleep)(60)  # 쉬어 가는 모드: 분당 한도가 풀릴 때까지 기다렸다 다시
+            if answer is None:
+                return judged
             spent += cost
             by_id = {a.get("part_id"): a for a in answer.get("parts", []) if isinstance(a, dict)}
             with db.write(store) as c:

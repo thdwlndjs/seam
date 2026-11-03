@@ -156,6 +156,23 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)  # 한도에 걸리면 다음 페이지를 바로 부르지 않는다
         self.assertEqual(parts.judge_pending(self.store, SCOPE, split_classifier(), budget_tokens=None), 12)  # 다음 번에 전부
 
+    def test_paced_mode_waits_a_minute_and_retries_after_a_rate_limit(self) -> None:
+        built = parts.build_unit_parts("unit-1", "회의록 > unit-1", SAMPLE_MD, SAMPLE_BLOCKS)
+        parts.save_unit_parts(self.store, SCOPE, "notion", "unit-1", "sec-1", built)
+        ok = split_classifier()
+        answers = iter([RuntimeError("429"), None])
+
+        def flaky(page: dict) -> dict:
+            outcome = next(answers)
+            if outcome is not None:
+                raise outcome
+            return ok(page)
+
+        waits: list[float] = []
+        judged = parts.judge_pending(self.store, SCOPE, flaky, budget_tokens=None, tokens_per_minute=6000, sleep=waits.append)
+        self.assertEqual(judged, 6)
+        self.assertEqual(waits[0], 60)  # 한도가 풀릴 때까지 기다린 뒤 다시
+
     def test_budget_splits_big_pages_and_stops_for_this_round(self) -> None:
         big = "\n".join(f"## 항목 {i}\n" + "내용 " * 300 for i in range(30))  # 부분 30개, 판정 한 번에 다 못 넣는 크기
         parts.save_unit_parts(self.store, SCOPE, "notion", "old-page", "sec-1",

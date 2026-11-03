@@ -629,13 +629,16 @@ class MarkdownCollectTests(unittest.TestCase):
         notion_map.sync(self.store, SCOPE, "root", ClientView(self.fake), classify=None)  # LLM 없이: "판정 못 함"
         found = {s["title"]: s for s in sections.sections(self.store, SCOPE)}
         self.assertEqual(found["회의록"]["role_source"], "none")
+        with closing(sqlite3.connect(self.store)) as c:  # 커서가 행 수정 시각보다 뒤: 커서를 남기면 r1이 조회되지 않는다
+            c.execute("UPDATE source_sections SET cursor = '2099-01-01T00:00:00Z'")
+            c.commit()
         self.fake.calls.clear()
         stats = reindex.reindex(self.store, SCOPE, ["root"], MarkdownClientView(self.fake, {"r1": self.ROW_MD}),
                                 classify=FakeClassifier(), classify_parts=meeting_kinds, sleep=lambda seconds: None)
         self.assertTrue(Path(stats["backup"]).exists())
         found = {s["title"]: s for s in sections.sections(self.store, SCOPE)}
         self.assertEqual((found["회의록"]["role"], found["회의록"]["role_source"]), ("meeting", "llm"))
-        self.assertIn("md:r1", self.fake.calls)  # 바뀌지 않은 행도 다시 읽는다
+        self.assertIn("md:r1", self.fake.calls)  # 바뀌지 않은 행도 다시 읽는다(DB 조회 커서도 지운다)
         self.assertTrue(parts.has_parts(self.store, SCOPE, "r1"))
 
     def test_link_outside_headings_is_scanned_like_a_subpage(self) -> None:

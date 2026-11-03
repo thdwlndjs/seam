@@ -54,6 +54,8 @@ def forget_edit_times(store: Path, scope: str) -> None:
         c.execute("UPDATE source_pages SET last_edited = NULL, fingerprint = NULL WHERE scope = ?", (scope,))
         c.execute("""UPDATE source_units SET last_edited = '' WHERE section_id IN
                      (SELECT id FROM source_sections WHERE scope = ?)""", (scope,))
+        # DB 조회 커서(마지막 수정 시각 이후만 조회)도 지운다. 남겨 두면 그보다 먼저 수정된 행은 조회되지 않는다.
+        c.execute("UPDATE source_sections SET cursor = NULL WHERE scope = ?", (scope,))
 
 
 REINDEX_TOKENS_PER_MINUTE = 6000  # Groq 무료 등급 분당 8,000토큰 중 메뉴 몫을 남긴다
