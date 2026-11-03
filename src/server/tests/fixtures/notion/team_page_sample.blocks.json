@@ -1,0 +1,21 @@
+[
+ {"id": "tp-00", "type": "file", "has_children": false, "text": ""},
+ {"id": "tp-01", "type": "callout", "has_children": false, "text": "팀 소개 페이지 예시입니다."},
+ {"id": "tp-02", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "tp-03", "type": "heading_2", "has_children": false, "text": "To do"},
+ {"id": "tp-04", "type": "divider", "has_children": false, "text": ""},
+ {"id": "tp-05", "type": "to_do", "has_children": false, "text": "기능 흐름 만들기"},
+ {"id": "tp-06", "type": "to_do", "has_children": false, "text": "시연 영상"},
+ {"id": "tp-07", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "tp-08", "type": "heading_3", "has_children": false, "text": "프로젝트 기본정보"},
+ {"id": "tp-09", "type": "bulleted_list_item", "has_children": false, "text": "프로젝트 주제 :"},
+ {"id": "tp-10", "type": "bulleted_list_item", "has_children": false, "text": "팀명 : 예시팀"},
+ {"id": "tp-11", "type": "child_page", "has_children": true, "text": "참고 페이지"},
+ {"id": "tp-12", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "tp-13", "type": "child_database", "has_children": false, "text": ""},
+ {"id": "tp-14", "type": "child_database", "has_children": false, "text": ""},
+ {"id": "tp-15", "type": "heading_3", "has_children": false, "text": "팀원별 진행상황 기록"},
+ {"id": "tp-16", "type": "table", "has_children": true, "text": ""},
+ {"id": "tp-17", "type": "paragraph", "has_children": false, "text": " [녹음 노트 공유]"},
+ {"id": "tp-18", "type": "paragraph", "has_children": false, "text": ""}
+]

@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 team_configs.json
 member_profiles.json
+
+# 실제 Notion 녹화본(공개 저장소라 커밋하지 않음)
+src/server/tests/fixtures/notion_local/
