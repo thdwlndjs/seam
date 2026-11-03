@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import isolation  # noqa: F401,I001  실제 저장소·키를 쓰지 않게(맨 먼저)
+
 import asyncio
 import os
 import sys
@@ -14,7 +16,7 @@ os.environ.setdefault("BOT_SERVER_SECRET", "test-secret")
 os.environ["WORKLOG_LOOP"] = "0"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import groq_queue  # noqa: E402
+import llm_queue  # noqa: E402
 import main  # noqa: E402
 import metrics  # noqa: E402
 import notion_map  # noqa: E402
@@ -95,7 +97,7 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual(parts.extract_pending(self.store, SCOPE, lambda p: {}, V1), 0)
 
         def busy(payload: dict) -> dict:
-            raise groq_queue.Busy("minute", 30)
+            raise llm_queue.Busy("minute", 30)
 
         self.assertEqual(parts.extract_pending(self.store, SCOPE, busy, V1), 0)
         self.assertEqual(parts.pending_count(self.store, SCOPE, V1), 6)
@@ -140,44 +142,113 @@ class QueueTests(unittest.TestCase):  # A21
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Path(self.tmp.name) / "w.sqlite3"
-        groq_queue.reset_for_tests()
+        llm_queue.reset_for_tests()
 
     def tearDown(self) -> None:
-        groq_queue.reset_for_tests()
+        llm_queue.reset_for_tests()
         self.tmp.cleanup()
 
+    GROQ, CEREBRAS = llm_queue.PROVIDERS
+
     def test_user_calls_are_never_blocked_but_background_waits_for_the_minute_reset(self) -> None:
-        groq_queue.record(self.store, groq_queue.USER, {"x-ratelimit-remaining-tokens": "300",
-                                                        "x-ratelimit-reset-tokens": "7.5s"}, 200, 1000)
-        groq_queue.check(groq_queue.USER, 5000, self.store)  # 사람이 기다리는 호출은 그대로
-        with self.assertRaises(groq_queue.Busy) as busy:
-            groq_queue.check(groq_queue.BACKGROUND, 1000, self.store)
-        self.assertEqual(busy.exception.reason, "minute")
+        llm_queue.record(self.store, "groq", llm_queue.USER, {"x-ratelimit-remaining-tokens": "300",
+                                                              "x-ratelimit-reset-tokens": "7.5s"}, 200, 1000)
+        llm_queue.check(self.GROQ, llm_queue.USER, 5000, self.store)  # 사람이 기다리는 호출은 그대로
+        with self.assertRaises(llm_queue.Busy) as busy:
+            llm_queue.check(self.GROQ, llm_queue.BACKGROUND, 1000, self.store)
+        self.assertEqual((busy.exception.reason, busy.exception.provider), ("minute", "groq"))
         self.assertLessEqual(busy.exception.wait_seconds, 7.5)
-        groq_queue.check(groq_queue.BACKGROUND, 200, self.store)  # 남은 양 안이면 된다
+        llm_queue.check(self.GROQ, llm_queue.BACKGROUND, 200, self.store)  # 남은 양 안이면 된다
+        llm_queue.check(self.CEREBRAS, llm_queue.BACKGROUND, 1000, self.store)  # 공급자마다 따로 센다
 
     def test_429_blocks_background_until_retry_after(self) -> None:
-        groq_queue.record(self.store, groq_queue.BACKGROUND, {"retry-after": "30"}, 429, 0)
-        with self.assertRaises(groq_queue.Busy) as busy:
-            groq_queue.check(groq_queue.BACKGROUND, 10, self.store)
+        llm_queue.record(self.store, "groq", llm_queue.BACKGROUND, {"retry-after": "30"}, 429, 0)
+        with self.assertRaises(llm_queue.Busy) as busy:
+            llm_queue.check(self.GROQ, llm_queue.BACKGROUND, 10, self.store)
         self.assertGreater(busy.exception.wait_seconds, 25)
-        self.assertIn("초 뒤 이어서 정리해요", groq_queue.busy_message(busy.exception))
+        self.assertIn("초 뒤 이어서 정리해요", llm_queue.busy_message(busy.exception))
 
     def test_background_keeps_to_its_daily_share(self) -> None:
-        share = int(groq_queue.DAILY_TOKENS * groq_queue.BACKGROUND_SHARE)
-        groq_queue.record(self.store, groq_queue.USER, {}, 200, share - 500)
-        groq_queue.check(groq_queue.BACKGROUND, 400, self.store)
-        with self.assertRaises(groq_queue.Busy) as busy:
-            groq_queue.check(groq_queue.BACKGROUND, 600, self.store)
+        share = int(self.GROQ.daily_tokens * self.GROQ.background_share)
+        llm_queue.record(self.store, "groq", llm_queue.USER, {}, 200, share - 500)
+        llm_queue.check(self.GROQ, llm_queue.BACKGROUND, 400, self.store)
+        with self.assertRaises(llm_queue.Busy) as busy:
+            llm_queue.check(self.GROQ, llm_queue.BACKGROUND, 600, self.store)
         self.assertEqual(busy.exception.reason, "daily")
-        self.assertIn("내일 다시 정리돼요", groq_queue.busy_message(busy.exception))
-        groq_queue.check(groq_queue.USER, 10_000, self.store)  # 사람이 누른 것은 한도 끝까지
-        self.assertEqual(groq_queue.daily_usage(self.store)["tokens"], share - 500)
+        self.assertIn("내일 다시 정리돼요", llm_queue.busy_message(busy.exception))
+        llm_queue.check(self.GROQ, llm_queue.USER, 10_000, self.store)  # 사람이 누른 것은 한도 끝까지
+        self.assertEqual(llm_queue.daily_usage(self.store, "groq")["tokens"], share - 500)
+        self.assertEqual(llm_queue.daily_usage(self.store, "cerebras")["tokens"], 0)
+
+    def test_cerebras_keeps_to_five_calls_a_minute(self) -> None:
+        for _ in range(self.CEREBRAS.rpm):
+            llm_queue.check(self.CEREBRAS, llm_queue.BACKGROUND, 100, self.store)
+            llm_queue.record(self.store, "cerebras", llm_queue.BACKGROUND, {}, 200, 100)
+        with self.assertRaises(llm_queue.Busy) as busy:
+            llm_queue.check(self.CEREBRAS, llm_queue.BACKGROUND, 100, self.store)
+        self.assertEqual((busy.exception.reason, busy.exception.provider), ("minute", "cerebras"))
+
+    def test_background_falls_back_to_cerebras_when_groq_is_used_up(self) -> None:
+        calls: list[str] = []
+
+        class Resp:
+            def __init__(self, url: str) -> None:
+                self.status_code, self.headers, self.url = 200, {}, url
+
+            def json(self) -> dict:
+                return {"choices": [{"message": {"content": '{"items": []}'}}], "usage": {"total_tokens": 50}}
+
+            def raise_for_status(self) -> None:
+                return None
+
+        def post(self, url, **kwargs):
+            calls.append(url)
+            return Resp(url)
+
+        share = int(self.GROQ.daily_tokens * self.GROQ.background_share)
+        llm_queue.record(self.store, "groq", llm_queue.USER, {}, 200, share)  # Groq 하루 몫을 다 씀
+        with patch.dict(os.environ, {"GROQ_API_KEY": "g", "CEREBRAS_API_KEY": "c"}),                 patch.object(worklog_bridge, "WORKLOG_STORE", self.store), patch("httpx.Client.post", post):
+            answer = worklog_bridge.groq_extract_part({"path": "회의", "text": "메모"})
+        self.assertEqual(calls, ["https://api.cerebras.ai/v1/chat/completions"])
+        self.assertEqual(answer["model"], "cerebras:gpt-oss-120b")
+        self.assertEqual(llm_queue.daily_usage(self.store, "cerebras")["tokens"], 50)
+
+    def test_a_429_from_groq_moves_the_same_call_to_cerebras(self) -> None:
+        urls: list[str] = []
+
+        class Resp:
+            def __init__(self, status: int) -> None:
+                self.status_code, self.headers = status, {"retry-after": "20"} if status == 429 else {}
+
+            def json(self) -> dict:
+                return {"choices": [{"message": {"content": '{"parts": []}'}}], "usage": {"total_tokens": 10}}
+
+            def raise_for_status(self) -> None:
+                return None
+
+        def post(self, url, **kwargs):
+            urls.append(url)
+            return Resp(429 if "groq" in url else 200)
+
+        with patch.dict(os.environ, {"GROQ_API_KEY": "g", "CEREBRAS_API_KEY": "c"}),                 patch.object(worklog_bridge, "WORKLOG_STORE", self.store), patch("httpx.Client.post", post):
+            worklog_bridge._llm_call("p", {"x": 1})
+            worklog_bridge._llm_call("p", {"x": 2})  # Groq는 retry-after 동안 건너뛴다
+        self.assertEqual(urls, ["https://api.groq.com/openai/v1/chat/completions",
+                                "https://api.cerebras.ai/v1/chat/completions",
+                                "https://api.cerebras.ai/v1/chat/completions"])
+
+    def test_without_a_cerebras_key_only_groq_is_used_and_everything_busy_raises(self) -> None:
+        with patch.dict(os.environ, {"GROQ_API_KEY": "g", "CEREBRAS_API_KEY": ""}):
+            self.assertEqual([p.name for p in llm_queue.available()], ["groq"])
+            llm_queue.record(self.store, "groq", llm_queue.BACKGROUND, {"retry-after": "40"}, 429, 0)
+            with self.assertRaises(llm_queue.Busy) as busy:
+                llm_queue.check_any(llm_queue.BACKGROUND, 10, self.store)
+            self.assertEqual(busy.exception.reason, "minute")
 
     def test_reset_durations_are_parsed(self) -> None:
-        self.assertEqual(groq_queue.parse_duration("1m2.5s"), 62.5)
-        self.assertEqual(groq_queue.parse_duration("120ms"), 0.12)
-        self.assertEqual(groq_queue.parse_duration(None), 0.0)
+        self.assertEqual(llm_queue.parse_duration("1m2.5s"), 62.5)
+        self.assertEqual(llm_queue.parse_duration("120ms"), 0.12)
+        self.assertEqual(llm_queue.parse_duration(None), 0.0)
 
 
 class MenuTests(unittest.TestCase):

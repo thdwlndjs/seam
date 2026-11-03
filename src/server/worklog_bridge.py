@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-import groq_queue
+import llm_queue
 import metrics
 import worklog
 
@@ -56,37 +56,57 @@ def record(*, scope: str, kind: str, conversation_key: str, locator: str, text: 
         return False
 
 
-# ── Groq 호출 (동기 — 분석은 별도 스레드에서 돈다) ─────────────────
-def _groq_call(system_prompt: str, payload: Any, priority: int = groq_queue.BACKGROUND,
-               model: str | None = None) -> tuple[Any, dict]:
-    """JSON 응답 한 번. 백그라운드(순위 2·3)는 먼저 대기열 한도를 확인한다(넘으면 groq_queue.Busy).
-    (응답 JSON, usage)를 돌려준다."""
+# ── LLM 호출 (동기 — 분석은 별도 스레드에서 돈다) ─────────────────
+def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGROUND) -> tuple[Any, dict, str]:
+    """JSON 응답 한 번. (응답 JSON, usage, "공급자:모델")을 돌려준다.
+
+    백그라운드(순위 2·3)는 공급자를 차례로 시도한다(Groq → Cerebras, 키가 있는 것만). 대기열 한도에 막히거나
+    429를 받으면 다음 공급자로 넘기고, 모두 막히면 llm_queue.Busy를 낸다(호출부는 그 주기를 멈춘다)."""
     body = json.dumps(payload, ensure_ascii=False)
-    groq_queue.check(priority, len(body) * 3 // 4 + len(system_prompt) // 2, WORKLOG_STORE)
-    with httpx.Client(timeout=60) as client:
-        resp = client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": model or GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": body},
-                ],
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-            },
-        )
+    estimated = len(body) * 3 // 4 + len(system_prompt) // 2
+    candidates = llm_queue.available(priority) or llm_queue.PROVIDERS[:1]
+    busy: llm_queue.Busy | None = None
+    for provider in candidates:
+        try:
+            llm_queue.check(provider, priority, estimated, WORKLOG_STORE)
+        except llm_queue.Busy as error:
+            busy = error
+            continue
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                provider.url,
+                headers={"Authorization": f"Bearer {provider.key}"},
+                json={
+                    "model": provider.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": body},
+                    ],
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                },
+            )
         usage = usage_of(resp) or {}
+        status = getattr(resp, "status_code", 200)
         metrics.count_groq(usage)
-        groq_queue.record(WORKLOG_STORE, priority, getattr(resp, "headers", None), getattr(resp, "status_code", 200),
-                          int(usage.get("total_tokens") or 0))
+        llm_queue.record(WORKLOG_STORE, provider.name, priority, getattr(resp, "headers", None), status,
+                         int(usage.get("total_tokens") or 0))
+        if status == 429 and priority > llm_queue.USER:
+            busy = llm_queue.Busy("minute", 60, provider.name)
+            log.info("%s 한도 초과 → 다음 공급자", provider.name)
+            continue
         resp.raise_for_status()
-        return json.loads(resp.json()["choices"][0]["message"]["content"]), usage
+        return json.loads(resp.json()["choices"][0]["message"]["content"]), usage, f"{provider.name}:{provider.model}"
+    raise busy or llm_queue.Busy("minute", 60)
 
 
 def _groq_json(system_prompt: str, payload: Any) -> Any:
-    return _groq_call(system_prompt, payload)[0]
+    return _llm_call(system_prompt, payload)[0]
+
+
+def llm_ready() -> bool:
+    """키가 있는 LLM 공급자가 하나라도 있는지."""
+    return bool(llm_queue.available())
 
 
 def usage_of(resp: httpx.Response) -> dict | None:
@@ -140,7 +160,7 @@ confidence가 low인 판정은 분석에 쓰이지 않고 원문 보관만 된�
 
 def groq_classify_sections(items: list[dict]) -> dict[str, dict]:
     """새로 생기거나 이름이 바뀐 섹션만 판정한다. 판정은 바로 쓰이고, 확신이 low면 원문만 보관한다."""
-    if not GROQ_API_KEY or not items:
+    if not (GROQ_API_KEY or llm_ready()) or not items:
         return {}
     data = _groq_json(CLASSIFY_PROMPT, {"sections": items})
     found = data.get("sections") if isinstance(data, dict) else None
@@ -163,8 +183,8 @@ JSON 하나만 출력해: {"parts": [{"part_id": "...", "kind": "...", "confiden
 
 
 def groq_classify_parts(page: dict) -> dict:
-    """한 페이지의 새로 생기거나 바뀐 부분만 종류를 판정한다(docs/v1.1/spec.md P1-3). Groq 키가 없으면 미룬다."""
-    if not GROQ_API_KEY or not page.get("parts"):
+    """한 페이지의 새로 생기거나 바뀐 부분만 종류를 판정한다(docs/v1.1/spec.md P1-3). LLM 키가 없으면 미룬다."""
+    if not (GROQ_API_KEY or llm_ready()) or not page.get("parts"):
         return {}
     data = _groq_json(PART_KIND_PROMPT, page)
     return data if isinstance(data, dict) else {}
@@ -172,7 +192,6 @@ def groq_classify_parts(page: dict) -> dict:
 
 # 추출 지시문의 판. 지시문이나 항목 구성을 바꾸면 올린다(같은 내용도 새 판으로 다시 추출된다).
 EXTRACT_PROMPT_VERSION = "part-extract-1"
-GROQ_BACKGROUND_MODEL = os.environ.get("GROQ_BACKGROUND_MODEL") or GROQ_MODEL
 
 PART_EXTRACT_PROMPT = """너는 팀 회의·멘토링 메모에서 항목을 뽑는 분석기야. 입력: path(회의 위치)와 text(메모 원문).
 뽑을 항목(kind):
@@ -190,12 +209,13 @@ JSON 하나만 출력해: {"items": [...]}. 뽑을 것이 없으면 {"items": []
 
 def groq_extract_part(payload: dict) -> dict:
     """회의 메모 부분 하나에서 항목을 뽑는다(docs/v1.1/spec.md P1-4). {"items", "usage", "model"}.
-    Groq 키가 없으면 빈 dict(추출을 미룬다). 백그라운드 순위라 한도에 걸리면 groq_queue.Busy."""
-    if not GROQ_API_KEY:
+    LLM 키가 없으면 빈 dict(추출을 미룬다). Groq가 막히면 Cerebras로 넘기고, 모두 막히면 llm_queue.Busy.
+    model에는 "공급자:모델"을 남긴다(정답지 비교 때 어느 쪽 결과인지 구분)."""
+    if not (GROQ_API_KEY or llm_ready()):
         return {}
-    data, usage = _groq_call(PART_EXTRACT_PROMPT, payload, groq_queue.BACKGROUND, GROQ_BACKGROUND_MODEL)
+    data, usage, label = _llm_call(PART_EXTRACT_PROMPT, payload, llm_queue.BACKGROUND)
     items = data.get("items") if isinstance(data, dict) else None
-    return {"items": items if isinstance(items, list) else [], "usage": usage, "model": GROQ_BACKGROUND_MODEL}
+    return {"items": items if isinstance(items, list) else [], "usage": usage, "model": label}
 
 
 def groq_extract(records: list[dict]) -> list[dict]:

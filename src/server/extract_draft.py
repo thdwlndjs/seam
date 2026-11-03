@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.environ.get("ENV_FILE"))
 
-import groq_queue  # noqa: E402
+import llm_queue  # noqa: E402
 import metrics  # noqa: E402
 import worklog_bridge  # noqa: E402
 from worklog import parts  # noqa: E402
@@ -43,9 +43,9 @@ def organize(store: Path, scope: str, max_rounds: int = 30, sleep=time.sleep) ->
         if parts.pending_count(store, scope, version) == 0:
             break
         try:
-            groq_queue.check(groq_queue.BACKGROUND, 1000, store)
+            llm_queue.check_any(llm_queue.BACKGROUND, 1000, store)
             sleep(5)
-        except groq_queue.Busy as busy:
+        except llm_queue.Busy as busy:
             if busy.reason == "daily":
                 break
             sleep(min(65, busy.wait_seconds + 1))

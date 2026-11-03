@@ -51,7 +51,7 @@ from pydantic import BaseModel
 # NOTION_RATE 등)를 읽어 두기 때문에, 순서가 바뀌면 .env 값이 그쪽에 전달되지 않는다.
 load_dotenv(os.environ.get("ENV_FILE"))
 
-import groq_queue  # noqa: E402
+import llm_queue  # noqa: E402
 import metrics  # noqa: E402
 import notion_map  # noqa: E402
 import worklog_bridge  # noqa: E402
@@ -817,7 +817,7 @@ async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None]
                 finally:
                     metrics.count_groq(usage)
                     # 사람이 기다리는 호출(순위 1)은 막지 않고, 쓴 양만 대기열에 알린다(백그라운드가 몫을 맞춘다).
-                    groq_queue.record(worklog_bridge.WORKLOG_STORE, groq_queue.USER, resp.headers, resp.status_code,
+                    llm_queue.record(worklog_bridge.WORKLOG_STORE, "groq", llm_queue.USER, resp.headers, resp.status_code,
                                       int((usage or {}).get("total_tokens") or 0))
         return full_text.strip() or None
     except Exception:
