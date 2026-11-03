@@ -33,6 +33,7 @@ import notion_map  # noqa: E402
 import worklog_bridge  # noqa: E402
 from notion_read import notion_client_for  # noqa: E402
 from worklog import db as wdb  # noqa: E402
+from worklog import parts  # noqa: E402
 
 TEAM_CONFIG_PATH = Path(__file__).resolve().parent.parent / "team_configs.json"
 
@@ -55,12 +56,19 @@ def forget_edit_times(store: Path, scope: str) -> None:
                      (SELECT id FROM source_sections WHERE scope = ?)""", (scope,))
 
 
+REINDEX_TOKENS_PER_MINUTE = 6000  # Groq 무료 등급 분당 8,000토큰 중 메뉴 몫을 남긴다
+
+
 def reindex(store: Path, scope: str, roots: list[str], client: Any, classify: Any = None,
-            classify_parts: Any = None) -> dict[str, Any]:
+            classify_parts: Any = None, tokens_per_minute: int | None = REINDEX_TOKENS_PER_MINUTE,
+            sleep: Any = None) -> dict[str, Any]:
     made = backup(store)
     forget_edit_times(store, scope)
     stats = notion_map.sync_roots(store, scope, roots, client, classify=classify, classify_parts=classify_parts,
                                   rejudge_unknown=True)
+    # 동기화 한 번의 판정 몫을 넘는 나머지도 끝까지 판정한다. 분당 한도를 넘지 않게 쉬어 간다.
+    stats["parts_judged"] += parts.judge_pending(store, scope, classify_parts, budget_tokens=None,
+                                                 tokens_per_minute=tokens_per_minute, sleep=sleep)
     stats["backup"] = str(made) if made else None
     return stats
 

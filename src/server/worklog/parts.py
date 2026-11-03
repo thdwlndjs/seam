@@ -222,7 +222,7 @@ def blocks_aligned(md: str, top_blocks: list[dict] | None) -> bool:
 
 
 def save_unit_parts(store: Path, scope: str, origin: str, page_id: str, section_id: str | None,
-                    built: list[dict[str, Any]]) -> list[str]:
+                    built: list[dict[str, Any]], last_edited: str | None = None) -> list[str]:
     """부분을 저장하고, 새로 생기거나 내용이 바뀐 부분 ID를 돌려준다(판정 대상).
     사람이 정한 종류는 내용이 바뀌어도 유지한다. 사라진 부분은 gone으로만 표시한다."""
     db.initialize(store)
@@ -252,6 +252,8 @@ def save_unit_parts(store: Path, scope: str, origin: str, page_id: str, section_
                  old["kind"] if human else None, "human" if human else None, old["kind_note"] if human else None,
                  part["md"], part["content_hash"], len(part["md"]), ts, ts))
             changed.append(part["id"])
+        if last_edited:  # 판정 순서(최근 수정 먼저)에 쓴다
+            c.execute("UPDATE source_parts SET last_edited = ? WHERE scope = ? AND page_id = ?", (last_edited, scope, page_id))
         keep = {p["id"] for p in built}
         for part_id in set(existing) - keep:
             c.execute("UPDATE source_parts SET status = 'gone', updated_at = ? WHERE id = ? OR parent_part_id = ?",
@@ -266,8 +268,31 @@ def _remove_ranges(md: str, ranges: list[tuple[int, int]]) -> str:
     return "\n".join(lines)
 
 
-def judge_pending(store: Path, scope: str, classify: PartClassifier | None) -> int:
-    """종류가 아직 없는 부분을 페이지 단위로 판정한다. 판정한 부분 수. LLM이 없거나 실패하면 다음에 다시 한다."""
+JUDGE_BUDGET_TOKENS = 4000  # [가정] 동기화 한 번에 판정에 쓰는 토큰(추정). 메뉴가 쓸 분당 한도를 남긴다
+PROMPT_TOKENS = 450  # 판정 지시문 몫(추정)
+
+
+def estimate_tokens(payload: Any) -> int:
+    """대략적인 토큰 수(한글 1자 ≈ 0.75토큰, JSON 기호 포함). 예산을 넘지 않게 나누는 데만 쓴다."""
+    return len(json.dumps(payload, ensure_ascii=False)) * 3 // 4 + PROMPT_TOKENS
+
+
+def _judge_item(row: dict) -> dict[str, Any]:
+    return {"part_id": row["id"], "path": row["path"], "title": row["path"].rsplit(" > ", 1)[-1], "chars": row["chars"],
+            "head": md_to_text(row["md"])[:HEAD_CHARS],
+            "children": [{"child_path": f"{row['path']} > {child['title']}", "chars": child["chars"], "toggle": True}
+                         for child in details_children(row["md"]) if child["chars"] >= CHILD_MIN_CHARS]}
+
+
+def judge_pending(store: Path, scope: str, classify: PartClassifier | None,
+                  budget_tokens: int | None = JUDGE_BUDGET_TOKENS, tokens_per_minute: int | None = None,
+                  sleep: Callable[[float], None] | None = None) -> int:
+    """종류가 아직 없는 부분을 판정한다. 판정한 부분 수. LLM이 없거나 실패하면 다음에 다시 한다.
+
+    - 최근 수정된 페이지부터. 한 번 호출이 budget_tokens(추정)를 넘지 않게 페이지의 부분을 나눠 보낸다.
+    - budget_tokens를 다 쓰면 멈춘다(남은 것은 다음 동기화). None이면 끝까지 한다.
+    - tokens_per_minute가 있으면 호출마다 쉬어 가며 그 속도를 넘지 않는다(reindex용).
+    """
     if classify is None:
         return 0
     db.initialize(store)
@@ -278,25 +303,36 @@ def judge_pending(store: Path, scope: str, classify: PartClassifier | None) -> i
     pages: dict[str, list[dict]] = {}
     for row in rows:
         pages.setdefault(row["page_id"] or row["id"], []).append(row)
-    judged = 0
-    for page_rows in pages.values():
-        items = [{"part_id": r["id"], "path": r["path"], "title": r["path"].rsplit(" > ", 1)[-1], "chars": r["chars"],
-                  "head": md_to_text(r["md"])[:HEAD_CHARS],
-                  "children": [{"child_path": f"{r['path']} > {child['title']}", "chars": child["chars"], "toggle": True}
-                               for child in details_children(r["md"]) if child["chars"] >= CHILD_MIN_CHARS]}
-                 for r in page_rows]
-        try:
-            answer = classify({"page_path": page_rows[0]["path"].rsplit(" > ", 1)[0], "parts": items}) or {}
-        except Exception:
-            break  # 한도 초과(429) 등: 이번 동기화에서는 멈추고 남은 페이지는 다음 동기화에서 판정한다
-        by_id = {a.get("part_id"): a for a in answer.get("parts", []) if isinstance(a, dict)}
-        with db.write(store) as c:
-            for row in page_rows:
-                found = by_id.get(row["id"])
-                if found is None or found.get("kind") not in KINDS:
-                    continue
-                _apply_judgment(c, row, found)
-                judged += 1
+    ordered = sorted(pages.values(), key=lambda rs: max(r["last_edited"] or "" for r in rs), reverse=True)
+    batch_limit = min(budget_tokens or JUDGE_BUDGET_TOKENS, JUDGE_BUDGET_TOKENS)
+    judged = spent = 0
+    for page_rows in ordered:
+        page_path = page_rows[0]["path"].rsplit(" > ", 1)[0]
+        batches: list[list[dict]] = [[]]
+        for row in page_rows:
+            if batches[-1] and estimate_tokens([_judge_item(r) for r in batches[-1] + [row]]) > batch_limit:
+                batches.append([])
+            batches[-1].append(row)
+        for batch in batches:
+            payload = {"page_path": page_path, "parts": [_judge_item(r) for r in batch]}
+            cost = estimate_tokens(payload["parts"])
+            if budget_tokens is not None and spent and spent + cost > budget_tokens:
+                return judged  # 이번 몫을 다 씀: 남은 것은 다음 동기화에서
+            try:
+                answer = classify(payload) or {}
+            except Exception:
+                return judged  # 한도 초과(429) 등: 이번에는 멈추고 남은 것은 다음 동기화에서 판정한다
+            spent += cost
+            by_id = {a.get("part_id"): a for a in answer.get("parts", []) if isinstance(a, dict)}
+            with db.write(store) as c:
+                for row in batch:
+                    found = by_id.get(row["id"])
+                    if found is None or found.get("kind") not in KINDS:
+                        continue
+                    _apply_judgment(c, row, found)
+                    judged += 1
+            if tokens_per_minute:
+                (sleep or __import__("time").sleep)(cost / tokens_per_minute * 60)
     return judged
 
 

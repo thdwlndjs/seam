@@ -537,7 +537,8 @@ def _row_title(row: dict) -> str:
     return "(제목 없음)"
 
 
-def _collect_parts(store: Path, scope: str, client: Client, section: dict, unit_id: str, title: str) -> str | None:
+def _collect_parts(store: Path, scope: str, client: Client, section: dict, unit_id: str, title: str,
+                   edited: str | None) -> str | None:
     """하위 페이지·DB 행 본문을 md로 한 번에 받아 부분으로 저장하고, 원문 저장용 글을 돌려준다(spec P1-1·P1-2).
     md를 못 받으면 None(호출부가 예전 블록 읽기로 대신한다). 블록 목록과 어긋나면 블록 ID 없이 저장한다."""
     page = notion_md.fetch_markdown(client, unit_id)
@@ -548,7 +549,7 @@ def _collect_parts(store: Path, scope: str, client: Client, section: dict, unit_
     except Exception:
         blocks = None
     built = wparts.build_unit_parts(unit_id, f"{section['path']} > {title}", page.md, blocks)
-    wparts.save_unit_parts(store, scope, "notion", unit_id, section["id"], built)
+    wparts.save_unit_parts(store, scope, "notion", unit_id, section["id"], built, last_edited=edited)
     metrics.count("parts", len(built))
     return wparts.md_to_text(page.md)
 
@@ -569,9 +570,9 @@ def _collect_section(store: Path, scope: str, client: Client, section: dict, fre
         if edited and wsections.unit_edited(store, page["id"]) == edited:
             wsections.set_unit_parent(store, page["id"], page["id"])  # 출처 기록 전에 모은 것: 출처만 채운다
             if not wparts.has_parts(store, scope, page["id"]):
-                _collect_parts(store, scope, client, section, page["id"], page["title"])  # 부분 전에 모은 것: 부분만 채운다
+                _collect_parts(store, scope, client, section, page["id"], page["title"], edited)  # 부분 전에 모은 것: 부분만 채운다
             continue
-        text = _collect_parts(store, scope, client, section, page["id"], page["title"])
+        text = _collect_parts(store, scope, client, section, page["id"], page["title"], edited)
         if text is None:
             text = _fetch_notion_page_by_id(page["id"], client)
         n, s = _save(store, scope, section, page["id"], text, edited, hold)
@@ -586,9 +587,9 @@ def _collect_section(store: Path, scope: str, client: Client, section: dict, fre
             if edited and wsections.unit_edited(store, row["id"]) == edited:
                 wsections.set_unit_parent(store, row["id"], database["id"])
                 if not wparts.has_parts(store, scope, row["id"]):
-                    _collect_parts(store, scope, client, section, row["id"], _row_title(row))
+                    _collect_parts(store, scope, client, section, row["id"], _row_title(row), edited)
                 continue
-            body = _collect_parts(store, scope, client, section, row["id"], _row_title(row))
+            body = _collect_parts(store, scope, client, section, row["id"], _row_title(row), edited)
             if body is None:
                 body = "\n".join(line for b in _list_child_blocks(row["id"], client) for line in _block_text(b, client))
             n, s = _save(store, scope, section, row["id"], "\n".join(filter(None, [_row_text(row), body])), edited, hold)

@@ -631,7 +631,7 @@ class MarkdownCollectTests(unittest.TestCase):
         self.assertEqual(found["회의록"]["role_source"], "none")
         self.fake.calls.clear()
         stats = reindex.reindex(self.store, SCOPE, ["root"], MarkdownClientView(self.fake, {"r1": self.ROW_MD}),
-                                classify=FakeClassifier(), classify_parts=meeting_kinds)
+                                classify=FakeClassifier(), classify_parts=meeting_kinds, sleep=lambda seconds: None)
         self.assertTrue(Path(stats["backup"]).exists())
         found = {s["title"]: s for s in sections.sections(self.store, SCOPE)}
         self.assertEqual((found["회의록"]["role"], found["회의록"]["role_source"]), ("meeting", "llm"))

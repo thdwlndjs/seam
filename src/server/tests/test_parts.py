@@ -154,7 +154,23 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(parts.judge_pending(self.store, SCOPE, rate_limited), 0)
         self.assertEqual(len(calls), 1)  # 한도에 걸리면 다음 페이지를 바로 부르지 않는다
-        self.assertEqual(parts.judge_pending(self.store, SCOPE, split_classifier()), 12)  # 다음 번에 두 페이지 6개씩 판정
+        self.assertEqual(parts.judge_pending(self.store, SCOPE, split_classifier(), budget_tokens=None), 12)  # 다음 번에 전부
+
+    def test_budget_splits_big_pages_and_stops_for_this_round(self) -> None:
+        big = "\n".join(f"## 항목 {i}\n" + "내용 " * 300 for i in range(30))  # 부분 30개, 판정 한 번에 다 못 넣는 크기
+        parts.save_unit_parts(self.store, SCOPE, "notion", "old-page", "sec-1",
+                              parts.build_unit_parts("old-page", "문서", big, None), last_edited="2026-10-01T00:00:00Z")
+        parts.save_unit_parts(self.store, SCOPE, "notion", "new-page", "sec-1",
+                              parts.build_unit_parts("new-page", "회의록", SAMPLE_MD, None), last_edited="2026-11-01T00:00:00Z")
+        classify = split_classifier()
+        first = parts.judge_pending(self.store, SCOPE, classify)
+        self.assertEqual(classify.calls[0]["page_path"], "회의록")  # 최근 수정된 페이지부터
+        self.assertTrue(all(parts.estimate_tokens(c["parts"]) <= parts.JUDGE_BUDGET_TOKENS for c in classify.calls))
+        self.assertLess(first, 36)  # 한 번의 몫을 넘으면 멈춘다
+        waits: list[float] = []
+        rest = parts.judge_pending(self.store, SCOPE, classify, budget_tokens=None, tokens_per_minute=6000, sleep=waits.append)
+        self.assertEqual(first + rest, 36)  # 끝까지 하면 전부 판정
+        self.assertTrue(waits and all(w > 0 for w in waits))  # 분당 속도를 넘지 않게 쉰다
 
     def test_parts_that_disappear_are_marked_gone(self) -> None:
         self.collect()
