@@ -20,6 +20,7 @@
     - 메뉴 1번: "주요 문서"(document 부분, 최대 5개).
     - 기준 시각: `source_pages.checked_at` 최댓값. `checked_at`은 확인할 때마다 갱신한다.
 - [ ] 1~3차 멘토링 추출 초안을 만들어 송지원에게 넘긴다(정답지 작업은 Phase 3에서 [고치기]로 한다).
+    - `src/server`에서 `python extract_draft.py --scope <팀 키>`: 판정·추출을 끝까지 하고(대기열 한도 안에서) `devTools/extract-draft-<시각>.md`에 초안을 쓴다. 초안은 실제 회의 내용이라 커밋하지 않는다.
 
 ## 먼저 쓸 테스트
 
