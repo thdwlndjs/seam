@@ -18,7 +18,7 @@
     - `UNREADABLE`에서 `link_to_page`를 빼고, `scan_page`가 대상 페이지를 하위 페이지처럼 넣는다.
 - [ ] `src/server/worklog_bridge.py`: 종류 판정 호출(`groq_classify_parts`). 입력·출력 JSON은 spec P1-3.
 - [ ] 기존 경로를 그대로 둔다. 지금처럼 `sources`와 `work_records`에도 쓰고, 부분(`source_parts`)은 함께 저장한다. 메뉴가 부분을 읽기 시작하는 것은 Phase 2부터다.
-- [ ] `src/server/worklog/__main__.py`: `reindex --scope` 명령. 저장소 백업, md 다시 수집, "판정 못 함" 섹션 재판정.
+- [ ] `src/server/reindex.py`: `reindex.py --scope` 명령(worklog 패키지는 외부 서비스에 의존하지 않으므로 서버 폴더에 둔다). 저장소 백업, md 다시 수집, "판정 못 함" 섹션 재판정, 남은 부분 끝까지 판정.
 
 ## 먼저 쓸 테스트
 
