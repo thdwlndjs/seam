@@ -1,0 +1,351 @@
+"""페이지·DB 행 md → 부분(part) 분할·블록 대조·종류 판정 저장. 문서: docs/v1.1/spec.md P1-2, P1-3.
+
+1. `top_level_blocks(md)`: md를 최상위 블록 단위로 자른다. 중첩은 탭으로만 표시되고, 표 안의 줄과 들여쓰기
+   없는 닫는 태그는 앞 블록에 속한다(실제 녹화본 5개가 블록 목록과 1:1로 맞은 규칙).
+2. `group_parts(blocks)`: 빈 단락·구분선·제목 사이에 이어진 블록을 한 부분으로 묶는다.
+3. `align_blocks(blocks, top_blocks)`: Notion 최상위 블록 목록과 개수·순서를 맞춰 블록 ID를 붙인다.
+4. `save_unit_parts` → `judge_pending`: 새로 생기거나 바뀐 부분만 종류를 판정한다(LLM은 호출부가 넘긴다).
+   판정할 때 "이 부분 안의 하위 토글은 문서다"라는 답을 받으면 그 토글을 따로 떼어 낸다.
+
+이 모듈은 Notion·LLM을 직접 부르지 않는다(worklog 패키지는 외부 서비스에 의존하지 않는다).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Callable
+from contextlib import closing
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from . import db
+
+KINDS = {"meeting", "document", "link"}
+LOW_CONFIDENCE = 0.6  # [가정] 이보다 낮으면 문서로 두고 추출하지 않는다
+CHILD_MIN_CHARS = 200  # 판정에 하위 토글로 알려 줄 최소 길이
+HEAD_CHARS = 200
+
+PartClassifier = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+# ── 1. 최상위 블록 ──────────────────────────────────────────
+
+@dataclass
+class RawBlock:
+    position: int
+    lines: list[str]
+
+    @property
+    def first(self) -> str:
+        return self.lines[0]
+
+
+def top_level_blocks(md: str) -> list[RawBlock]:
+    blocks: list[RawBlock] = []
+    in_table = False
+    # splitlines()는   같은 문자에서도 끊으므로 쓰지 않는다.
+    for line in md.replace("\r\n", "\n").split("\n"):
+        stripped = line.strip()
+        if in_table:
+            blocks[-1].lines.append(line)
+            in_table = not stripped.startswith("</table")
+            continue
+        if line and not line.startswith("\t") and not stripped.startswith("</"):
+            blocks.append(RawBlock(len(blocks), [line]))
+        elif blocks:
+            blocks[-1].lines.append(line)
+        in_table = stripped.startswith("<table") and "</table" not in stripped and bool(blocks)
+    for block in blocks:  # 블록 사이의 빈 줄은 앞 블록 끝에 붙는다. 내용에 넣지 않는다.
+        while len(block.lines) > 1 and not block.lines[-1].strip():
+            block.lines.pop()
+    return blocks
+
+
+def line_kind(line: str) -> str:
+    """최상위 줄 하나가 어떤 블록인지(md 표기 기준)."""
+    text = line.strip()
+    if text == "<empty-block/>":
+        return "empty"
+    if text == "---":
+        return "divider"
+    if re.match(r"#{1,6} ", text):
+        return "heading"
+    if text.startswith("<page "):
+        return "page"
+    if text.startswith("<database "):
+        return "database"
+    if text.startswith("<table"):
+        return "table"
+    if re.match(r"- \[[ xX]\] ", text):
+        return "to_do"
+    if re.match(r"\d+\. ", text):
+        return "numbered"
+    if text.startswith("- "):
+        return "bulleted"
+    return "other"
+
+
+# ── 2. 부분으로 묶기 ────────────────────────────────────────
+
+@dataclass
+class RawPart:
+    position: int
+    title: str
+    md: str
+    block_positions: list[int] = field(default_factory=list)
+
+
+def plain_title(line: str) -> str:
+    text = re.sub(r"^(\d+\.|- \[[ xX]\]|-|#{1,6})\s+", "", line.strip())
+    text = re.sub(r"<[^>]+>", "", text).replace("**", "").replace("\\[", "[").replace("\\]", "]")
+    return text.strip() or "(제목 없음)"
+
+
+def group_parts(blocks: list[RawBlock]) -> list[RawPart]:
+    groups: list[list[RawBlock]] = []
+    current: list[RawBlock] | None = None
+    for block in blocks:
+        kind = line_kind(block.first)
+        if kind in {"empty", "divider", "page", "database"}:
+            current = None  # 경계. 하위 페이지·DB는 부분이 아니라 지도의 하위 항목이다.
+            continue
+        if kind == "heading" or current is None:
+            current = [block]
+            groups.append(current)
+        else:
+            current.append(block)
+    return [RawPart(i, plain_title(g[0].first), "\n".join(line for b in g for line in b.lines), [b.position for b in g])
+            for i, g in enumerate(groups)]
+
+
+# ── 3. 블록 대조 ────────────────────────────────────────────
+
+_STRICT = {"divider": {"divider"}, "numbered_list_item": {"numbered"}, "bulleted_list_item": {"bulleted"},
+           "to_do": {"to_do"}, "heading_1": {"heading"}, "heading_2": {"heading"}, "heading_3": {"heading"},
+           "table": {"table"}, "child_page": {"page"}, "child_database": {"database"}}
+_SEPARATORS = {"empty", "divider", "page", "database", "table"}
+
+
+def _plain_block_text(block: dict) -> str:
+    if "text" in block:  # 녹화본(fixture) 형식
+        return block["text"]
+    body = block.get(block.get("type", ""), {}) or {}
+    return "".join(item.get("plain_text", "") for item in body.get("rich_text", []) or [])
+
+
+def _matches(kind: str, block: dict) -> bool:
+    block_type = block.get("type", "")
+    if block_type in _STRICT:
+        return kind in _STRICT[block_type]
+    if block_type == "paragraph" and not _plain_block_text(block) and not block.get("has_children"):
+        return kind == "empty"
+    return kind not in _SEPARATORS  # 단락·콜아웃·파일·토글 등: 경계 표기만 아니면 된다
+
+
+def align_blocks(blocks: list[RawBlock], top_blocks: list[dict]) -> list[str] | None:
+    """블록 위치마다 Notion 블록 ID. 개수나 종류가 어긋나면 None(호출부가 ID 없이 저장한다)."""
+    if len(blocks) != len(top_blocks):
+        return None
+    for block, notion_block in zip(blocks, top_blocks):
+        if not _matches(line_kind(block.first), notion_block):
+            return None
+    return [b["id"] for b in top_blocks]
+
+
+# ── 하위 토글과 텍스트 ──────────────────────────────────────
+
+def details_children(md: str) -> list[dict[str, Any]]:
+    """부분 안의 토글(<details>)들: 제목, 줄 범위, 길이. 깊이와 상관없이 위에서부터."""
+    lines = md.split("\n")
+    found: list[dict[str, Any]] = []
+    for start, line in enumerate(lines):
+        opened = re.fullmatch(r"(\t*)<details>\s*", line)
+        if not opened or start + 1 >= len(lines):
+            continue
+        summary = re.fullmatch(r"\t*<summary>(.*?)</summary>\s*", lines[start + 1])
+        if not summary:
+            continue
+        end = next((i for i in range(start + 2, len(lines)) if lines[i] == f"{opened.group(1)}</details>"), len(lines) - 1)
+        found.append({"title": plain_title(summary.group(1)), "start": start, "end": end,
+                      "chars": len("\n".join(lines[start:end + 1]))})
+    return found
+
+
+def md_to_text(md: str) -> str:
+    """md → 사람이 읽는 글(저장·요약용). 구조 태그는 빼고 내용은 남긴다."""
+    out: list[str] = []
+    for line in md.replace("\r\n", "\n").split("\n"):
+        indent = line[: len(line) - len(line.lstrip("\t"))]
+        text = line.strip()
+        if not text or re.fullmatch(r"</?(details|tr|table|synced_block|callout|columns|column)\b[^>]*>|<empty-block/>", text):
+            continue
+        text = re.sub(r"</?(summary|td|th)>", " ", text).replace("<br>", " / ")
+        text = re.sub(r"<[^>]+>", "", text).replace("\\[", "[").replace("\\]", "]").replace("\\>", ">").strip()
+        if text:
+            out.append(indent + text)
+    return "\n".join(out)
+
+
+# ── 4. 저장과 판정 ──────────────────────────────────────────
+
+def build_unit_parts(unit_id: str, path: str, md: str, top_blocks: list[dict] | None) -> list[dict[str, Any]]:
+    """한 페이지(또는 DB 행)의 부분 목록. top_blocks가 있으면 블록 ID를 붙인다(어긋나면 ID 없이)."""
+    blocks = top_level_blocks(md)
+    ids = align_blocks(blocks, top_blocks) if top_blocks is not None else None
+    built = []
+    for group in group_parts(blocks):
+        block_ids = [ids[p] for p in group.block_positions] if ids else None
+        built.append({"id": f"{unit_id}:{block_ids[0]}" if block_ids else f"{unit_id}:p{group.position}",
+                      "path": f"{path} > {group.title}", "position": group.position, "md": group.md,
+                      "content_hash": db.sha256(group.md), "block_ids": block_ids})
+    return built
+
+
+def blocks_aligned(md: str, top_blocks: list[dict] | None) -> bool:
+    return top_blocks is not None and align_blocks(top_level_blocks(md), top_blocks) is not None
+
+
+def save_unit_parts(store: Path, scope: str, origin: str, page_id: str, section_id: str | None,
+                    built: list[dict[str, Any]]) -> list[str]:
+    """부분을 저장하고, 새로 생기거나 내용이 바뀐 부분 ID를 돌려준다(판정 대상).
+    사람이 정한 종류는 내용이 바뀌어도 유지한다. 사라진 부분은 gone으로만 표시한다."""
+    db.initialize(store)
+    ts = db.now()
+    changed: list[str] = []
+    with db.write(store) as c:
+        existing = {r["id"]: r for r in c.execute(
+            "SELECT * FROM source_parts WHERE scope = ? AND page_id = ? AND parent_part_id IS NULL", (scope, page_id))}
+        for part in built:
+            old = existing.get(part["id"])
+            if old is not None and old["content_hash"] == part["content_hash"] and old["status"] == "active":
+                continue
+            human = old is not None and old["kind_source"] == "human"
+            c.execute("UPDATE source_parts SET status = 'gone', updated_at = ? WHERE parent_part_id = ?", (ts, part["id"]))
+            c.execute(
+                """INSERT INTO source_parts(id, scope, origin, page_id, section_id, block_ids_json, parent_part_id, path,
+                       position, kind, kind_source, kind_note, summary, md, content_hash, chars, state, status,
+                       created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'collected', 'active', ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET section_id = excluded.section_id, block_ids_json = excluded.block_ids_json,
+                       path = excluded.path, position = excluded.position, kind = excluded.kind,
+                       kind_source = excluded.kind_source, kind_note = excluded.kind_note, summary = NULL,
+                       md = excluded.md, content_hash = excluded.content_hash, chars = excluded.chars,
+                       state = 'collected', status = 'active', updated_at = excluded.updated_at""",
+                (part["id"], scope, origin, page_id, section_id,
+                 json.dumps(part["block_ids"]) if part["block_ids"] else None, part["path"], part["position"],
+                 old["kind"] if human else None, "human" if human else None, old["kind_note"] if human else None,
+                 part["md"], part["content_hash"], len(part["md"]), ts, ts))
+            changed.append(part["id"])
+        keep = {p["id"] for p in built}
+        for part_id in set(existing) - keep:
+            c.execute("UPDATE source_parts SET status = 'gone', updated_at = ? WHERE id = ? OR parent_part_id = ?",
+                      (ts, part_id, part_id))
+    return changed
+
+
+def _remove_ranges(md: str, ranges: list[tuple[int, int]]) -> str:
+    lines = md.split("\n")
+    for start, end in sorted(ranges, reverse=True):
+        del lines[start:end + 1]
+    return "\n".join(lines)
+
+
+def judge_pending(store: Path, scope: str, classify: PartClassifier | None) -> int:
+    """종류가 아직 없는 부분을 페이지 단위로 판정한다. 판정한 부분 수. LLM이 없거나 실패하면 다음에 다시 한다."""
+    if classify is None:
+        return 0
+    db.initialize(store)
+    with closing(db.connect(store)) as c:
+        rows = [dict(r) for r in c.execute(
+            """SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind IS NULL AND parent_part_id IS NULL
+               ORDER BY page_id, position""", (scope,))]
+    pages: dict[str, list[dict]] = {}
+    for row in rows:
+        pages.setdefault(row["page_id"] or row["id"], []).append(row)
+    judged = 0
+    for page_rows in pages.values():
+        items = [{"part_id": r["id"], "path": r["path"], "title": r["path"].rsplit(" > ", 1)[-1], "chars": r["chars"],
+                  "head": md_to_text(r["md"])[:HEAD_CHARS],
+                  "children": [{"child_path": f"{r['path']} > {child['title']}", "chars": child["chars"], "toggle": True}
+                               for child in details_children(r["md"]) if child["chars"] >= CHILD_MIN_CHARS]}
+                 for r in page_rows]
+        try:
+            answer = classify({"page_path": page_rows[0]["path"].rsplit(" > ", 1)[0], "parts": items}) or {}
+        except Exception:
+            continue
+        by_id = {a.get("part_id"): a for a in answer.get("parts", []) if isinstance(a, dict)}
+        with db.write(store) as c:
+            for row in page_rows:
+                found = by_id.get(row["id"])
+                if found is None or found.get("kind") not in KINDS:
+                    continue
+                _apply_judgment(c, row, found)
+                judged += 1
+    return judged
+
+
+def _apply_judgment(c: Any, row: dict, found: dict) -> None:
+    ts = db.now()
+    kind, note = found["kind"], found.get("reason") or None
+    try:
+        confidence = float(found.get("confidence") if found.get("confidence") is not None else 1)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < LOW_CONFIDENCE:
+        note = f"확신 낮음({kind}, {confidence:g}) → 보관만" + (f" · {note}" if note else "")
+        kind = "document"
+    children = {f"{row['path']} > {child['title']}": child for child in details_children(row["md"])}
+    ranges = []
+    for split in found.get("split") or []:
+        child = children.get(split.get("child_path"))
+        if child is None or split.get("kind") not in KINDS:
+            continue
+        ranges.append((child["start"], child["end"]))
+        lines = row["md"].split("\n")[child["start"]:child["end"] + 1]
+        child_md = "\n".join(lines)
+        child_id = f"{row['id']}:{db.sha256(split['child_path'])[:10]}"
+        c.execute(
+            """INSERT INTO source_parts(id, scope, origin, page_id, section_id, block_ids_json, parent_part_id, path,
+                   position, kind, kind_source, kind_note, summary, md, content_hash, chars, state, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'llm', NULL, ?, ?, ?, ?, 'collected', 'active', ?, ?)
+               ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, summary = excluded.summary, md = excluded.md,
+                   content_hash = excluded.content_hash, chars = excluded.chars, status = 'active', updated_at = excluded.updated_at""",
+            (child_id, row["scope"], row["origin"], row["page_id"], row["section_id"], row["id"], split["child_path"],
+             row["position"], split["kind"], split.get("summary"), child_md, db.sha256(child_md), len(child_md), ts, ts))
+    md = _remove_ranges(row["md"], ranges) if ranges else row["md"]
+    c.execute("""UPDATE source_parts SET kind = ?, kind_source = 'llm', kind_note = ?, summary = ?, md = ?, chars = ?,
+                     updated_at = ? WHERE id = ?""",
+              (kind, note, found.get("summary") if kind != "meeting" else None, md, len(md), ts, row["id"]))
+
+
+def set_part_kind(store: Path, part_id: str, kind: str, actor: str) -> None:
+    """사람이 종류를 정한다. 같은 블록이면 내용이 바뀌어도 유지된다."""
+    if kind not in KINDS:
+        raise db.ValidationError(f"종류는 {', '.join(sorted(KINDS))} 중 하나")
+    with db.write(store) as c:
+        if c.execute("UPDATE source_parts SET kind = ?, kind_source = 'human', kind_note = ?, updated_at = ? WHERE id = ?",
+                     (kind, f"{actor}가 정함", db.now(), part_id)).rowcount == 0:
+            raise db.NotFoundError(f"부분 {part_id} 없음")
+
+
+def has_parts(store: Path, scope: str, page_id: str) -> bool:
+    """이 페이지(행)의 부분이 저장돼 있는지. 부분이 생기기 전에 모은 행을 한 번 채우는 데 쓴다."""
+    db.initialize(store)
+    with closing(db.connect(store)) as c:
+        return c.execute("SELECT 1 FROM source_parts WHERE scope = ? AND page_id = ? LIMIT 1", (scope, page_id)).fetchone() is not None
+
+
+def list_parts(store: Path, scope: str, page_id: str | None = None, include_gone: bool = False) -> list[dict[str, Any]]:
+    db.initialize(store)
+    query = "SELECT * FROM source_parts WHERE scope = ?"
+    args: list[Any] = [scope]
+    if page_id is not None:
+        query += " AND page_id = ?"
+        args.append(page_id)
+    if not include_gone:
+        query += " AND status = 'active'"
+    query += " ORDER BY page_id, position, parent_part_id IS NOT NULL, path"
+    with closing(db.connect(store)) as c:
+        return [dict(r) for r in c.execute(query, args)]

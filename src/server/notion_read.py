@@ -96,9 +96,24 @@ class _Throttled:
         return _Throttled(attr, self._gate, self._background)
 
 
+# md 엔드포인트는 이 버전부터 있다. 다른 호출(databases, data_sources 등)은 notion-client 기본 버전을 그대로 쓴다.
+MARKDOWN_NOTION_VERSION = "2026-03-11"
+
+
+class _PMClient(Client):
+    """notion-client에 페이지 md 읽기(`page_markdown`)를 더한 것. md 호출에만 새 API 버전을 쓴다."""
+
+    def __init__(self, auth: str) -> None:
+        super().__init__(auth=auth)
+        self._markdown = Client(auth=auth, notion_version=MARKDOWN_NOTION_VERSION)
+
+    def page_markdown(self, page_id: str) -> Any:
+        return self._markdown.request(path=f"pages/{page_id}/markdown", method="GET")
+
+
 def notion_client_for(token: str, background: bool = False) -> Any:
     """Notion 호출은 항상 이걸로 만든 클라이언트로 한다. background=True는 수집용(사용자 요청에 자리를 양보)."""
-    return _Throttled(Client(auth=token), _gate_for(token), background)
+    return _Throttled(_PMClient(token), _gate_for(token), background)
 
 
 def _rich_text(block: dict) -> str:

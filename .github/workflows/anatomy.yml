@@ -1,5 +1,8 @@
 # 해부도 사이트: 푸시할 때마다 코드에서 다시 만들어 GitHub Pages에 올린다.
 # 처음 한 번: 저장소 Settings → Pages → Build and deployment → Source를 "GitHub Actions"로.
+# push일 때는 그 전에 claude_sync.py가 직전 커밋과의 .py diff를 보고, 영향받은 부품 설명이
+# 여전히 맞는지 Claude에게 판단시켜 anatomy.json/history.jsonl을 갱신한다(영향 없으면 호출 안 함).
+# 필요한 secret: ANTHROPIC_API_KEY.
 name: anatomy
 
 on:
@@ -9,7 +12,7 @@ on:
   workflow_dispatch:     # Actions 탭에서 손으로 다시 돌리기
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -22,9 +25,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # claude_sync.py가 직전 커밋과 diff하려면 전체 이력이 있어야 함
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Claude로 해부도 설명 갱신
+        if: github.event_name == 'push'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          pip install -q anthropic
+          python anatomy/claude_sync.py --src . --before "${{ github.event.before }}" --after "${{ github.sha }}"
+      - name: 바뀐 게 있으면 커밋·푸시
+        if: github.event_name == 'push'
+        run: |
+          if [ -n "$(git status --porcelain -- anatomy/anatomy.json anatomy/history.jsonl)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add anatomy/anatomy.json anatomy/history.jsonl
+            git commit -m "claude-sync: ${GITHUB_SHA::7} 기준 해부도 갱신"
+            git push origin HEAD:main
+          fi
       - name: 해부도 만들기
         run: python anatomy/build.py --src . --out _site
       - name: PR이면 코드와 다른 부품이 있는지 확인

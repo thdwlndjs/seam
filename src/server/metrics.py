@@ -46,6 +46,11 @@ def count_notion() -> None:
     _add("notion_calls")
 
 
+def count(field: str, amount: int = 1) -> None:
+    """parts(만든 부분 수), fallback(md 대신 블록 읽기로 간 횟수) 등."""
+    _add(field, amount)
+
+
 def count_groq(usage: dict | None = None) -> None:
     """Groq 호출 1회. usage(응답의 usage 또는 x_groq.usage)가 있으면 토큰도 더한다."""
     _add("groq_calls")

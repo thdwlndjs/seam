@@ -229,10 +229,13 @@
    "ana": "\"내가 맡은 일\"과 \"최근에 손댄 일\"이 겹치는 것만 골라 완료 도장을 찍어요.",
    "points": [
     "핵심은 집합 교집합 한 줄이에요: my_issue_numbers & touched_numbers.",
-    "Project 보드는 REST API가 없어서 GraphQL 3단계예요: Status 필드 찾기 → 보드 아이템 찾기 → 값 바꾸기."
+    "Project 보드는 REST API가 없어서 GraphQL 3단계예요: Status 필드 찾기(_find_project_status_field) → 보드 아이템 찾기(_find_project_item_id) → 값 바꾸기(_set_project_item_status)."
    ],
    "refs": [
-    "server/main.py::share_completed_work"
+    "server/main.py::share_completed_work",
+    "server/main.py::_find_project_status_field",
+    "server/main.py::_find_project_item_id",
+    "server/main.py::_set_project_item_status"
    ]
   },
   {
@@ -462,7 +465,12 @@
    ],
    "refs": [
     "server/worklog_bridge.py::analyze_due",
-    "server/worklog_bridge.py::record"
+    "server/worklog_bridge.py::record",
+    "server/worklog_bridge.py::groq_extract",
+    "server/worklog_bridge.py::groq_judge",
+    "server/worklog_bridge.py::groq_classify_sections",
+    "server/worklog_bridge.py::team_snapshot",
+    "server/worklog_bridge.py::meeting_notes"
    ]
   },
   {
@@ -501,14 +509,19 @@
    "ana": "서류 심사관이에요. 판단 초안(후보)은 만들지만 도장은 사람이 찍어야 해요.",
    "points": [
     "분석 정책: 15분 조용함, 또는 20개 메시지·3,000토큰이 쌓이면 분석해요.",
-    "질문·의견·미확정 결정은 빼고, 목표·범위·아키텍처·예산·일정이거나 Task 2개 이상에 영향을 주는 결정만 올려요.",
-    "변경 유형: unchanged / supplementary / proposed / conflicting / superseding.",
-    "모든 후보에 원문 인용과 비교 대상 ID가 남아요. 승인 전에는 Task·Decision이 그대로예요."
+    "질문·의견·미확정 결정은 빼고(is_question_like), 목표·범위·아키텍처·예산·일정이거나 Task 2개 이상에 영향을 주는 결정만 올려요(is_key_decision).",
+    "변경 유형: unchanged / supplementary / proposed / conflicting / superseding. _judge가 규칙으로 먼저 거르고, 애매할 때만 LLM 판정을 받아 검증해요.",
+    "모든 후보에 원문 인용과 비교 대상 ID가 남아요(find_related). 승인 전에는 Task·Decision이 그대로예요."
    ],
    "refs": [
     "server/worklog/core.py::analyze_batch",
     "server/worklog/core.py::approve",
-    "server/worklog/core.py::due_batches"
+    "server/worklog/core.py::due_batches",
+    "server/worklog/core.py::is_question_like",
+    "server/worklog/core.py::is_key_decision",
+    "server/worklog/core.py::normalize_item",
+    "server/worklog/core.py::find_related",
+    "server/worklog/core.py::_judge"
    ]
   },
   {

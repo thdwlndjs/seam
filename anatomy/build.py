@@ -31,6 +31,35 @@ SNIPPET_LINES = 14
 
 # ---------------------------------------------------------------- 코드 읽기
 
+def symbols_in_text(text: str, posix: str) -> list[dict]:
+    """한 파일의 텍스트에서 최상위 함수·클래스를 뽑는다. 디스크든 git show든 출처는 안 가린다."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as error:
+        print(f"! {posix}: 읽을 수 없음 ({error})", file=sys.stderr)
+        return []
+    symbols = []
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        calls = set()
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call):
+                fn = inner.func
+                if isinstance(fn, ast.Name):
+                    calls.add(fn.id)
+                elif isinstance(fn, ast.Attribute):
+                    calls.add(fn.attr)
+            elif isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load):
+                calls.add(inner.id)  # 콜백으로 넘기는 함수 이름도 연결로 본다
+        start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        doc = ast.get_docstring(node) or ""
+        symbols.append({"path": posix, "name": node.name, "start": start, "def": node.lineno, "end": node.end_lineno,
+                        "doc": doc.strip().splitlines()[0] if doc.strip() else "",
+                        "kind": "class" if isinstance(node, ast.ClassDef) else "function", "calls": sorted(calls)})
+    return symbols
+
+
 def scan_code(root: Path) -> dict:
     """모든 .py 파일의 최상위 함수·클래스: 위치, 첫 줄 설명, 그 안에서 부르는 이름들."""
     symbols: list[dict] = []
@@ -40,31 +69,9 @@ def scan_code(root: Path) -> dict:
         if any(part in SKIP_DIRS or part.startswith(".") for part in rel.parts[:-1]):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        try:
-            tree = ast.parse(text)
-        except SyntaxError as error:
-            print(f"! {rel}: 읽을 수 없음 ({error})", file=sys.stderr)
-            continue
         posix = rel.as_posix()
         sources[posix] = text.splitlines()
-        for node in tree.body:
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
-            calls = set()
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Call):
-                    fn = inner.func
-                    if isinstance(fn, ast.Name):
-                        calls.add(fn.id)
-                    elif isinstance(fn, ast.Attribute):
-                        calls.add(fn.attr)
-                elif isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load):
-                    calls.add(inner.id)  # 콜백으로 넘기는 함수 이름도 연결로 본다
-            start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
-            doc = ast.get_docstring(node) or ""
-            symbols.append({"path": posix, "name": node.name, "start": start, "def": node.lineno, "end": node.end_lineno,
-                            "doc": doc.strip().splitlines()[0] if doc.strip() else "",
-                            "kind": "class" if isinstance(node, ast.ClassDef) else "function", "calls": sorted(calls)})
+        symbols.extend(symbols_in_text(text, posix))
     return {"symbols": symbols, "sources": sources}
 
 
@@ -80,7 +87,8 @@ def resolve(ref: str, symbols: list[dict]) -> dict | None:
 def git_info(root: Path) -> dict:
     def git(*args: str) -> str:
         try:
-            return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=10).stdout.strip()
+            return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=10).stdout.strip()
         except Exception:
             return ""
 
@@ -166,6 +174,18 @@ def build(data: dict, code: dict, git: dict) -> dict:
     return data
 
 
+def load_history(path: Path, limit: int = 100) -> list[dict]:
+    """claude_sync.py가 커밋마다 한 줄씩 추가하는 변경 이력. 최신이 먼저 오게 뒤집는다."""
+    if not path.exists():
+        return []
+    entries = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            entries.append(json.loads(line))
+    return list(reversed(entries))[:limit]
+
+
 def render(data: dict, template: str) -> str:
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     marker = "<!--ANATOMY_DATA-->"
@@ -178,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--src", default=".", help="코드 폴더 (기본: 현재 폴더)")
     parser.add_argument("--data", default=str(HERE / "anatomy.json"))
+    parser.add_argument("--history", default=str(HERE / "history.jsonl"), help="커밋별 변경 이력 (claude_sync.py가 씀)")
     parser.add_argument("--template", default=str(HERE / "template.html"))
     parser.add_argument("--out", default="_site")
     parser.add_argument("--strict", action="store_true", help="사라진 함수가 있으면 실패")
@@ -185,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(args.src).resolve()
     data = json.loads(Path(args.data).read_text(encoding="utf-8"))
+    data["history"] = load_history(Path(args.history))
     built = build(data, scan_code(root), git_info(root))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

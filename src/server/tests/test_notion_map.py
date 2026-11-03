@@ -537,5 +537,116 @@ class MapCommandTests(unittest.TestCase):
         self.assertEqual(self.run_cli("map-set", "--scope", SCOPE, "공지사항", "아무거나", "--actor", "lead")[0], 2)
 
 
+class MarkdownClientView(ClientView):
+    """md 엔드포인트(page_markdown)까지 흉내 낸다. 없는 페이지는 404처럼 실패한다."""
+
+    def __init__(self, fake: FakeNotion, markdown: dict[str, str]) -> None:
+        super().__init__(fake)
+        self.fake, self.markdown = fake, markdown
+
+    def page_markdown(self, page_id: str) -> dict:
+        self.fake.calls.append(f"md:{page_id}")
+        if page_id not in self.markdown:
+            raise RuntimeError("404")
+        return {"markdown": self.markdown[page_id], "truncated": False, "unknown_block_ids": []}
+
+
+def meeting_kinds(page: dict) -> dict:
+    return {"parts": [{"part_id": p["part_id"], "kind": "meeting", "confidence": 0.9, "split": []} for p in page["parts"]]}
+
+
+class MarkdownCollectTests(unittest.TestCase):
+    """Phase 1: 하위 페이지·DB 행 본문을 md로 받아 부분으로 저장한다(docs/v1.1/spec.md P1-1~P1-3)."""
+
+    ROW_MD = "1. 인증\n\t- OAuth로 확정\n<empty-block/>\n→ 다음 주 보안 점검\n<table header-row=\"true\">\n<tr>\n<td>담당</td>\n</tr>\n</table>"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Path(self.tmp.name) / "w.sqlite3"
+        self.fake = team_workspace()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def sync(self, client, classify_parts=meeting_kinds) -> dict:
+        self.fake.calls.clear()
+        return notion_map.sync(self.store, SCOPE, "root", client, classify=FakeClassifier(), classify_parts=classify_parts)
+
+    def source_text(self, locator: str) -> str:
+        with closing(sqlite3.connect(self.store)) as c:
+            return c.execute("SELECT content FROM sources WHERE locator = ? ORDER BY rowid DESC", (locator,)).fetchone()[0]
+
+    def test_rows_are_read_once_as_markdown_and_split_into_parts(self) -> None:
+        from worklog import parts
+
+        stats = self.sync(MarkdownClientView(self.fake, {"r1": self.ROW_MD}))
+        stored = parts.list_parts(self.store, SCOPE, page_id="r1")
+        self.assertEqual([p["path"].rsplit(" > ", 1)[-1] for p in stored], ["인증", "→ 다음 주 보안 점검"])
+        self.assertEqual({p["kind"] for p in stored}, {"meeting"})
+        self.assertEqual(stats["parts_judged"], 2)
+        self.assertEqual([c for c in self.fake.calls if c.endswith(":r1")], ["md:r1", "blocks:r1"])  # 본문 재귀 읽기 없음
+        text = self.source_text("notion:r1")  # 메뉴가 쓰는 원문은 그대로 저장된다(태그 없이)
+        self.assertIn("OAuth로 확정", text)
+        self.assertIn("담당", text)
+        self.assertNotIn("<empty-block/>", text)
+
+    def test_rows_collected_before_parts_get_parts_once_without_saving_again(self) -> None:
+        from worklog import parts
+
+        self.sync(ClientView(self.fake))  # md를 못 쓰는 예전 경로로 한 번 모음
+        self.assertFalse(parts.has_parts(self.store, SCOPE, "r1"))
+        before = self.source_text("notion:r1")
+        md_client = MarkdownClientView(self.fake, {"r1": self.ROW_MD, "w1": "1. 인증 일정"})
+        stats = self.sync(md_client)
+        self.assertTrue(parts.has_parts(self.store, SCOPE, "r1"))
+        self.assertEqual(stats["records_new"], 0)  # 원문은 다시 저장하지 않는다
+        self.assertEqual(self.source_text("notion:r1"), before)
+        self.sync(md_client)
+        self.assertNotIn("md:r1", self.fake.calls)  # 한 번 채운 뒤에는 다시 읽지 않는다
+
+    def test_markdown_failure_falls_back_to_block_reading(self) -> None:
+        from worklog import parts
+
+        self.sync(MarkdownClientView(self.fake, {}))  # 모든 md 호출이 실패
+        self.assertIn("인증은 OAuth로 확정", self.source_text("notion:r1"))
+        self.assertFalse(parts.has_parts(self.store, SCOPE, "r1"))
+
+    def test_link_to_page_is_followed_like_a_subpage(self) -> None:
+        self.fake.pages["root"]["blocks"].append(
+            {"id": "lnk", "type": "link_to_page", "link_to_page": {"type": "page_id", "page_id": "pg-linked"}, "has_children": False})
+        self.fake.pages["pg-linked"] = {"title": "외부 회의록", "edited": "2026-11-01T00:00:00Z",
+                                        "blocks": [heading("lh", "11월 회의", 1), para("lp", "배포 일정 확정")]}
+        self.sync(ClientView(self.fake))
+        found = {s["title"]: s for s in sections.sections(self.store, SCOPE)}
+        # 제목("외부 일정") 아래의 링크는 그 제목 아래 하위 페이지와 똑같이: 섹션의 페이지로 두고 본문을 모은다.
+        self.assertIn({"id": "pg-linked", "title": notion_map.LINK_TITLE}, found["외부 일정"]["layout"]["pages"])
+        self.assertIn("배포 일정 확정", self.source_text("notion:pg-linked"))
+
+    def test_reindex_backs_up_rereads_everything_and_rejudges_unknown_sections(self) -> None:
+        import reindex
+        from worklog import parts
+
+        notion_map.sync(self.store, SCOPE, "root", ClientView(self.fake), classify=None)  # LLM 없이: "판정 못 함"
+        found = {s["title"]: s for s in sections.sections(self.store, SCOPE)}
+        self.assertEqual(found["회의록"]["role_source"], "none")
+        self.fake.calls.clear()
+        stats = reindex.reindex(self.store, SCOPE, ["root"], MarkdownClientView(self.fake, {"r1": self.ROW_MD}),
+                                classify=FakeClassifier(), classify_parts=meeting_kinds)
+        self.assertTrue(Path(stats["backup"]).exists())
+        found = {s["title"]: s for s in sections.sections(self.store, SCOPE)}
+        self.assertEqual((found["회의록"]["role"], found["회의록"]["role_source"]), ("meeting", "llm"))
+        self.assertIn("md:r1", self.fake.calls)  # 바뀌지 않은 행도 다시 읽는다
+        self.assertTrue(parts.has_parts(self.store, SCOPE, "r1"))
+
+    def test_link_outside_headings_is_scanned_like_a_subpage(self) -> None:
+        self.fake.pages["root"]["blocks"].insert(1, {"id": "lnk", "type": "link_to_page", "has_children": False,
+                                                    "link_to_page": {"type": "page_id", "page_id": "pg-linked"}})
+        self.fake.pages["pg-linked"] = {"title": "외부 회의록", "edited": "2026-11-01T00:00:00Z",
+                                        "blocks": [heading("lh", "11월 회의", 1), para("lp", "배포 일정 확정")]}
+        self.sync(ClientView(self.fake))
+        found = {s["title"]: s for s in sections.sections(self.store, SCOPE)}
+        self.assertTrue(found["11월 회의"]["path"].endswith(f"{notion_map.LINK_TITLE} > 11월 회의"))
+
+
 if __name__ == "__main__":
     unittest.main()

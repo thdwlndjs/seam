@@ -195,6 +195,38 @@ MIGRATIONS: list[list[str]] = [
     [
         "ALTER TABLE source_units ADD COLUMN parent_id TEXT",
     ],
+    # 5: 부분(part). 페이지·DB 행 md를 빈 단락·구분선·제목 사이 블록 묶음으로 나눈 단위와 그 종류.
+    #    문서: docs/v1.1/spec.md P1-2, P1-3, "데이터 모델".
+    [
+        """CREATE TABLE source_parts (
+            id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            origin TEXT NOT NULL,            -- notion | teams | clova
+            page_id TEXT,                    -- 부분이 나온 페이지·DB 행
+            section_id TEXT,                 -- 지도의 섹션
+            block_ids_json TEXT,             -- 블록 대조에 성공했을 때 이 부분의 최상위 블록 ID 목록
+            parent_part_id TEXT,             -- 종류 판정에서 떼어 낸 하위 토글이면 원래 부분
+            path TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            kind TEXT,                       -- meeting | document | link | NULL(아직 판정 전)
+            kind_source TEXT,                -- llm | human
+            kind_note TEXT,
+            summary TEXT,                    -- document·link의 한 줄 설명
+            md TEXT NOT NULL,
+            content_hash TEXT NOT NULL,      -- 떼어 내기 전 원래 md의 해시(같으면 다시 판정하지 않는다)
+            chars INTEGER NOT NULL,
+            state TEXT NOT NULL,             -- collected | extracted | pending_confirm | applied | skipped
+            last_edited TEXT,
+            confirmed_by TEXT,
+            confirmed_at TEXT,
+            status TEXT NOT NULL,            -- active | gone
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX source_parts_scope ON source_parts(scope, status, kind)",
+        "CREATE INDEX source_parts_page ON source_parts(page_id, position)",
+        "CREATE INDEX source_parts_parent ON source_parts(parent_part_id)",
+    ],
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
