@@ -24,7 +24,8 @@ def top_level_lines(md: str) -> list[str]:
     - 들여쓰기 없는 닫는 태그(`</callout>`)는 앞 블록에 속한다.
     """
     lines, in_table = [], False
-    for line in md.split("\n"):
+    # splitlines()는   같은 문자에서도 끊으므로 쓰지 않는다. CRLF로 체크아웃된 경우만 맞춘다.
+    for line in md.replace("\r\n", "\n").split("\n"):
         stripped = line.strip()
         if in_table:
             in_table = not stripped.startswith("</table")
