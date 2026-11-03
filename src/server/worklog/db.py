@@ -250,6 +250,27 @@ MIGRATIONS: list[list[str]] = [
             PRIMARY KEY (day, provider)
         )""",
     ],
+    # 7: 확인 반영(Phase 3). 문서: docs/v1.1/spec.md P1-5, P1-6, "데이터 모델".
+    [
+        # [고치기] 전후. 사람이 고친 목록이 추출 정답지다.
+        """CREATE TABLE extract_corrections (
+            id TEXT PRIMARY KEY,
+            part_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,      -- 고친 대상 추출의 md 해시
+            prompt_version TEXT NOT NULL,
+            before_json TEXT NOT NULL,
+            after_json TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX extract_corrections_part ON extract_corrections(part_id, created_at)",
+        # 반영된 추출의 md 해시. 확인된 회의록이 수정되면 새 추출과 비교해 바뀐 항목만 반영한다.
+        "ALTER TABLE source_parts ADD COLUMN applied_hash TEXT",
+        # 되돌린(reverted)·취소된(cancelled) 항목은 같은 제목의 새 항목을 막지 않는다.
+        "DROP INDEX work_items_live_title",
+        """CREATE UNIQUE INDEX work_items_live_title ON work_items(scope, kind, normalized_title)
+           WHERE status NOT IN ('superseded', 'reverted', 'cancelled')""",
+    ],
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

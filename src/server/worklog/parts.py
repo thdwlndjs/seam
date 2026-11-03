@@ -548,6 +548,8 @@ def extract_pending(store: Path, scope: str, extract: PartExtractor | None, prom
             return done  # 한도 초과(429·대기열 Busy) 등: 남은 것은 다음 주기에
         kept, dropped = clean_items(items, text)
         save_extract(store, extract_hash(part), prompt_version, model, kept, dropped, usage)
+        with db.write(store) as c:  # 상태: 수집 → 추출됨(확인 대기로 올라가기 전 단계, spec P1-5)
+            c.execute("UPDATE source_parts SET state = 'extracted' WHERE id = ? AND state = 'collected'", (part["id"],))
         spent += cost
         done += 1
     return done
