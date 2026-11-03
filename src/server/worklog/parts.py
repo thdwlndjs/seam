@@ -312,7 +312,7 @@ def _page_info(store: Path, scope: str, page_id: str | None, page_path: str) -> 
 
 def judge_pending(store: Path, scope: str, classify: PartClassifier | None,
                   budget_tokens: int | None = JUDGE_BUDGET_TOKENS, tokens_per_minute: int | None = None,
-                  sleep: Callable[[float], None] | None = None) -> int:
+                  sleep: Callable[[float], None] | None = None, page_id: str | None = None) -> int:
     """종류가 아직 없는 부분을 판정한다. 판정한 부분 수. LLM이 없거나 실패하면 다음에 다시 한다.
 
     - 최근 수정된 페이지부터. 한 번 호출이 budget_tokens(추정)를 넘지 않게 페이지의 부분을 나눠 보낸다.
@@ -325,7 +325,7 @@ def judge_pending(store: Path, scope: str, classify: PartClassifier | None,
     with closing(db.connect(store)) as c:
         rows = [dict(r) for r in c.execute(
             """SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind IS NULL AND parent_part_id IS NULL
-               ORDER BY page_id, position""", (scope,))]
+               AND (? IS NULL OR page_id = ?) ORDER BY page_id, position""", (scope, page_id, page_id))]
     pages: dict[str, list[dict]] = {}
     for row in rows:
         pages.setdefault(row["page_id"] or row["id"], []).append(row)
@@ -496,12 +496,13 @@ def _chunks(text: str, limit_tokens: int) -> list[str]:
     return out
 
 
-def pending_extracts(store: Path, scope: str, prompt_version: str) -> list[dict[str, Any]]:
+def pending_extracts(store: Path, scope: str, prompt_version: str, page_id: str | None = None) -> list[dict[str, Any]]:
     """추출할 회의 메모 부분(종류 meeting, 이 판의 추출이 아직 없음). 최근 수정된 것부터."""
     db.initialize(store)
     with closing(db.connect(store)) as c:
         rows = [dict(r) for r in c.execute(
-            "SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting'", (scope,))]
+            "SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting' AND (? IS NULL OR page_id = ?)",
+            (scope, page_id, page_id))]
         done = {r["content_hash"] for r in c.execute(
             "SELECT content_hash FROM part_extracts WHERE prompt_version = ?", (prompt_version,))}
     pending = [r for r in rows if extract_hash(r) not in done]
@@ -528,13 +529,13 @@ def save_extract(store: Path, content_hash: str, prompt_version: str, model: str
 
 
 def extract_pending(store: Path, scope: str, extract: PartExtractor | None, prompt_version: str,
-                    budget_tokens: int | None = EXTRACT_BUDGET_TOKENS) -> int:
+                    budget_tokens: int | None = EXTRACT_BUDGET_TOKENS, page_id: str | None = None) -> int:
     """추출 전인 회의 메모 부분을 최근 것부터 추출해 저장한다. 추출한 부분 수.
     LLM이 없거나 실패하면(한도 초과 포함) 멈추고 다음 주기에 이어 한다. 문서(document)는 추출하지 않는다."""
     if extract is None:
         return 0
     done = spent = 0
-    for part in pending_extracts(store, scope, prompt_version):
+    for part in pending_extracts(store, scope, prompt_version, page_id):
         text = md_to_text(part["md"])
         pieces = _chunks(text, EXTRACT_BUDGET_TOKENS) if estimate_tokens(text) > EXTRACT_BUDGET_TOKENS else [text]
         cost = sum(estimate_tokens(piece) for piece in pieces)

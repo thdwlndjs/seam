@@ -51,10 +51,12 @@ from pydantic import BaseModel
 # NOTION_RATE 등)를 읽어 두기 때문에, 순서가 바뀌면 .env 값이 그쪽에 전달되지 않는다.
 load_dotenv(os.environ.get("ENV_FILE"))
 
+import confirm_flow  # noqa: E402
 import llm_queue  # noqa: E402
 import metrics  # noqa: E402
 import notion_map  # noqa: E402
 import worklog_bridge  # noqa: E402
+from worklog import apply as wapply  # noqa: E402
 from worklog import parts as wparts  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
@@ -362,9 +364,9 @@ SETUP_STEPS: list[SetupStep] = [
               _extract_token, "토큰 형식이 아니에요. 공백 없이 다시 보내줄래요?"),
     SetupStep("notion_page_id", "**5** 팀 정보 노션 페이지 링크", _extract_notion_page_id,
               "페이지를 못 찾았어요.\n링크를 다시 보내줄래요?"),
-    SetupStep("meeting_notes_page_id", "**6** 회의록 노션 페이지 링크", _extract_notion_page_id,
-              "페이지를 못 찾았어요.\n링크를 다시 보내줄래요?"),
-    SetupStep("github_project_number", "**7** GitHub 프로젝트 번호\nProjects 탭 URL 끝 숫자예요",
+    # 회의록 페이지는 따로 묻지 않는다: 팀 정보 페이지 안에서 부분 종류 판정으로 찾는다(docs/v1.1/spec.md P1-7).
+    # 이미 meeting_notes_page_id가 저장된 팀은 그 페이지를 계속 함께 읽는다(_team_roots).
+    SetupStep("github_project_number", "**6** GitHub 프로젝트 번호\nProjects 탭 URL 끝 숫자예요",
               _extract_project_number, "숫자만 보내줄래요?"),
 ]
 
@@ -417,7 +419,7 @@ _SETUP_LABELS = {
 # ── 턴 라우팅 (예전 handle_message의 판단 부분) ─────────────────
 async def handle_turn(turn: Turn) -> None:
     if turn.req.kind == "welcome":
-        await turn.send_buttons(WELCOME_TEXT, _MENU_BUTTONS)
+        await _send_welcome(turn)
         return
 
     # 카드 버튼(Action.Submit / Action.Execute) — 에코봇이 data를 value에 그대로 실어 보낸다.
@@ -433,12 +435,19 @@ async def handle_turn(turn: Turn) -> None:
         if action == "dismiss_claim_card":
             await turn.send("알겠어요, 넘어갈게요.")
             return
+        if action in _CONFIRM_ACTIONS:
+            await _handle_confirm_action(turn, action, value)
+            return
 
     raw_text = turn.req.text.strip()
     aad_id = turn.aad_id
 
     # 채팅 메시지는 저장하지 않는다. 예전엔 메뉴가 아닌 메시지를 몰래 저장해 변경 후보를 만들었다(v1.1에서 없앰,
     # docs/v1.1/spec.md P1-0). 회의록은 Notion이나 '회의록 올리기'로만 받는다.
+    if raw_text.lower() not in _CANCEL_TRIGGERS and confirm_flow.has_edit_session(aad_id):
+        await confirm_flow.handle_edit_text(turn, raw_text)  # [고치기] 중인 채팅
+        return
+
     if raw_text.lower() in _CANCEL_TRIGGERS and _cancel_pending_sessions(aad_id):
         await turn.send("취소했어요. 처음부터 다시 하려면 원하는 메뉴나 '설정'을 입력해주세요.")
         return
@@ -473,6 +482,8 @@ def _cancel_pending_sessions(aad_id: str) -> bool:
         cancelled = True
     if aad_id in github_onboarding_sessions:
         del github_onboarding_sessions[aad_id]
+        cancelled = True
+    if confirm_flow.edit_sessions.pop(aad_id, None) is not None:
         cancelled = True
     return cancelled
 
@@ -573,7 +584,10 @@ async def _run_menu(turn: Turn, raw_text: str) -> None:
         return
 
     github_id = _get_github_id(turn.aad_id)
-    if raw_text in ("3", "4") and github_id is None:
+    if raw_text == "4":  # 작업 공유·반영 하위 메뉴(① 완료 공유 ② Notion 변경 반영 ③ 최근 반영 내역)
+        await confirm_flow.show_submenu(turn)
+        return
+    if raw_text in ("3", "4-1") and github_id is None:
         github_onboarding_sessions[turn.aad_id] = {"kind": "menu", "raw_text": raw_text}
         await turn.send(_ASK_GITHUB_ID_TEXT)
         return
@@ -594,7 +608,7 @@ async def _run_menu(turn: Turn, raw_text: str) -> None:
         elif raw_text == "3":
             turn.status("🔍 내 역할을 확인하는 중...")
             reply_text = await fetch_my_role(github_id, turn.user_name, config, turn.team_key, on_stage=turn.status)
-        elif raw_text == "4":
+        elif raw_text == "4-1":
             turn.status("🔍 완료된 작업을 확인하는 중...")
             reply_text = await share_completed_work(config, github_id)
         else:
@@ -1050,7 +1064,10 @@ def _organize_parts() -> dict[str, dict[str, int]]:
             judged = wparts.judge_pending(store, team_key, worklog_bridge.groq_classify_parts)
             extracted = wparts.extract_pending(store, team_key, worklog_bridge.groq_extract_part,
                                                worklog_bridge.EXTRACT_PROMPT_VERSION)
-            results[team_key] = {"judged": judged, "extracted": extracted}
+            # 새 회의록: 마지막 수정 후 2시간이 지나면 확인 대기로. 확인된 회의록의 수정: 새 항목만 자동 반영.
+            promoted = wapply.promote_due(store, team_key)
+            edits = wapply.apply_edits(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION, worklog_bridge.groq_judge)
+            results[team_key] = {"judged": judged, "extracted": extracted, "promoted": promoted, "edited": len(edits)}
         except Exception:
             traceback.print_exc()
     return results
@@ -1112,21 +1129,24 @@ async def fetch_team_status(config: dict, team_key: str,
         result = ["👥 팀 진행상황", "\n".join(lines) if lines else "(회의록도 없고 등록된 이슈도 없어요)"]
         return "\n".join(result + unassigned_hint + footer), unassigned_open
 
-    # 회의 메모는 백그라운드가 부분마다 한 번 추출해 둔 결과를 읽는다. 메뉴를 누를 때 Groq를 부르지 않는다
-    # (docs/v1.1/spec.md P1-9). 아직 확인 흐름(Phase 3)이 없어 "확인 전"으로 표시한다.
+    # 회의 메모는 사람이 확인해 worklog에 반영된 항목만 보인다(docs/v1.1/spec.md P1-9). 메뉴를 누를 때 LLM을 부르지 않는다.
     stored = await asyncio.to_thread(_stored_items, team_key)
     confirmed, undecided = stored["confirmed"], stored["undecided"]
-    pending_hint = [f"(회의록 {stored['pending']}건 정리 중)"] if stored["pending"] else []
+    pending_hint = []
+    if stored["to_confirm"]:
+        pending_hint.append(f"📥 확인 대기 회의록 {stored['to_confirm']}건 — 메인 카드나 4번 ②에서 확인해 주세요")
+    if stored["pending"]:
+        pending_hint.append(f"⏳ 회의록 {stored['pending']}건 정리 중")
 
-    if not confirmed and not undecided and not stored["decisions"] and not stored["feedback"]:
-        header = "👥 팀 진행상황 (회의록 정리 중, 원문)" if stored["pending"] else "👥 팀 진행상황 (회의록 원문)"
+    if not confirmed and not undecided and not stored["decisions"] and not stored["feedback"] and not stored["discussion"]:
+        header = "👥 팀 진행상황 (아직 확인된 회의록이 없어요, 원문)"
         text = header + "\n" + "\n".join(f"- {_brief(t)}" for t in note_lines[-10:])
-        return "\n".join([text] + unassigned_hint + pending_hint + footer), unassigned_open
+        return "\n".join([text] + unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer), unassigned_open
 
     commit_touched = await _get_commit_touched_issues(repo, github_token)
     tasks = _classify_tasks_by_github_state(confirmed, issue_state_by_number, commit_touched)
 
-    result = ["👥 팀 진행상황 (회의록 기준, 확인 전)"]
+    result = ["👥 팀 진행상황 (회의록 기준)"]
     if stored["decisions"]:
         result += ["", "📌 정한 것", *[f"- {t}" for t in stored["decisions"]]]
     if tasks["done"]:
@@ -1139,6 +1159,8 @@ async def fetch_team_status(config: dict, team_key: str,
         result += ["", "🆕 이슈 미등록 (회의에서만 언급됨)", *[f"- {t}" for t in tasks["unlinked"]]]
     if undecided:
         result += ["", "🤔 아직 정해야 할 사안", *[f"- {t}" for t in undecided[:10]]]
+    if stored["discussion"]:
+        result += ["", "🗣 추가 논의 필요", *[f"- {t}" for t in stored["discussion"]]]
     if stored["feedback"]:
         result += ["", "💬 멘토링 피드백", *[f"- {t}" for t in stored["feedback"]]]
     result += unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer
@@ -1147,21 +1169,81 @@ async def fetch_team_status(config: dict, team_key: str,
 
 
 def _stored_items(team_key: str) -> dict:
-    """메뉴 2번에 쓸 저장된 추출 결과(같은 항목은 합쳐짐, 최근 회의 먼저). Notion·Groq를 부르지 않는다."""
+    """메뉴 2번에 쓸 반영된 항목(worklog). 사람이 확인한 회의록에서 나온 것만 보인다(docs/v1.1/spec.md P1-9).
+    Notion·LLM을 부르지 않는다."""
     store = worklog_bridge.WORKLOG_STORE
-    items = wparts.meeting_items(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION)
-    by_kind: dict[str, list[dict]] = {}
-    for item in items:
-        by_kind.setdefault(item["kind"], []).append(item)
-    tasks = by_kind.get("task", [])
+    live = wapply.live_items(store, team_key)
+    tasks = live.get("task", [])
     return {
-        "confirmed": [f"{t['owner']}: {t['title']}" for t in tasks if t.get("owner")],
-        "undecided": [t["title"] for t in by_kind.get("open", [])]
-                     + [f"{t['title']} – 담당자 미정" for t in tasks if not t.get("owner")],
-        "decisions": [d["title"] for d in by_kind.get("decision", [])][:5],
-        "feedback": [f["title"] for f in by_kind.get("feedback", [])][:5],
+        "confirmed": [f"{t['assignee']}: {t['title']}" for t in tasks if t.get("assignee")],
+        "undecided": [i["title"] for i in live.get("open", [])]
+                     + [f"{t['title']} – 담당자 미정" for t in tasks if not t.get("assignee")],
+        "discussion": [i["title"] for i in live.get("needs_discussion", [])][:5],
+        "decisions": [d["title"] for d in live.get("decision", [])][:5],
+        "feedback": [f["title"] for f in live.get("feedback", [])][:5],
         "pending": wparts.pending_count(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION),
+        "to_confirm": len(wapply.pending_pages(store, team_key)),
     }
+
+
+# ── 4번 반영 흐름·메인 카드 알림 (confirm_flow) ─────────────
+_CONFIRM_ACTIONS = {"apply_list", "apply_pick", "apply_pick_ready", "part_apply", "part_edit", "part_cancel",
+                    "edit_delete", "edit_done", "applied_list", "revert", "gone_remove", "gone_keep"}
+
+
+def _is_approver(turn: Turn, config: dict) -> bool:
+    """되돌리기·삭제 확인을 할 수 있는 사람. 역할·권한(Phase 5) 전까지는 관리자만."""
+    return bool(config.get("admin_aad_id")) and config.get("admin_aad_id") == turn.aad_id
+
+
+async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
+    config = _get_config(turn.team_key)
+    if config is None:
+        await turn.send(_NO_CONFIG_TEXT)
+        return
+    team, page_id = turn.team_key, str(value.get("page_id") or "")
+
+    async def sync_team() -> None:
+        await asyncio.to_thread(_sync_team_map, team, _team_roots(config), config["notion_token"], False)
+
+    if action == "apply_list":
+        await confirm_flow.show_apply_list(turn, team)
+    elif action == "apply_pick":
+        await confirm_flow.pick_page(turn, team, page_id, sync_team)
+    elif action == "apply_pick_ready":  # 메인 카드의 확인 대기: 이미 정리돼 있으니 바로 미리보기
+        await confirm_flow.show_preview(turn, team, page_id)
+    elif action == "part_apply":
+        await confirm_flow.apply_page(turn, team, page_id)
+    elif action == "part_edit":
+        await confirm_flow.start_edit(turn, team, page_id)
+    elif action == "part_cancel":
+        await confirm_flow.cancel_page(turn, team, page_id)
+    elif action == "edit_delete":
+        await confirm_flow.delete_item(turn, int(value.get("n") or 0))
+    elif action == "edit_done":
+        await confirm_flow.finish_edit(turn)
+    elif action == "applied_list":
+        await confirm_flow.show_applied_list(turn, team)
+    elif action == "revert":
+        await confirm_flow.revert(turn, team, str(value.get("candidate_id") or ""), _is_approver(turn, config))
+    elif action in ("gone_remove", "gone_keep"):
+        await confirm_flow.resolve_gone(turn, team, str(value.get("part_id") or ""), action == "gone_remove",
+                                        _is_approver(turn, config))
+
+
+async def _send_welcome(turn: Turn) -> None:
+    """메인 카드: 알림(확인 대기·결정 대체·삭제 확인·정리 중)을 먼저, 그다음 메뉴."""
+    if _get_config(turn.team_key) is not None:
+        try:
+            lines, buttons = await asyncio.to_thread(confirm_flow.main_card_alerts, turn.team_key)
+        except Exception:
+            traceback.print_exc()
+            lines, buttons = [], []
+        if lines and buttons:
+            await turn.send_buttons("\n".join(["🔔 알림", *lines]), buttons)
+        elif lines:
+            await turn.send("\n".join(["🔔 알림", *lines]))
+    await turn.send_buttons(WELCOME_TEXT, _MENU_BUTTONS)
 
 
 # ── 3. 내 역할 조회 ─────────────────────────────

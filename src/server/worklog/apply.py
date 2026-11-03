@@ -371,3 +371,19 @@ def extract_eval(store: Path, scope: str, prompt_version: str) -> dict[str, Any]
     report["missing_count"], report["wrong_count"] = len(report["missing"]), len(report["wrong"])
     return report
 
+
+
+def live_items(store: Path, scope: str) -> dict[str, list[dict[str, Any]]]:
+    """메뉴용 반영된 항목(종류별, 최근 것 먼저). needs_discussion은 따로 모은다. 담당은 attributes.assignee."""
+    db.initialize(store)
+    out: dict[str, list[dict[str, Any]]] = {}
+    with closing(db.connect(store)) as c:
+        for row in c.execute(
+                """SELECT * FROM work_items WHERE scope = ? AND status NOT IN ('superseded', 'reverted', 'cancelled', 'done')
+                   ORDER BY updated_at DESC, rowid DESC""", (scope,)):
+            item = dict(row)
+            attributes = json.loads(item.pop("attributes_json"))
+            item.update(assignee=attributes.get("assignee"), due=attributes.get("due"), attributes=attributes)
+            key = "needs_discussion" if item["status"] == "needs_discussion" else item["kind"]
+            out.setdefault(key, []).append(item)
+    return out

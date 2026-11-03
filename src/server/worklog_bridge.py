@@ -186,11 +186,11 @@ JSON 하나만 출력해: {"parts": [{"part_id": "...", "kind": "...", "confiden
 판단할 근거가 없으면 그 part_id는 빼."""
 
 
-def groq_classify_parts(page: dict) -> dict:
+def groq_classify_parts(page: dict, priority: int = llm_queue.BACKGROUND) -> dict:
     """한 페이지의 새로 생기거나 바뀐 부분만 종류를 판정한다(docs/v1.1/spec.md P1-3). LLM 키가 없으면 미룬다."""
     if not (GROQ_API_KEY or llm_ready()) or not page.get("parts"):
         return {}
-    data = _groq_json(PART_KIND_PROMPT, page)
+    data = _llm_call(PART_KIND_PROMPT, page, priority)[0]
     return data if isinstance(data, dict) else {}
 
 
@@ -218,13 +218,13 @@ title·detail은 반드시 한국어로 쓴다. quote는 반드시 text 안에 �
 JSON 하나만 출력해: {"items": [...]}. 뽑을 것이 없으면 {"items": []}."""
 
 
-def groq_extract_part(payload: dict) -> dict:
+def groq_extract_part(payload: dict, priority: int = llm_queue.BACKGROUND) -> dict:
     """회의 메모 부분 하나에서 항목을 뽑는다(docs/v1.1/spec.md P1-4). {"items", "usage", "model"}.
     LLM 키가 없으면 빈 dict(추출을 미룬다). Groq가 막히면 Cerebras로 넘기고, 모두 막히면 llm_queue.Busy.
     model에는 "공급자:모델"을 남긴다(정답지 비교 때 어느 쪽 결과인지 구분)."""
     if not (GROQ_API_KEY or llm_ready()):
         return {}
-    data, usage, label = _llm_call(PART_EXTRACT_PROMPT, payload, llm_queue.BACKGROUND)
+    data, usage, label = _llm_call(PART_EXTRACT_PROMPT, payload, priority)
     items = data.get("items") if isinstance(data, dict) else None
     return {"items": items if isinstance(items, list) else [], "usage": usage, "model": label}
 
@@ -238,8 +238,8 @@ def groq_extract(records: list[dict]) -> list[dict]:
     return items
 
 
-def groq_judge(item: dict, related: list[dict]) -> dict:
-    return _groq_json(JUDGE_PROMPT, {"item": item, "related": related})
+def groq_judge(item: dict, related: list[dict], priority: int = llm_queue.BACKGROUND) -> dict:
+    return _llm_call(JUDGE_PROMPT, {"item": item, "related": related}, priority)[0]
 
 
 def analyze_due() -> list[dict]:
