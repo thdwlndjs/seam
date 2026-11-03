@@ -105,7 +105,9 @@ class RawPart:
 
 
 def plain_title(line: str) -> str:
-    text = re.sub(r"^(\d+\.|- \[[ xX]\]|-|#{1,6})\s+", "", line.strip())
+    text = re.split(r"<br\s*/?>", line.strip())[0]  # 여러 줄 단락은 첫 줄만
+    text = re.sub(r"\s*\{[a-z_]+=\"[^\"]*\"\}\s*$", "", text)  # 색 등 블록 속성 {color="purple_bg"}
+    text = re.sub(r"^(\d+\.|- \[[ xX]\]|-|#{1,6})\s+", "", text)
     text = re.sub(r"<[^>]+>", "", text).replace("**", "").replace("\\[", "[").replace("\\]", "]")
     return text.strip() or "(제목 없음)"
 
@@ -115,6 +117,8 @@ def group_parts(blocks: list[RawBlock]) -> list[RawPart]:
     current: list[RawBlock] | None = None
     for block in blocks:
         kind = line_kind(block.first)
+        if kind == "empty" and current is not None and line_kind(current[0].first) == "heading":
+            continue  # 제목으로 시작한 부분은 빈 단락에서 끝나지 않는다(문서는 제목 뒤에 빈 줄을 두고 본문을 쓴다)
         if kind in {"empty", "divider", "page", "database"}:
             current = None  # 경계. 하위 페이지·DB는 부분이 아니라 지도의 하위 항목이다.
             continue
@@ -332,11 +336,14 @@ def judge_pending(store: Path, scope: str, classify: PartClassifier | None,
                 return judged
             spent += cost
             by_id = {a.get("part_id"): a for a in answer.get("parts", []) if isinstance(a, dict)}
+            if not by_id:
+                return judged  # 빈 답(LLM 없음·형식 오류): 아무것도 굳히지 않고 다음 동기화에서 다시
             with db.write(store) as c:
                 for row in batch:
                     found = by_id.get(row["id"])
                     if found is None or found.get("kind") not in KINDS:
-                        continue
+                        # 판단할 근거가 없다고 뺀 부분: 보관만 하고 다시 보내지 않는다(매 동기화마다 토큰을 쓰지 않게)
+                        found = {"kind": "document", "confidence": 1, "reason": "판정 근거 없음 → 보관만"}
                     _apply_judgment(c, row, found)
                     judged += 1
             if tokens_per_minute:

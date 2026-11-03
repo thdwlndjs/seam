@@ -189,6 +189,29 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(first + rest, 36)  # 끝까지 하면 전부 판정
         self.assertTrue(waits and all(w > 0 for w in waits))  # 분당 속도를 넘지 않게 쉰다
 
+    def test_parts_the_llm_leaves_out_are_kept_as_documents_but_an_empty_answer_changes_nothing(self) -> None:
+        built = parts.build_unit_parts("unit-1", "회의록 > unit-1", SAMPLE_MD, SAMPLE_BLOCKS)
+        parts.save_unit_parts(self.store, SCOPE, "notion", "unit-1", "sec-1", built)
+        self.assertEqual(parts.judge_pending(self.store, SCOPE, lambda page: {}), 0)  # 빈 답: 그대로 둔다
+        self.assertTrue(all(p["kind"] is None for p in parts.list_parts(self.store, SCOPE)))
+
+        def only_first(page: dict) -> dict:
+            first = page["parts"][0]
+            return {"parts": [{"part_id": first["part_id"], "kind": "meeting", "confidence": 0.9, "split": []}]}
+
+        self.assertEqual(parts.judge_pending(self.store, SCOPE, only_first), 6)
+        stored = parts.list_parts(self.store, SCOPE)
+        self.assertEqual(stored[0]["kind"], "meeting")
+        self.assertTrue(all(p["kind"] == "document" and "근거 없음" in p["kind_note"] for p in stored[1:]))
+        self.assertEqual(parts.judge_pending(self.store, SCOPE, only_first), 0)  # 다시 보내지 않는다
+
+    def test_heading_parts_run_past_empty_paragraphs_and_titles_are_clean(self) -> None:
+        md = ('## 📈 2. 데이터 수집 전략 {color="purple_bg"}\n<empty-block/>\n수집 채널은 카페와 리뷰\n<empty-block/>\n'
+              '- 리뷰 300건\n## 3. 타깃 고객\n20대 직장인\n<empty-block/>\n---\n1. 전화를 통한 VoC<br>a) 맘카페')
+        groups = parts.group_parts(parts.top_level_blocks(md))
+        self.assertEqual([g.title for g in groups], ["📈 2. 데이터 수집 전략", "3. 타깃 고객", "전화를 통한 VoC"])
+        self.assertIn("리뷰 300건", groups[0].md)  # 빈 단락 뒤 본문까지 제목의 부분
+
     def test_parts_that_disappear_are_marked_gone(self) -> None:
         self.collect()
         shorter = SAMPLE_MD.split("1. 음성 비서")[0] + "<empty-block/>\n"
