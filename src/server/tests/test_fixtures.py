@@ -6,6 +6,8 @@ md와 블록 목록이 1:1로 맞는다는 것은 Phase 1 블록 대조(docs/v1.
 
 from __future__ import annotations
 
+import isolation  # noqa: F401,I001  실제 저장소·키를 쓰지 않게(맨 먼저)
+
 import json
 import re
 import sys

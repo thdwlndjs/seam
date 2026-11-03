@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import isolation  # noqa: F401,I001  실제 저장소·키를 쓰지 않게(맨 먼저)
+
 import io
 import json
 import sqlite3
