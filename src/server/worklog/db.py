@@ -190,8 +190,18 @@ MIGRATIONS: list[list[str]] = [
     [
         "ALTER TABLE source_sections ADD COLUMN role_note TEXT",
     ],
+    # 4: 하위 페이지·행이 어느 DB(또는 페이지)에서 왔는지. 한 섹션에 DB가 여러 개 있을 때
+    #    (예: 같은 제목 아래 WBS와 멘토링) 회의록 DB의 행만 골라내는 데 쓴다.
+    [
+        "ALTER TABLE source_units ADD COLUMN parent_id TEXT",
+    ],
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
+
+
+def notion_id(value: str | None) -> str:
+    """Notion ID 비교용 표기. 설정에는 하이픈 없이(32자), API 응답에는 하이픈 있게(36자) 들어와서 그대로 비교하면 어긋난다."""
+    return (value or "").replace("-", "").lower()
 
 
 def now() -> str:
