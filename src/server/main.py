@@ -328,7 +328,7 @@ _MENU_ITEMS = [
     ("1", "1️⃣ 팀/프로젝트 정보"),
     ("2", "2️⃣ 진행상황 조회"),
     ("3", "3️⃣ 내 역할 조회"),
-    ("4", "4️⃣ 완료된 작업 공유하기"),
+    ("4", "4️⃣ 작업 공유·회의록 반영"),
 ]
 _MENU_BUTTONS = [{"title": label, "data": {"action": "menu", "choice": choice}} for choice, label in _MENU_ITEMS]
 
