@@ -3,7 +3,7 @@
 흐름: 4번 → ② Notion 변경 반영 → 회의록 고르기 → (지금 읽고 정리) → 미리보기 [반영] [고치기] [취소]
 - [반영]: 확인한 사람을 반영자로 worklog에 넣는다. [취소]: 반영하지 않는다(건너뛰기).
 - [고치기]: 카드에 입력칸이 없어 채팅으로 고친다. `3: 새 문장`(3번 제목 바꾸기), `+ 할 일: 문장`(추가),
-  [삭제 n] 버튼, [다 고쳤어요]. 고친 전후는 정답지(extract_corrections)로 남는다. 세션은 10분.
+  `- n`(지우기, [삭제 n] 버튼은 12번까지), [다 고쳤어요]. 고친 전후는 정답지(extract_corrections)로 남는다. 세션은 10분.
 - 직접 반영이 100초 시한 안에 안 끝나면 "끝나면 메인 카드에 올려 둘게요"라고 답하고 이어서 정리한다.
 - 되돌리기·삭제 확인은 권한자만(Phase 5 전까지는 관리자: team_configs.json의 admin_aad_id).
 """
@@ -26,6 +26,7 @@ EDIT_SESSION_SECONDS = 600
 KIND_LABELS = {"decision": "결정", "task": "할 일", "open": "미정", "feedback": "피드백", "insight": "인사이트"}
 LABEL_KINDS = {v: k for k, v in KIND_LABELS.items()}
 _RENAME_RE = re.compile(r"^\s*(\d+)\s*[:：]\s*(.+?)\s*$")
+_DELETE_RE = re.compile(r"^\s*(?:-|삭제)\s*(\d+)\s*$")
 _ADD_RE = re.compile(r"^\s*\+\s*(결정|할 일|할일|미정|피드백|인사이트)\s*[:：]\s*(.+?)\s*$")
 
 # aad_id → {"team_key", "page_id", "items": [...], "original": [...], "at": monotonic}
@@ -170,7 +171,7 @@ async def _show_edit(turn: Any) -> None:
     session = edit_sessions[turn.aad_id]
     lines = ["✏️ 고치기 — 채팅으로 보내 주세요",
              "· 제목 바꾸기: `3: 새 문장`", "· 추가: `+ 할 일: 문장` (결정·할 일·미정·피드백·인사이트)",
-             "· 지우기: 아래 [삭제 n]", "", *_preview_lines(session["items"], numbered=True)]
+             "· 지우기: 아래 [삭제 n] 또는 `- 13`", "", *_preview_lines(session["items"], numbered=True)]
     buttons = [{"title": f"🗑 삭제 {n}", "data": {"action": "edit_delete", "n": n}}
                for n in range(1, min(len(session["items"]), 12) + 1)]
     buttons.append({"title": "👌 다 고쳤어요", "data": {"action": "edit_done"}})
@@ -191,7 +192,9 @@ async def handle_edit_text(turn: Any, text: str) -> bool:
     if session is None:
         return False
     session["at"] = time.monotonic()
-    if (match := _RENAME_RE.match(text)) and 1 <= int(match.group(1)) <= len(session["items"]):
+    if (match := _DELETE_RE.match(text)) and 1 <= int(match.group(1)) <= len(session["items"]):
+        session["items"].pop(int(match.group(1)) - 1)
+    elif (match := _RENAME_RE.match(text)) and 1 <= int(match.group(1)) <= len(session["items"]):
         session["items"][int(match.group(1)) - 1]["title"] = match.group(2)
     elif match := _ADD_RE.match(text):
         kind = LABEL_KINDS[match.group(1).replace("할일", "할 일")]
@@ -199,7 +202,7 @@ async def handle_edit_text(turn: Any, text: str) -> bool:
         session["items"].append({"kind": kind, "title": match.group(2), "quote": "", "confidence": 1.0,
                                  "part_id": first, "added": True})
     else:
-        await turn.send("형식을 못 알아봤어요. `3: 새 문장` 또는 `+ 할 일: 문장`처럼 보내 주세요. (그만두려면 '취소')")
+        await turn.send("형식을 못 알아봤어요. `3: 새 문장`, `- 3`, `+ 할 일: 문장`처럼 보내 주세요. (그만두려면 '취소')")
         return True
     await _show_edit(turn)
     return True

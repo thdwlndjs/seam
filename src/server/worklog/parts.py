@@ -528,10 +528,26 @@ def save_extract(store: Path, content_hash: str, prompt_version: str, model: str
                    usage.get("prompt_tokens"), usage.get("completion_tokens"), db.now()))
 
 
+def _mark_cached_extracted(store: Path, scope: str, prompt_version: str) -> None:
+    """이 판의 추출이 이미 있는(같은 글이 전에 추출된) 수집 상태 부분을 추출됨으로 올린다.
+    Phase 2에서 상태 없이 추출해 둔 부분도 여기서 확인 대기 흐름에 들어온다."""
+    db.initialize(store)
+    with db.write(store) as c:
+        done = {r["content_hash"] for r in c.execute(
+            "SELECT content_hash FROM part_extracts WHERE prompt_version = ?", (prompt_version,))}
+        rows = [dict(r) for r in c.execute(
+            """SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting'
+               AND state = 'collected'""", (scope,))]
+        for row in rows:
+            if extract_hash(row) in done:
+                c.execute("UPDATE source_parts SET state = 'extracted' WHERE id = ?", (row["id"],))
+
+
 def extract_pending(store: Path, scope: str, extract: PartExtractor | None, prompt_version: str,
                     budget_tokens: int | None = EXTRACT_BUDGET_TOKENS, page_id: str | None = None) -> int:
     """추출 전인 회의 메모 부분을 최근 것부터 추출해 저장한다. 추출한 부분 수.
     LLM이 없거나 실패하면(한도 초과 포함) 멈추고 다음 주기에 이어 한다. 문서(document)는 추출하지 않는다."""
+    _mark_cached_extracted(store, scope, prompt_version)
     if extract is None:
         return 0
     done = spent = 0

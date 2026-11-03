@@ -113,10 +113,13 @@ class ConfirmFlowTests(unittest.TestCase):
         self.post(None, text="+ 할 일: 발표 자료 준비")
         self.assertIn("형식을 못 알아봤어요", self.post(None, text="아무 말"))
         self.post({"action": "edit_delete", "n": 2})
+        self.post(None, text="- 1")  # 버튼이 없는 13번 이후도 채팅으로 지울 수 있다
+        self.post(None, text="+ 결정: 되살린 첫 항목")
         self.assertIn("고친 목록", self.post({"action": "edit_done"}))
         self.post({"action": "part_apply", "page_id": "unit-1"})
         titles = self.titles()
-        self.assertIn("바꾼 제목", titles)
+        self.assertNotIn("바꾼 제목", titles)
+        self.assertIn("되살린 첫 항목", titles)
         self.assertIn("발표 자료 준비", titles)
         self.assertNotIn(first, titles)
         with closing(sqlite3.connect(self.store)) as c:

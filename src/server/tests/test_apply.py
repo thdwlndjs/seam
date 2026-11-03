@@ -134,6 +134,15 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual({r["status"] for r in self.items()}, {"needs_discussion"})
 
 
+    def test_parts_extracted_before_states_existed_join_the_confirm_flow(self) -> None:
+        # Phase 2에서 추출만 해 두고 상태는 '수집'으로 남은 부분: 캐시가 있어 다시 추출되지 않아도 확인 대기로 가야 한다
+        with closing(sqlite3.connect(self.store)) as c:
+            c.execute("UPDATE source_parts SET state = 'collected' WHERE kind = 'meeting'")
+            c.commit()
+        parts.extract_pending(self.store, SCOPE, None, V)
+        self.assertEqual({p["state"] for p in apply.meeting_parts(self.store, SCOPE, "unit-1")}, {"extracted"})
+        self.assertGreater(apply.promote_due(self.store, SCOPE, datetime(2026, 11, 4, tzinfo=timezone.utc)), 0)
+
 class SupersedeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
