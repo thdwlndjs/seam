@@ -8,6 +8,9 @@ diff가 실제로 기존 설명을 건드릴 때만 든다.
 - 입력: anatomy/anatomy.json (현재 상태 설명), git diff(이전 커밋 vs 이번 커밋)
 - 출력: anatomy/anatomy.json (영향받은 노드만 패치), anatomy/history.jsonl (이번 커밋 요약 한 줄 추가)
 
+Claude 호출은 Anthropic API가 아니라 Claude Code CLI(`claude -p ...`)를 헤드리스로 돌려서 한다.
+인증은 `claude setup-token`으로 만든 CLAUDE_CODE_OAUTH_TOKEN(구독 기반) — API 키/크레딧 불필요.
+
 깃에 커밋/푸시하는 건 이 스크립트가 아니라 워크플로우가 한다. 이 스크립트는 파일만 고치고,
 뭔가 바뀌었으면 표준출력 마지막 줄에 "CHANGED"를 찍는다(워크플로우가 그걸 보고 커밋 여부를 정함).
 
@@ -170,14 +173,20 @@ changelog는 이번 커밋에서 "무엇이 왜 바뀌었는지"를 사람이 �
 
 
 def call_claude(payload: dict) -> dict:
-    import anthropic
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=MODEL, max_tokens=4000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+    """Claude Code CLI를 헤드리스로 돌린다. CLAUDE_CODE_OAUTH_TOKEN(구독 토큰)으로 인증 —
+    API 키/크레딧이 아니라 `claude setup-token`으로 만든 구독 기반 토큰을 써서 과금이 안 붙는다."""
+    result = subprocess.run(
+        ["claude", "-p", json.dumps(payload, ensure_ascii=False),
+         "--output-format", "json", "--model", MODEL, "--restricted",
+         "--system-prompt", SYSTEM_PROMPT],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
     )
-    text = "".join(block.text for block in message.content if block.type == "text").strip()
+    if result.returncode != 0:
+        raise RuntimeError(f"claude CLI 종료코드 {result.returncode}: {result.stderr.strip()[:500]}")
+    envelope = json.loads(result.stdout)
+    if envelope.get("is_error"):
+        raise RuntimeError(f"claude CLI 에러: {str(envelope.get('result'))[:500]}")
+    text = str(envelope.get("result", "")).strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0]
     return json.loads(text)
@@ -247,8 +256,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"영향받은 부품 {len(payload['nodes'])}개 — Claude({MODEL}) 호출")
     try:
         result = call_claude(payload)
-    except Exception as error:  # API 키 없음, 레이트리밋, 파싱 실패 등 — 빌드를 막으면 안 되니 조용히 건너뜀
-        print(f"! Claude 호출 실패, 이번 커밋은 설명 갱신 없이 넘어감: {error}", file=sys.stderr)
+    except Exception as error:  # CLI 미설치, 토큰 없음/만료, 레이트리밋, 파싱 실패 등 — 빌드는 막지 않되 눈에 띄게 알림
+        message = f"Claude 호출 실패, 이번 커밋은 설명 갱신 없이 넘어감: {error}"
+        print(f"::warning title=anatomy claude-sync 실패::{message}")  # GitHub Actions 요약에 노란 경고로 뜸
+        print(f"! {message}", file=sys.stderr)
         return 0
 
     updated = apply_patches(anatomy, result.get("patches", []))

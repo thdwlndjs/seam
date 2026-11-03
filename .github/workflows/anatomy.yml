@@ -2,7 +2,8 @@
 # 처음 한 번: 저장소 Settings → Pages → Build and deployment → Source를 "GitHub Actions"로.
 # push일 때는 그 전에 claude_sync.py가 직전 커밋과의 .py diff를 보고, 영향받은 부품 설명이
 # 여전히 맞는지 Claude에게 판단시켜 anatomy.json/history.jsonl을 갱신한다(영향 없으면 호출 안 함).
-# 필요한 secret: ANTHROPIC_API_KEY.
+# Claude 호출은 Claude Code CLI를 구독 기반 토큰으로 돌린다 — API 과금 없음.
+# 필요한 secret: CLAUDE_CODE_OAUTH_TOKEN (로컬에서 `claude setup-token`으로 발급).
 name: anatomy
 
 on:
@@ -30,12 +31,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'push'
+        with:
+          node-version: "20"
       - name: Claude로 해부도 설명 갱신
         if: github.event_name == 'push'
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
-          pip install -q anthropic
+          npm install -g @anthropic-ai/claude-code
           python anatomy/claude_sync.py --src . --before "${{ github.event.before }}" --after "${{ github.sha }}"
       - name: 바뀐 게 있으면 커밋·푸시
         if: github.event_name == 'push'
