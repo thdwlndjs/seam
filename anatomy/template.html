@@ -127,6 +127,12 @@ details.audit ul{margin:8px 0 0; padding-left:1.1em; font-size:13px; display:fle
 details.audit code{font:12px var(--font-mono); overflow-wrap:anywhere}
 .audit-ok{color:var(--c-feat)}
 .audit-bad{color:var(--c-entry)}
+.history{display:flex; flex-direction:column; gap:12px; max-height:420px; overflow-y:auto}
+.history-item{display:flex; flex-direction:column; gap:6px; padding-bottom:12px; border-bottom:1px solid var(--line)}
+.history-item:last-child{border-bottom:0; padding-bottom:0}
+.history-meta{font:12px/1.4 var(--font-mono); color:var(--muted)}
+.history-meta a{color:var(--accent)}
+.history-summary{margin:0; font-size:14px}
 </style>
 </head>
 <body>
@@ -183,6 +189,11 @@ details.audit code{font:12px var(--font-mono); overflow-wrap:anywhere}
         <summary id="auditSummary">코드 점검</summary>
         <div id="auditBody"></div>
       </details>
+
+      <section class="box" id="history" aria-labelledby="historyTitle">
+        <div class="box-title" id="historyTitle">최근 변경</div>
+        <div class="history" id="historyBody"></div>
+      </section>
     </aside>
   </main>
 </div>
@@ -635,6 +646,51 @@ document.getElementById("eyebrow").textContent =
   };
   add("설명에 적혔지만 코드에서 사라진 함수", stale.flatMap(n => n.missing.map(m => [n.label + ":", m])));
   add("어느 부품에도 연결 안 된 함수 (설명을 보강할 곳)", unmapped.map(f => [f.path + ":", f.names.join(", ")]));
+})();
+(function renderHistory() {
+  const box = document.getElementById("history");
+  const body = document.getElementById("historyBody");
+  const history = DATA.history || [];
+  if (!history.length) { box.hidden = true; return; }
+  body.replaceChildren(...history.map(h => {
+    const item = document.createElement("div");
+    item.className = "history-item";
+    const meta = document.createElement("div");
+    meta.className = "history-meta";
+    const when = h.date ? new Date(h.date).toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" }) : "";
+    if (META.repo_url) {
+      const commit = document.createElement("a");
+      commit.href = META.repo_url + "/commit/" + h.sha; commit.target = "_blank"; commit.rel = "noopener";
+      commit.textContent = h.short;
+      meta.append(commit, (h.message ? " · " + h.message : "") + (when ? " · " + when : ""));
+    } else {
+      meta.textContent = h.short + (h.message ? " · " + h.message : "") + (when ? " · " + when : "");
+    }
+    item.appendChild(meta);
+    (h.entries || []).forEach(e => {
+      const p = document.createElement("p");
+      p.className = "history-summary";
+      p.textContent = e.summary;
+      item.appendChild(p);
+      const nodeIds = (e.nodes || []).filter(nid => byId[nid]);
+      if (nodeIds.length) {
+        const nbs = document.createElement("div");
+        nbs.className = "nbs";
+        nbs.append(...nodeIds.map(nid => {
+          const n = byId[nid];
+          const b = document.createElement("button");
+          b.type = "button"; b.className = "nb";
+          b.style.setProperty("--dot", "var(" + LAYERS[n.layer].token + ")");
+          b.innerHTML = "<i></i>";
+          b.appendChild(document.createTextNode(n.label));
+          b.addEventListener("click", () => select(nid));
+          return b;
+        }));
+        item.appendChild(nbs);
+      }
+    });
+    return item;
+  }));
 })();
 
 loadScenario(SCENARIOS[0]);
