@@ -214,6 +214,14 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([g.title for g in groups], ["📈 2. 데이터 수집 전략", "3. 타깃 고객", "전화를 통한 VoC"])
         self.assertIn("리뷰 300건", groups[0].md)  # 빈 단락 뒤 본문까지 제목의 부분
 
+    def test_judging_sees_the_whole_page(self) -> None:
+        classify = split_classifier()
+        self.collect(classify=classify)
+        page = classify.calls[0]["page"]
+        self.assertEqual((page["title"], page["part_count"]), ("1차 멘토링", 6))
+        self.assertEqual(page["outline"][:2], ["화분 관리기", "스마트 책장"])
+        self.assertGreater(page["chars"], 2000)  # 페이지 전체 길이(부분 합)
+
     def test_parts_that_disappear_are_marked_gone(self) -> None:
         self.collect()
         shorter = SAMPLE_MD.split("1. 음성 비서")[0] + "<empty-block/>\n"

@@ -289,6 +289,19 @@ def _judge_item(row: dict) -> dict[str, Any]:
                          for child in details_children(row["md"]) if child["chars"] >= CHILD_MIN_CHARS]}
 
 
+PAGE_OUTLINE_TITLES = 15
+
+
+def _page_info(store: Path, scope: str, page_id: str | None, page_path: str) -> dict[str, Any]:
+    """판정에 같이 보내는 페이지 전체 모습: 제목, 전체 길이, 부분 수, 부분 제목 목차.
+    부분 앞 200자만 보면 큰 기획 문서의 제목 단위 부분을 회의 메모로 잘못 볼 수 있다(Phase 2 실측)."""
+    with closing(db.connect(store)) as c:
+        rows = c.execute("""SELECT path, chars FROM source_parts WHERE scope = ? AND page_id = ? AND status = 'active'
+                            AND parent_part_id IS NULL ORDER BY position""", (scope, page_id)).fetchall()
+    return {"title": page_path.rsplit(" > ", 1)[-1], "chars": sum(r["chars"] for r in rows), "part_count": len(rows),
+            "outline": [r["path"].rsplit(" > ", 1)[-1][:40] for r in rows[:PAGE_OUTLINE_TITLES]]}
+
+
 def judge_pending(store: Path, scope: str, classify: PartClassifier | None,
                   budget_tokens: int | None = JUDGE_BUDGET_TOKENS, tokens_per_minute: int | None = None,
                   sleep: Callable[[float], None] | None = None) -> int:
@@ -313,13 +326,14 @@ def judge_pending(store: Path, scope: str, classify: PartClassifier | None,
     judged = spent = 0
     for page_rows in ordered:
         page_path = page_rows[0]["path"].rsplit(" > ", 1)[0]
+        page_info = _page_info(store, scope, page_rows[0]["page_id"], page_path)
         batches: list[list[dict]] = [[]]
         for row in page_rows:
             if batches[-1] and estimate_tokens([_judge_item(r) for r in batches[-1] + [row]]) > batch_limit:
                 batches.append([])
             batches[-1].append(row)
         for batch in batches:
-            payload = {"page_path": page_path, "parts": [_judge_item(r) for r in batch]}
+            payload = {"page_path": page_path, "page": page_info, "parts": [_judge_item(r) for r in batch]}
             cost = estimate_tokens(payload["parts"])
             if budget_tokens is not None and spent and spent + cost > budget_tokens:
                 return judged  # 이번 몫을 다 씀: 남은 것은 다음 동기화에서

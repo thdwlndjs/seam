@@ -168,8 +168,12 @@ def groq_classify_sections(items: list[dict]) -> dict[str, dict]:
 
 
 PART_KIND_PROMPT = """너는 팀 Notion 회의록·문서 페이지를 나눈 '부분'이 어떤 글인지 고르는 분류기야.
-입력: page_path(페이지 위치)와 parts 배열. 각 part에 part_id, path, title, chars(길이), head(앞부분),
+입력: page_path(페이지 위치), page(페이지 전체: title, chars 전체 길이, part_count 부분 수, outline 부분 제목 목차),
+parts 배열. 각 part에 part_id, path, title, chars(길이), head(앞부분),
 children(그 부분 안의 접힌 토글: child_path, chars)이 있다.
+먼저 페이지 전체가 무엇인지 본다. 페이지가 회의록·멘토링 기록이 아니라 기획서·보고서·조사 자료·발표 준비·산출물
+정리 같은 문서이면(긴 페이지, 제목으로 나뉜 목차, 페르소나·산출물·역할 분담 같은 내용), 그 안의 부분은
+메모처럼 보여도 모두 "document"다. "meeting"은 회의·멘토링·피드백 자리를 적은 페이지의 부분만이다.
 kind:
 - "meeting": 회의·멘토링에서 나온 메모, 피드백, 결정, 할 일, 질문과 답
 - "document": 기획서·제안서·조사 자료처럼 따로 쓴 긴 문서, 양식, 소개 글

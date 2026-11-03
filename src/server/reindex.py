@@ -61,23 +61,36 @@ def forget_edit_times(store: Path, scope: str) -> None:
 REINDEX_TOKENS_PER_MINUTE = 6000  # Groq 무료 등급 분당 8,000토큰 중 메뉴 몫을 남긴다
 
 
+def forget_part_kinds(store: Path, scope: str) -> int:
+    """LLM이 정한 부분 종류를 다시 판정하게 한다(사람이 정한 것은 둔다). 떼어 낸 하위 부분 때문에 저장된 md가
+    원본과 다르므로, 내용 해시를 지워 다음 수집이 원본 md로 다시 저장하고 종류를 비우게 한다."""
+    wdb.initialize(store)
+    with wdb.write(store) as c:
+        return c.execute("""UPDATE source_parts SET content_hash = '' WHERE scope = ? AND parent_part_id IS NULL
+                            AND status = 'active' AND (kind_source IS NULL OR kind_source != 'human')""", (scope,)).rowcount
+
+
 def reindex(store: Path, scope: str, roots: list[str], client: Any, classify: Any = None,
             classify_parts: Any = None, tokens_per_minute: int | None = REINDEX_TOKENS_PER_MINUTE,
-            sleep: Any = None) -> dict[str, Any]:
+            sleep: Any = None, rejudge_parts: bool = False) -> dict[str, Any]:
     made = backup(store)
     forget_edit_times(store, scope)
+    rejudged = forget_part_kinds(store, scope) if rejudge_parts else 0
     stats = notion_map.sync_roots(store, scope, roots, client, classify=classify, classify_parts=classify_parts,
                                   rejudge_unknown=True)
     # 동기화 한 번의 판정 몫을 넘는 나머지도 끝까지 판정한다. 분당 한도를 넘지 않게 쉬어 간다.
     stats["parts_judged"] += parts.judge_pending(store, scope, classify_parts, budget_tokens=None,
                                                  tokens_per_minute=tokens_per_minute, sleep=sleep)
     stats["backup"] = str(made) if made else None
+    stats["parts_rejudged"] = rejudged
     return stats
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="팀 하나를 md·부분으로 다시 수집한다")
     parser.add_argument("--scope", required=True, help="team_configs.json의 팀 키")
+    parser.add_argument("--rejudge-parts", action="store_true",
+                        help="LLM이 정한 부분 종류도 다시 판정한다(판정 지시문을 바꿨을 때). 사람이 정한 것은 둔다")
     args = parser.parse_args(argv)
     configs = json.loads(TEAM_CONFIG_PATH.read_text(encoding="utf-8"))
     config = configs.get(args.scope)
@@ -87,8 +100,9 @@ def main(argv: list[str] | None = None) -> int:
     roots = [r for r in (config.get("notion_page_id"), config.get("meeting_notes_page_id")) if r]
     with metrics.measure("reindex", args.scope) as meter:
         stats = reindex(worklog_bridge.WORKLOG_STORE, args.scope, roots, notion_client_for(config["notion_token"]),
-                        classify=worklog_bridge.groq_classify_sections, classify_parts=worklog_bridge.groq_classify_parts)
-    summary = {k: stats[k] for k in ("backup", "pages_checked", "judged", "records_new", "parts_judged", "roots")}
+                        classify=worklog_bridge.groq_classify_sections, classify_parts=worklog_bridge.groq_classify_parts,
+                        rejudge_parts=args.rejudge_parts)
+    summary = {k: stats[k] for k in ("backup", "pages_checked", "judged", "records_new", "parts_rejudged", "parts_judged", "roots")}
     summary.update(meter.counts)
     print(json.dumps(summary, ensure_ascii=False, indent=1))
     return 0
