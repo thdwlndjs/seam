@@ -235,6 +235,14 @@ def save_unit_parts(store: Path, scope: str, origin: str, page_id: str, section_
     with db.write(store) as c:
         existing = {r["id"]: r for r in c.execute(
             "SELECT * FROM source_parts WHERE scope = ? AND page_id = ? AND parent_part_id IS NULL", (scope, page_id))}
+        # 블록 대조에 실패해 ID가 위치 순번이 된 부분은, 같은 경로(제목)의 기존 부분 ID를 그대로 쓴다.
+        # 그러지 않으면 대조가 한 번 어긋날 때마다 모든 부분이 "사라졌다가 새로 생긴" 것이 된다.
+        by_path = {r["path"]: r["id"] for r in existing.values() if r["status"] == "active"}
+        taken: set[str] = set()
+        for part in built:
+            if not part["block_ids"] and part["id"] not in existing and by_path.get(part["path"]) not in taken | {None}:
+                part["id"] = by_path[part["path"]]
+            taken.add(part["id"])
         for part in built:
             old = existing.get(part["id"])
             if old is not None and old["content_hash"] == part["content_hash"] and old["status"] == "active":
