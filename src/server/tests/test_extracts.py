@@ -251,6 +251,46 @@ class QueueTests(unittest.TestCase):  # A21
                                 "https://api.cerebras.ai/v1/chat/completions",
                                 "https://api.cerebras.ai/v1/chat/completions"])
 
+    def test_menu_summary_moves_to_cerebras_when_groq_says_429(self) -> None:
+        urls: list[str] = []
+
+        class Stream:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.status_code = 429 if "groq" in url else 200
+                self.headers = {"retry-after": "30"} if self.status_code == 429 else {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise RuntimeError("429")
+
+            async def aiter_lines(self):
+                yield 'data: {"choices": [{"delta": {"content": "요약입니다"}}]}'
+                yield 'data: {"choices": [], "usage": {"total_tokens": 30}}'
+                yield "data: [DONE]"
+
+        def stream(self, method, url, **kwargs):
+            urls.append(url)
+            return Stream(url)
+
+        chunks: list[str] = []
+        with patch.dict(os.environ, {"GROQ_API_KEY": "g", "CEREBRAS_API_KEY": "c"}), \
+                patch.object(worklog_bridge, "WORKLOG_STORE", self.store), patch("httpx.AsyncClient.stream", stream):
+            text = asyncio.run(main._summarize_project_info("팀 소개 원문", chunks.append))
+            asyncio.run(main._summarize_project_info("팀 소개 원문"))  # 429 뒤에는 Groq를 건너뛴다
+        self.assertEqual(text, "요약입니다")
+        self.assertEqual(chunks, ["요약입니다"])
+        self.assertEqual(urls, ["https://api.groq.com/openai/v1/chat/completions",
+                                "https://api.cerebras.ai/v1/chat/completions",
+                                "https://api.cerebras.ai/v1/chat/completions"])
+        self.assertEqual(llm_queue.daily_usage(self.store, "cerebras")["tokens"], 60)
+
     def test_without_a_cerebras_key_only_groq_is_used_and_everything_busy_raises(self) -> None:
         with patch.dict(os.environ, {"GROQ_API_KEY": "g", "CEREBRAS_API_KEY": ""}):
             self.assertEqual([p.name for p in llm_queue.available()], ["groq"])

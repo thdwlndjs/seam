@@ -70,9 +70,16 @@ PROVIDERS = _providers()
 
 
 def available(priority: int = BACKGROUND) -> list[Provider]:
-    """키가 있는 공급자, 쓸 순서대로. 사람이 기다리는 호출은 Groq만 쓴다."""
-    usable = [p for p in PROVIDERS if p.key]
-    return usable[:1] if priority <= USER else usable
+    """키가 있는 공급자, 쓸 순서대로(Groq → Cerebras). 사람이 기다리는 호출도 Groq가 막히면 Cerebras로 넘긴다."""
+    return [p for p in PROVIDERS if p.key]
+
+
+def cooling_down(provider: Provider) -> bool:
+    """429를 받은 뒤 retry-after가 아직 안 지났는지(또는 시간·하루 요청을 다 썼는지). 사람이 기다리는 호출이
+    다음 공급자로 바로 넘어갈지 정하는 데 쓴다(분당 남은 양 추정으로는 막지 않는다)."""
+    with _lock:
+        state = _minute.get(provider.name, {})
+        return (state.get("reset_at") or 0.0) > time.monotonic() and state.get("remaining") == 0
 
 
 class Busy(Exception):

@@ -768,8 +768,12 @@ def _fit_for_groq(text: str, keep: str = "head") -> str:
 
 
 async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None] | None = None) -> str | None:
-    """요약을 돌려준다. Groq 키가 없거나 실패하면 None — 호출부가 원문 앞부분을 보여주고 캐시하지 않는다."""
-    if not GROQ_API_KEY or not raw_text.strip():
+    """요약을 돌려준다. LLM 키가 없거나 모두 실패하면 None — 호출부가 원문 앞부분을 보여주고 캐시하지 않는다.
+    Groq가 한도(429)에 걸렸거나 쉬는 중이면 같은 모델의 Cerebras로 넘긴다(docs/v1.1/spec.md P1-8)."""
+    candidates = [(p, p.key) for p in llm_queue.available(llm_queue.USER)]
+    if not candidates and GROQ_API_KEY:
+        candidates = [(llm_queue.PROVIDERS[0], GROQ_API_KEY)]
+    if not candidates or not raw_text.strip():
         return None
     raw_text = _fit_for_groq(raw_text)
 
@@ -779,50 +783,54 @@ async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None]
         "'[프로젝트명 입력]'처럼 아직 안 채워진 항목은 '미정'으로 짧게만 표시하거나 생략해.\n"
         "팀 규칙/협업 방식 같은 formality는 한두 줄로만 축약하고, 전체 5~10줄 이내로 정리해."
     )
-    try:
+    ready = [c for c in candidates if not llm_queue.cooling_down(c[0])] or candidates
+    for provider, key in ready:
         full_text = ""
-        async with httpx.AsyncClient(timeout=15) as client:
-            async with client.stream(
-                "POST",
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": raw_text},
-                    ],
-                    "temperature": 0.2,
-                    "stream": True,
-                },
-            ) as resp:
-                usage: dict | None = None
-                try:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        payload = line[len("data: "):].strip()
-                        if payload == "[DONE]":
-                            break
-                        event = json.loads(payload)
-                        # Groq는 스트림 마지막 조각의 x_groq.usage에 토큰 수를 싣는다.
-                        usage = (event.get("x_groq") or {}).get("usage") or event.get("usage") or usage
-                        choices = event.get("choices") or [{}]
-                        delta = (choices[0].get("delta") or {}).get("content", "")
-                        if delta:
-                            full_text += delta
-                            if on_chunk:
-                                on_chunk(delta)
-                finally:
-                    metrics.count_groq(usage)
-                    # 사람이 기다리는 호출(순위 1)은 막지 않고, 쓴 양만 대기열에 알린다(백그라운드가 몫을 맞춘다).
-                    llm_queue.record(worklog_bridge.WORKLOG_STORE, "groq", llm_queue.USER, resp.headers, resp.status_code,
-                                      int((usage or {}).get("total_tokens") or 0))
-        return full_text.strip() or None
-    except Exception:
-        traceback.print_exc()
-        return None
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                async with client.stream(
+                    "POST",
+                    provider.url,
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": GROQ_MODEL if provider.name == "groq" else provider.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": raw_text},
+                        ],
+                        "temperature": 0.2,
+                        "stream": True,
+                    },
+                ) as resp:
+                    usage: dict | None = None
+                    try:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[len("data: "):].strip()
+                            if payload == "[DONE]":
+                                break
+                            event = json.loads(payload)
+                            # Groq는 마지막 조각의 x_groq.usage에, Cerebras는 usage에 토큰 수를 싣는다.
+                            usage = (event.get("x_groq") or {}).get("usage") or event.get("usage") or usage
+                            choices = event.get("choices") or [{}]
+                            delta = (choices[0].get("delta") or {}).get("content", "")
+                            if delta:
+                                full_text += delta
+                                if on_chunk:
+                                    on_chunk(delta)
+                    finally:
+                        metrics.count_groq(usage)
+                        # 사람이 기다리는 호출(순위 1)은 막지 않고, 쓴 양만 대기열에 알린다(백그라운드가 몫을 맞춘다).
+                        llm_queue.record(worklog_bridge.WORKLOG_STORE, provider.name, llm_queue.USER, resp.headers,
+                                         resp.status_code, int((usage or {}).get("total_tokens") or 0))
+            return full_text.strip() or None
+        except Exception:
+            traceback.print_exc()
+            if full_text:
+                return full_text.strip()  # 이미 보낸 글이 있으면 다른 공급자로 처음부터 다시 보내지 않는다
+    return None
 
 
 def _team_roots(config: dict) -> list[str]:
