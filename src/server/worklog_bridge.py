@@ -134,6 +134,29 @@ def groq_classify_sections(items: list[dict]) -> dict[str, dict]:
     return found if isinstance(found, dict) else {}
 
 
+PART_KIND_PROMPT = """너는 팀 Notion 회의록·문서 페이지를 나눈 '부분'이 어떤 글인지 고르는 분류기야.
+입력: page_path(페이지 위치)와 parts 배열. 각 part에 part_id, path, title, chars(길이), head(앞부분),
+children(그 부분 안의 접힌 토글: child_path, chars)이 있다.
+kind:
+- "meeting": 회의·멘토링에서 나온 메모, 피드백, 결정, 할 일, 질문과 답
+- "document": 기획서·제안서·조사 자료처럼 따로 쓴 긴 문서, 양식, 소개 글
+- "link": 링크·첨부·녹음 노트 공유'만' 있는 부분. 메모·피드백·결론 문장이 한 줄이라도 섞여 있으면 meeting이다
+회의 메모 안에 기획서 같은 긴 문서가 토글로 붙어 있으면, 그 부분은 meeting으로 두고
+그 토글을 split에 넣어 document로 떼어 내. 메모 토글(기능, 멘토링 등)은 떼지 마.
+document·link에는 summary(40자 이내 한 줄 설명: 무엇에 대한 문서인지, 작성 기준일이 있으면 함께)를 붙여.
+JSON 하나만 출력해: {"parts": [{"part_id": "...", "kind": "...", "confidence": 0.0~1.0, "summary": "..." 또는 null,
+"reason": "한 줄", "split": [{"child_path": "...", "kind": "document", "summary": "..."}]}]}.
+판단할 근거가 없으면 그 part_id는 빼."""
+
+
+def groq_classify_parts(page: dict) -> dict:
+    """한 페이지의 새로 생기거나 바뀐 부분만 종류를 판정한다(docs/v1.1/spec.md P1-3). Groq 키가 없으면 미룬다."""
+    if not GROQ_API_KEY or not page.get("parts"):
+        return {}
+    data = _groq_json(PART_KIND_PROMPT, page)
+    return data if isinstance(data, dict) else {}
+
+
 def groq_extract(records: list[dict]) -> list[dict]:
     payload = {"records": [{"source_id": r["source_id"], "text": r["text"], "author": r.get("author")} for r in records]}
     data = _groq_json(EXTRACT_PROMPT, payload)

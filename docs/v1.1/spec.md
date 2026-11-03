@@ -49,13 +49,14 @@ v1.1에서 만드는 동작·데이터·화면의 규격이다. 구현과 테스
 
 | 항목 | 규격 |
 | --- | --- |
-| 호출 | `GET /v1/pages/{page_id}/markdown`, 헤더 `Notion-Version: 2026-03-11`(이 호출에만). 다른 호출의 버전은 바꾸지 않는다 |
+| 호출 | `GET /v1/pages/{page_id}/markdown`, 헤더 `Notion-Version: 2026-03-11`(이 호출에만). 다른 호출의 버전은 바꾸지 않는다. `notion_read.notion_client_for()`가 만든 클라이언트의 `page_markdown(page_id)`로 부른다(호출 관문을 지난다) |
 | 응답 | `markdown`, `truncated`, `unknown_block_ids` |
 | 잘린 응답 | `truncated = true`면 `unknown_block_ids`의 각 ID로 같은 엔드포인트를 불러 이어 붙인다. 페이지당 최대 20회 **[가정]**. 상한을 넘으면 그 페이지를 블록 읽기로 대체한다 |
-| 실패 | 404·지원 안 되는 블록·상한 초과 → `notion_read._block_text` 경로로 대체하고 `fallback_reason`을 기록한다 |
+| 실패 | 404·지원 안 되는 블록·상한 초과 → 원문(`sources`)은 예전 블록 읽기(`notion_read._block_text`)로 저장하고, 그 페이지의 부분은 만들지 않는다. `fallback_reason`을 기록하고 계측 `fallback`을 센다 |
 | 반환 | `MarkdownPage(page_id, md, source = "md" \| "blocks", fallback_reason)` |
 
-- 다시 받는 조건은 지금과 같다. `source_units.last_edited`가 바뀐 페이지·행만 받는다.
+- 다시 받는 조건은 지금과 같다. `source_units.last_edited`가 바뀐 페이지·행만 받는다. 단, 부분이 생기기 전에 모은 행(부분이 하나도 없는 행)은 한 번 md로 받아 부분만 채운다(원문은 다시 저장하지 않는다).
+- 원문(`sources`)은 메뉴가 계속 쓸 수 있게 그대로 저장한다. 글은 md에서 구조 태그를 뺀 것(`parts.md_to_text`)이다.
 - link_to_page 블록은 대상 페이지를 하위 페이지처럼 지도에 넣는다. 다른 루트가 이미 덮은 페이지는 `_covered_ids`로 뺀다.
 
 ### P1-2 부분 분할과 블록 대조
@@ -64,11 +65,13 @@ v1.1에서 만드는 동작·데이터·화면의 규격이다. 구현과 테스
 
 **(1) 최상위 블록 자르기** `parts.top_level_blocks(md: str) -> list[RawBlock]`
 
-실제 녹화본 5개(1·2·3차 멘토링, 3차 질문지, 팀 정보 페이지)로 확인한 규칙이다. 다섯 페이지 모두 최상위 블록 목록과 1:1로 맞았다(`tests/test_fixtures.py`).
+실제 녹화본 8개(1·2·3차 멘토링, 3차 질문지, 팀 정보 페이지, 긴 WBS 문서 3개)로 확인한 규칙이다. 여덟 페이지 모두 최상위 블록 목록과 종류까지 1:1로 맞았다(`tests/test_fixtures.py`).
 
 - 중첩은 **탭**으로만 표시된다. 탭으로 시작하지 않는 줄이 새 최상위 블록이다. 공백으로 시작하는 줄(` \[클로바노트공유\]`)도 최상위 단락이다.
 - `<table>` … `</table>` 안의 `<tr>`·`<td>` 줄은 들여쓰기가 없어도 그 표에 속한다. 최상위 `<table>` 줄은 블록 하나다.
 - 들여쓰기 없는 닫는 태그(`</callout>` 등)는 앞 블록에 속한다.
+- 최상위 토글은 `<details>`와 다음 줄 `<summary>…</summary>`가 둘 다 들여쓰기 없이 나온다. 둘이 한 블록이고, 부분 제목은 summary의 글자다.
+- 코드 블록(```)은 둘째 줄부터 들여쓰기가 없다. 닫는 ``` 까지 앞 블록에 속한다.
 - 빈 단락은 `<empty-block/>`, 구분선은 `---`, 하위 페이지는 `<page url=…>제목</page>`, 인라인 DB는 `<database url=…>제목</database>`로 나온다.
 
 **(2) 부분으로 묶기** `parts.group_parts(blocks: list[RawBlock]) -> list[RawPart]`
@@ -76,13 +79,14 @@ v1.1에서 만드는 동작·데이터·화면의 규격이다. 구현과 테스
 블록 하나를 부분 하나로 보면 너무 잘게 나뉜다. 1차 멘토링은 최상위 블록이 19개이고, 결론 `→` 줄 네 개도 각각 블록이다. 그래서 경계 블록 사이에 이어진 블록들을 한 부분으로 묶는다.
 
 - 경계: 빈 단락(`<empty-block/>`), 구분선(`---`), 제목(`#`, `##`, `###`). 빈 단락과 구분선은 부분에 넣지 않고, 제목은 다음 부분의 첫 줄이 된다.
+- 제목으로 시작한 부분은 빈 단락에서 끝나지 않고 다음 제목·구분선까지 간다. 문서는 제목 뒤에 빈 줄을 두고 본문을 쓰기 때문이다(그러지 않으면 제목만 있는 부분이 생겨 판정할 근거가 없다).
 - 하위 페이지(`<page>`)와 인라인 DB(`<database>`)는 부분이 아니라 지도의 하위 항목이다(P1-1의 수집 대상).
-- `RawPart(position, title, md, block_positions)`. `title`은 첫 블록 첫 줄에서 목록 기호(`1.`, `-`, `- [ ]`)와 마크업을 뺀 글자다.
+- `RawPart(position, title, md, block_positions)`. `title`은 첫 블록 첫 줄에서 목록 기호(`1.`, `-`, `- [ ]`), 마크업, 블록 속성(`{color="…"}`)을 빼고 `<br>` 앞까지만 쓴 글자다. 토글이면 `<summary>`의 글자다.
 
 `parts.align_blocks(blocks: list[RawBlock], top_blocks: list[dict]) -> list[str] | None`
 
 - `notion_map.top_blocks(client, page_id)`의 결과와 개수·순서를 맞춰 블록마다 `block_id`를 붙인다. 부분은 자기 블록들의 ID 목록(`block_ids`)을 갖는다.
-- 개수가 다르거나, 같은 위치가 어긋나면 `None`을 돌려준다(구분선 ↔ `---`, 빈 단락 ↔ `<empty-block/>`, 목록 ↔ `1.`·`-`, 제목 ↔ `#`, 표 ↔ `<table`, 하위 페이지 ↔ `<page`, DB ↔ `<database`). 이때 그 페이지는 블록 읽기로 부분을 만든다.
+- 개수가 다르거나, 같은 위치가 어긋나면 `None`을 돌려준다(구분선 ↔ `---`, 빈 단락 ↔ `<empty-block/>`, 목록 ↔ `1.`·`-`, 제목 ↔ `#`, 표 ↔ `<table`, 하위 페이지 ↔ `<page`, DB ↔ `<database`). 이때 그 페이지의 부분은 블록 ID 없이(`block_ids_json = NULL`) 저장하고, 블록 위치 순번으로 ID를 만든다.
 - 경로(`path`)는 `페이지 경로 > 부분 제목`이다. 예: `프로젝트 기본정보 > 1차 멘토링 > 스마트 옷장`.
 
 **기대 결과**
@@ -138,7 +142,9 @@ v1.1에서 만드는 동작·데이터·화면의 규격이다. 구현과 테스
 - `confidence < 0.6` **[가정]**이면 `document`로 두고 `kind_note`에 이유를 남긴다. 추출하지 않고 원문만 보관한다.
 - `document`·`link`는 `summary`(한 줄 설명, 40자 이내)가 반드시 있다.
 - 내용 해시가 같은 부분은 다시 판정하지 않는다. `map-set`으로 사람이 정한 종류(`kind_source = 'human'`)는 같은 `block_id`면 해시가 바뀌어도 유지한다.
-- Groq가 없거나 실패하면 부분을 `kind = NULL`, `state = 'skipped'`로 두고 다음 주기에 다시 판정한다.
+- Groq가 없거나 실패하면, 또는 답이 비어 있으면 `kind = NULL`로 두고 다음 동기화에서 다시 판정한다.
+- 답에 판정이 있는데 어떤 부분만 빠졌으면(판단할 근거가 없다고 뺀 것) 그 부분은 `document`, `kind_note = 판정 근거 없음`으로 보관만 하고 다시 보내지 않는다.
+- 동기화 한 번에 판정에 쓰는 토큰은 약 4,000(추정) **[가정]**이다. 최근 수정된 페이지부터, 한 호출이 그 몫을 넘지 않게 페이지의 부분을 나눠 보내고, 몫을 다 쓰면 멈춘다. 판정이 한 번 실패하면(429 등) 그 동기화에서는 멈춘다. 근거: 한 번에 전부 판정하자 분당 한도(8,000토큰)를 다 써서 바로 뒤 메뉴 2번 요약이 429로 실패했다(Phase 1 실측).
 
 ### P1-4 추출
 
@@ -261,7 +267,8 @@ applied ─삭제 감지→ 권한자에게 "거기서 나온 항목을 지울�
 
 ### P1-10 다시 수집과 이전
 
-- `python -m worklog reindex --scope <team_key>`: 저장소를 `worklog.sqlite3.bak-YYYYMMDD`로 복사한 뒤, 그 팀의 모든 페이지를 md로 다시 받아 부분을 만든다. 기존 `sources`는 지우지 않는다.
+- `src/server`에서 `python reindex.py --scope <team_key>`(worklog 패키지는 Notion·LLM에 의존하지 않으므로 서버 폴더에 둔다): 저장소를 `worklog.sqlite3.bak-YYYYMMDD-HHMMSS`로 복사하고, 그 팀의 페이지·행 수정 시각, 구조 지문, DB 조회 커서를 지운 뒤 모든 페이지를 md로 다시 받아 부분을 만든다. 기존 `sources`는 지우지 않는다.
+- 동기화 몫을 넘는 나머지 부분도 끝까지 판정한다. 분당 6,000토큰을 넘지 않게 쉬어 가고, 429가 나면 1분 기다렸다 최대 3번 다시 한다.
 - 다시 수집한 부분 중 이미 반영된 내용과 같은 해시는 `applied`로 둔다. 처음 보는 부분은 `extracted`부터 시작한다.
 - `role_source = 'none'`("판정 못 함") 섹션은 다음 동기화에서 다시 판정한다.
 
@@ -385,6 +392,7 @@ CREATE TABLE source_parts (
     scope TEXT NOT NULL,
     origin TEXT NOT NULL,            -- notion | teams | clova
     page_id TEXT,                    -- notion만
+    section_id TEXT,                 -- 지도의 섹션
     block_ids_json TEXT,             -- 대조 성공 시 이 부분의 최상위 블록 ID 목록
     parent_part_id TEXT,             -- split으로 떼어 낸 경우
     path TEXT NOT NULL,
@@ -396,7 +404,7 @@ CREATE TABLE source_parts (
     md TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     chars INTEGER NOT NULL,
-    state TEXT NOT NULL,             -- extracted | pending_confirm | applied | skipped
+    state TEXT NOT NULL,             -- collected | extracted | pending_confirm | applied | skipped
     last_edited TEXT,
     confirmed_by TEXT,
     confirmed_at TEXT,
@@ -534,6 +542,8 @@ metric kind=<menu|apply|background> team=<scope> menu=<1-4|-> notion_calls=<n> g
 
 | 날짜 | 바뀐 것 | 근거 |
 | --- | --- | --- |
+| 2026-11-03 | 제목 부분은 빈 단락에서 끝나지 않음, 제목 정리, 근거 없음 부분은 보관만 | reindex 실측: 제목만 있는 부분 11개가 판정되지 않고 남음, 큰 문서 한 페이지가 부분 57개(→43개), 판정에 Groq 73,104토큰 |
+| 2026-11-03 | Phase 1 구현·실측 반영: md 실패 시 원문만 블록 읽기(부분 없음), 대조 실패 시 ID 없이 저장, 부분 없는 행 한 번 채우기, 토글·코드 블록 규칙, 판정 예산(동기화당 ~4,000토큰, 최근 수정 먼저), reindex는 서버 폴더 `reindex.py`(커서까지 지우고 쉬어 가며 끝까지 판정), state `collected` 추가 | 실제 녹화본 8개 대조 성공, 처음 수집 Notion 418→42회·143→20초, 한 번에 판정 시 Groq 429로 메뉴 2번 실패 |
 | 2026-11-03 | P1-2 분할 규칙: 블록 하나 = 부분 하나 → 경계(빈 단락·구분선·제목) 사이 블록 묶음. md 최상위 줄 규칙(탭만 중첩, 표 안 줄·닫는 태그는 앞 블록). 1차 멘토링 기대값 7개 → 6개, `block_id` → `block_ids_json` | Phase 0 실제 녹화본 5개: 1차 멘토링 최상위 블록 19개(빈 단락 7, 구분선 1, `→` 단락 4 포함) |
 | 2026-11-03 | P1-0 추가: 채팅 메시지 저장과 변경 후보·터미널 승인 경로를 없앤다 | 송지원 결정(숨은 기능이고 쌓인 데이터 0건) |
 | 2026-11-03 | 첫 작성. **[가정]** 값: 종류 판정 확신 0.6, 대체 확신 0.7, md 이어 받기 20회, 추출 분할 4,000토큰, 백그라운드 70%, 확인 대기 알림 3일, 게이트 기본값 12개(세부 단계 10개) | [report-2026-11-03.md](report-2026-11-03.md) |

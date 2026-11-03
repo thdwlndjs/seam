@@ -29,15 +29,20 @@ from typing import Any
 
 from notion_client import Client
 
+import metrics
+import notion_md
 import worklog
 from notion_read import _block_text, _fetch_notion_page_by_id, _list_child_blocks, _rich_text
 from worklog import db as wdb
+from worklog import parts as wparts
 from worklog import sections as wsections
 
 MAX_PAGE_DEPTH = 3
 HEADINGS = {"heading_1": 1, "heading_2": 2, "heading_3": 3}
 CONTAINERS = {"column_list", "column", "synced_block"}
-UNREADABLE = {"unsupported", "link_to_page"}  # 링크된 DB 보기 등 API가 내용을 주지 않는 블록
+UNREADABLE = {"unsupported"}  # 링크된 DB 보기 등 API가 내용을 주지 않는 블록
+LINKS = {"link_to_page"}  # 다른 페이지·DB를 가리키는 블록: 하위 페이지·DB처럼 따라간다(spec P1-1)
+LINK_TITLE = "(링크된 페이지)"
 
 ROLE_LABELS = {"progress": "진행 기록", "meeting": "회의", "reference": "참고 자료"}
 
@@ -53,7 +58,19 @@ def _title(block: dict) -> str:
         return block.get("child_page", {}).get("title", "")
     if kind == "child_database":
         return block.get("child_database", {}).get("title", "")
+    if kind in LINKS:
+        return LINK_TITLE
     return _rich_text(block.get(kind, {}))
+
+
+def _link_target(block: dict) -> tuple[str, str] | None:
+    """link_to_page 블록이 가리키는 것: ("page" | "database", ID). 그 밖(댓글 링크 등)은 None."""
+    target = block.get("link_to_page", {}) or {}
+    if target.get("type") == "page_id" and target.get("page_id"):
+        return "page", target["page_id"]
+    if target.get("type") == "database_id" and target.get("database_id"):
+        return "database", target["database_id"]
+    return None
 
 
 def intro_id(page_id: str) -> str:
@@ -61,7 +78,7 @@ def intro_id(page_id: str) -> str:
 
 
 def _is_text(block: dict) -> bool:
-    return block["type"] not in HEADINGS and block["type"] not in {"child_page", "child_database"} | UNREADABLE | CONTAINERS
+    return block["type"] not in HEADINGS and block["type"] not in {"child_page", "child_database"} | UNREADABLE | CONTAINERS | LINKS
 
 
 def _is_toggle(block: dict) -> bool:
@@ -93,9 +110,11 @@ def top_blocks(client: Client, page_id: str) -> list[dict]:
 
 def fingerprint(blocks: list[dict]) -> str:
     """구조 지문: 제목·하위 페이지·DB·읽을 수 없는 블록의 ID·종류·이름. 일반 문단은 넣지 않는다."""
-    parts = [(b["id"], b["type"], _title(b)) for b in blocks
-             if b["type"] in HEADINGS or b["type"] in {"child_page", "child_database"} | UNREADABLE]
-    return wdb.sha256(parts)
+    items = [(b["id"], b["type"], _title(b), _link_target(b) if b["type"] in LINKS else None) for b in blocks
+             if b["type"] in HEADINGS or b["type"] in {"child_page", "child_database"} | UNREADABLE | LINKS]
+    if not any(item[3] for item in items):
+        items = [item[:3] for item in items]  # 링크 블록이 없으면 예전 지문과 같게 둔다(저장된 지도를 다시 스캔하지 않게)
+    return wdb.sha256(items)
 
 
 def scan_page(page_id: str, path: str, blocks: list[dict], depth: int) -> tuple[list[dict], list[tuple[str, str]]]:
@@ -121,6 +140,14 @@ def scan_page(page_id: str, path: str, blocks: list[dict], depth: int) -> tuple[
 
     for block in blocks:
         kind = block["type"]
+        if kind in LINKS:
+            target = _link_target(block)
+            if target is None:
+                continue
+            # 링크는 그 대상을 하위 페이지·DB처럼 다룬다. 다른 루트가 이미 덮은 페이지는 sync_roots가 뺀다.
+            block = {"id": target[1], "type": "child_page" if target[0] == "page" else "child_database",
+                     "child_page" if target[0] == "page" else "child_database": {"title": LINK_TITLE}}
+            kind = block["type"]
         if kind in HEADINGS and HEADINGS[kind] in boundary:
             title = _title(block)
             if HEADINGS[kind] == levels[0]:
@@ -212,7 +239,7 @@ def _read_answer(answer: Any) -> tuple[str | None, str]:
 
 
 def _judge_sections(store: Path, scope: str, client: Client, found: list[dict], blocks: list[dict], page_path: str,
-                    classify: Classifier | None) -> int:
+                    classify: Classifier | None, rejudge_unknown: bool = False) -> int:
     """새로 생기거나 이름이 바뀐 섹션만 역할을 판정한다. 나머지는 저장된 판정을 그대로 쓴다. 판정한 수를 돌려준다."""
     stored = {s["id"]: s for s in wsections.sections(store, scope, include_inactive=True)}
 
@@ -220,6 +247,8 @@ def _judge_sections(store: Path, scope: str, client: Client, found: list[dict], 
         old = stored.get(section["id"])
         if old is None or old["status"] == "inactive":
             return False
+        if old["role_source"] == "none" and rejudge_unknown:
+            return False  # reindex: "판정 못 함"(LLM 없음·실패)으로 굳은 섹션을 다시 판정한다(spec P1-10)
         return old["title"] == section["title"] or old["role_source"] == "human"  # 사람이 정한 역할은 이름이 바뀌어도 유지
 
     need = [s for s in found if not settled(s)]
@@ -314,7 +343,7 @@ def _inline_text(client: Client, blocks: list[dict], section_id: str) -> str:
     for block in blocks[index + 1:]:
         if block["type"] in HEADINGS and HEADINGS[block["type"]] in boundary:
             break
-        if block["type"] in {"child_page", "child_database"} | UNREADABLE:
+        if block["type"] in {"child_page", "child_database"} | UNREADABLE | LINKS:
             continue
         lines.extend(_block_text(block, client))
     body = [line for line in lines if line.strip()]
@@ -343,7 +372,8 @@ def _retire_root(store: Path, scope: str, root: str, stats: dict[str, Any]) -> N
         stats["sections_removed"] += _remove_page_sections(store, scope, page["page_id"], keep=set())
 
 
-def sync_roots(store: Path, scope: str, roots: list[str], client: Client, classify: Classifier | None = None) -> dict[str, Any]:
+def sync_roots(store: Path, scope: str, roots: list[str], client: Client, classify: Classifier | None = None,
+               classify_parts: wparts.PartClassifier | None = None, rejudge_unknown: bool = False) -> dict[str, Any]:
     """루트 여러 개(팀 정보 페이지, 회의록 페이지)를 차례로 맞춘다.
 
     - 첫 루트(팀 정보 페이지)가 기준이다. 다음 루트가 이미 그 안에 들어 있으면(하위 페이지·DB로) 따로 읽지 않는다.
@@ -354,7 +384,7 @@ def sync_roots(store: Path, scope: str, roots: list[str], client: Client, classi
     roots = [r for i, r in enumerate(roots) if r and wdb.notion_id(r) not in {wdb.notion_id(x) for x in roots[:i]}]
     wanted = {wdb.notion_id(r) for r in roots}
     stats: dict[str, Any] = {"pages_checked": 0, "structure_changed": [], "sections_removed": [], "sections_added": [],
-                             "judged": 0, "records_new": 0, "superseded": 0, "roots": {}}
+                             "judged": 0, "records_new": 0, "superseded": 0, "parts_judged": 0, "roots": {}}
     for page_id, old in [(p["page_id"], p) for p in wsections.pages(store, scope) if wdb.notion_id(p["root_id"]) not in wanted]:
         wsections.save_page(store, scope, page_id, old["root_id"], old["path"], old["last_edited"], old["fingerprint"], status="gone")
         stats["sections_removed"] += _remove_page_sections(store, scope, page_id, keep=set())
@@ -364,7 +394,8 @@ def sync_roots(store: Path, scope: str, roots: list[str], client: Client, classi
             stats["roots"][root] = "inside first root"
             continue
         try:
-            one = sync(store, scope, root, client, classify, retire_other_roots=False)
+            one = sync(store, scope, root, client, classify, retire_other_roots=False, classify_parts=classify_parts,
+                       rejudge_unknown=rejudge_unknown)
         except Exception as error:
             if index == 0:
                 raise  # 팀 정보 페이지를 못 읽으면 실패로 알린다
@@ -397,7 +428,8 @@ def _sync_database_root(store: Path, scope: str, database_id: str, client: Clien
 
 
 def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classifier | None = None,
-         retire_other_roots: bool = True) -> dict[str, Any]:
+         retire_other_roots: bool = True, classify_parts: wparts.PartClassifier | None = None,
+         rejudge_unknown: bool = False) -> dict[str, Any]:
     """루트 하나: 구조 확인 → (바뀐 페이지만) 재스캔 → 지도대로 수집. 한 번 호출이 한 번의 접근이다.
     루트를 바꿨으면 옛 루트의 지도는 정리한다. 루트가 여러 개면 sync_roots를 쓴다."""
     stats: dict[str, Any] = {"pages_checked": 0, "structure_changed": [], "sections_added": [], "sections_removed": [],
@@ -447,7 +479,7 @@ def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classi
                 found = [{"id": page_id, "page_id": page_id, "title": path.split(" > ")[-1], "path": path,
                           "inherit_from": None, "inherit_id": None, "layout": {"inline": False, "pages": [{"id": page_id, "title": path}],
                                                            "databases": [], "unreadable": []}}]
-            stats["judged"] += _judge_sections(store, scope, client, found, blocks, path, classify)
+            stats["judged"] += _judge_sections(store, scope, client, found, blocks, path, classify, rejudge_unknown)
             before = {s["id"] for s in wsections.sections(store, scope, page_id)}
             for section in found:
                 wsections.save_section(store, scope, section)
@@ -477,6 +509,8 @@ def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classi
         new, superseded = _collect_section(store, scope, client, section, fresh_blocks, hold)
         stats["records_new"] += new
         stats["superseded"] += superseded
+    # 새로 생기거나 바뀐 부분만 종류를 판정한다(LLM 없으면 다음 동기화로 미룬다). Notion은 부르지 않는다.
+    stats["parts_judged"] = wparts.judge_pending(store, scope, classify_parts)
     return stats
 
 
@@ -496,6 +530,30 @@ def _save(store: Path, scope: str, section: dict, unit_id: str, text: str, edite
     return int(result["created"]), result.get("superseded", 0) if result["created"] else 0
 
 
+def _row_title(row: dict) -> str:
+    for prop in row.get("properties", {}).values():
+        if prop.get("type") == "title":
+            return "".join(t.get("plain_text", "") for t in prop.get("title", [])) or "(제목 없음)"
+    return "(제목 없음)"
+
+
+def _collect_parts(store: Path, scope: str, client: Client, section: dict, unit_id: str, title: str,
+                   edited: str | None) -> str | None:
+    """하위 페이지·DB 행 본문을 md로 한 번에 받아 부분으로 저장하고, 원문 저장용 글을 돌려준다(spec P1-1·P1-2).
+    md를 못 받으면 None(호출부가 예전 블록 읽기로 대신한다). 블록 목록과 어긋나면 블록 ID 없이 저장한다."""
+    page = notion_md.fetch_markdown(client, unit_id)
+    if page.md is None:
+        return None
+    try:
+        blocks = _list_child_blocks(unit_id, client)
+    except Exception:
+        blocks = None
+    built = wparts.build_unit_parts(unit_id, f"{section['path']} > {title}", page.md, blocks)
+    wparts.save_unit_parts(store, scope, "notion", unit_id, section["id"], built, last_edited=edited)
+    metrics.count("parts", len(built))
+    return wparts.md_to_text(page.md)
+
+
 def _collect_section(store: Path, scope: str, client: Client, section: dict, fresh_blocks: dict[str, list[dict]],
                      hold: str | None) -> tuple[int, int]:
     new = superseded = 0
@@ -511,8 +569,13 @@ def _collect_section(store: Path, scope: str, client: Client, section: dict, fre
             continue
         if edited and wsections.unit_edited(store, page["id"]) == edited:
             wsections.set_unit_parent(store, page["id"], page["id"])  # 출처 기록 전에 모은 것: 출처만 채운다
+            if not wparts.has_parts(store, scope, page["id"]):
+                _collect_parts(store, scope, client, section, page["id"], page["title"], edited)  # 부분 전에 모은 것: 부분만 채운다
             continue
-        n, s = _save(store, scope, section, page["id"], _fetch_notion_page_by_id(page["id"], client), edited, hold)
+        text = _collect_parts(store, scope, client, section, page["id"], page["title"], edited)
+        if text is None:
+            text = _fetch_notion_page_by_id(page["id"], client)
+        n, s = _save(store, scope, section, page["id"], text, edited, hold)
         new, superseded = new + n, superseded + s
         wsections.save_unit(store, section["id"], page["id"], edited or "", parent_id=page["id"])
     # 출처(어느 DB의 행인지)를 기록하기 전에 모은 행이 있으면, 이번 한 번은 커서 없이 전체 행 목록을 받아 출처를 채운다.
@@ -523,8 +586,12 @@ def _collect_section(store: Path, scope: str, client: Client, section: dict, fre
             edited = row.get("last_edited_time")
             if edited and wsections.unit_edited(store, row["id"]) == edited:
                 wsections.set_unit_parent(store, row["id"], database["id"])
+                if not wparts.has_parts(store, scope, row["id"]):
+                    _collect_parts(store, scope, client, section, row["id"], _row_title(row), edited)
                 continue
-            body = "\n".join(line for b in _list_child_blocks(row["id"], client) for line in _block_text(b, client))
+            body = _collect_parts(store, scope, client, section, row["id"], _row_title(row), edited)
+            if body is None:
+                body = "\n".join(line for b in _list_child_blocks(row["id"], client) for line in _block_text(b, client))
             n, s = _save(store, scope, section, row["id"], "\n".join(filter(None, [_row_text(row), body])), edited, hold)
             new, superseded = new + n, superseded + s
             wsections.save_unit(store, section["id"], row["id"], edited or "", parent_id=database["id"])

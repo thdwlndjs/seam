@@ -106,7 +106,9 @@ def save_section(store: Path, scope: str, section: dict[str, Any]) -> dict[str, 
         old = c.execute("SELECT * FROM source_sections WHERE id = ?", (section["id"],)).fetchone()
         same = old is not None and old["title"] == section["title"] and old["status"] != "inactive"
         human = old is not None and old["role_source"] == "human" and old["status"] != "inactive"
-        if same or human:
+        # reindex가 "판정 못 함"으로 굳은 섹션을 다시 판정했으면 이름이 같아도 새 판정을 쓴다(docs/v1.1/spec.md P1-10).
+        rejudged = same and old["role_source"] == "none" and section.get("role_source") not in (None, "none")
+        if (same or human) and not rejudged:
             c.execute("""UPDATE source_sections SET page_id = ?, path = ?, title = ?, layout_json = ?, updated_at = ?
                          WHERE id = ?""",
                       (section["page_id"], section["path"], section["title"], to_json(section["layout"]), ts, section["id"]))

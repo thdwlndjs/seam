@@ -839,7 +839,8 @@ def _sync_team_map(team_key: str, roots: list[str], token: str, background: bool
     with lock:
         return notion_map.sync_roots(worklog_bridge.WORKLOG_STORE, team_key, roots,
                                      notion_client_for(token, background=background),
-                                     classify=worklog_bridge.groq_classify_sections)
+                                     classify=worklog_bridge.groq_classify_sections,
+                                     classify_parts=worklog_bridge.groq_classify_parts)
 
 
 def _format_as_of(iso: str | None) -> str:
