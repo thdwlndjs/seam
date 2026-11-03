@@ -1,47 +1,54 @@
-# Python Teams Echo Bot
+# PM봇 (Teams)
 
-This is a minimal Microsoft Teams echo bot template using [microsoft-teams](https://github.com/microsoft/teams.py).
+팀의 Notion·GitHub를 읽어 Teams에서 팀/프로젝트 정보, 진행상황, 내 역할을 알려 주는 봇입니다. [microsoft-teams](https://github.com/microsoft/teams.py) 기반입니다.
 
-## Structure
+v1.1 계획과 규격은 [docs/v1.1/](docs/v1.1/)에 있습니다([plan](docs/v1.1/plan.md), [spec](docs/v1.1/spec.md), [phase별 작업](docs/v1.1/phases/)).
 
-- `src/main.py`: Main application code for the Teams bot.
-- `pyproject.toml`: Project dependencies and metadata.
+## 구조
 
-## Getting Started
+| 경로 | 역할 |
+| --- | --- |
+| `src/bot/main.py` | Teams 입력단(포트 3978). 받은 턴을 서버의 `/api/turn`으로 넘기고, 서버가 보내는 상태·글·버튼을 Teams로 보낸다. 상태는 갖지 않는다 |
+| `src/server/main.py` | 서버(포트 8000). 메뉴 처리, 설정 마법사, Notion·GitHub·Groq 호출 |
+| `src/server/worklog/` | 저장소(SQLite). Notion 구조 지도와 수집한 원문 |
+| `src/server/notion_map.py`, `notion_read.py` | Notion 읽기(토큰별 호출 관문 포함) |
+| `src/server/metrics.py` | 메뉴 응답·백그라운드마다 Notion·Groq 호출 수를 한 줄로 남김 |
+| `src/team_configs.json` | 팀별 연결 정보(토큰 포함, 커밋하지 않음). 설정 마법사가 만든다 |
+| `src/worklog.sqlite3` | 저장소 파일(커밋하지 않음) |
+| `scripts/record_notion_fixtures.py` | 테스트용 Notion 녹화(커밋하지 않는 폴더에 저장) |
 
-1. Create a virtual environment: `python -m venv .venv`
-2. Activate it: `. .venv/bin/activate` (Unix) or `.venv\Scripts\activate` (Windows)
-3. Install dependencies: `pip install -e .`
-4. Run the app: `python src/main.py`
+## 처음 준비
 
-Required environment variables:
+1. 가상환경: `python -m venv .venv`
+2. 의존성: `.venv\Scripts\python.exe -m pip install -e .`
+3. `.env.example`을 `.env`로 복사하고 값을 채운다.
 
-- `N8N_SHARED_SECRET`: shared secret for the n8n → bot notify webhook
-- `GROQ_API_KEY` (optional): used to summarize meeting notes into tasks
-- `GROQ_MODEL` (optional, default `llama-3.1-8b-instant`)
+| 변수 | 필수 | 설명 |
+| --- | --- | --- |
+| `BOT_SERVER_SECRET` | 예 | 봇 ↔ 서버 검증용. 봇과 서버가 같은 값을 써야 한다. 없으면 둘 다 시작하지 않는다 |
+| `GROQ_API_KEY` | 아니요 | 없으면 요약·분류 없이 원문으로 답한다 |
+| `GROQ_MODEL` | 아니요 | 기본 `openai/gpt-oss-120b` |
+| `DANGEROUSLY_ALLOW_UNAUTHENTICATED_REQUESTS` | 로컬만 | Playground로 테스트할 때 `true`. 실제 Teams 배포에서는 끈다 |
+| `CLIENT_ID`, `CLIENT_SECRET`, `TENANT_ID` | 배포만 | Teams 봇 자격증명. Playground에서는 주석 처리 |
 
-`GITHUB_TOKEN`, `GITHUB_REPO`, `NOTION_TOKEN`, and the Notion page/GitHub project IDs are
-**not** read from `.env` — they're per-team/per-user, collected through the bot's `설정`
-chat command and stored in `team_configs.json` (gitignored, since it holds tokens).
+GitHub·Notion 토큰과 페이지 ID는 `.env`에서 읽지 않습니다. 팀마다 다르므로 봇에게 `설정`이라고 보내면 마법사가 받아서 `src/team_configs.json`에 저장합니다.
 
 ## 로컬 Playground에서 실행하기 (Microsoft 365 Agents Playground)
 
 Teams/Azure 등록 없이 브라우저에서 봇을 테스트하는 방법입니다.
 
-**사전 준비 (최초 1회)**
+**최초 1회**: Node.js 설치 후 `npm install -g @microsoft/m365agentsplayground`
 
-- Node.js 설치 후 Playground CLI 설치: `npm install -g @microsoft/m365agentsplayground`
-- 위 Getting Started 1~3번으로 `.venv` 만들고 의존성 설치
-- `.env` 에서 `CLIENT_ID` / `CLIENT_SECRET` / `TENANT_ID` 는 **주석 처리**,
-  `DANGEROUSLY_ALLOW_UNAUTHENTICATED_REQUESTS=true` 는 **주석 해제** (Playground는 인증 없이 요청을 보냄)
-
-**실행 (터미널 2개, `echo-bot` 폴더에서)**
+**실행 (터미널 3개, `echo-bot` 폴더에서, 이 순서대로)**
 
 ```powershell
-# 터미널 1 — 봇 서버 (http://localhost:3978)
-.venv\Scripts\python.exe src\main.py
+# 터미널 1 — 서버 (http://localhost:8000)
+.venv\Scripts\python.exe src\server\main.py
 
-# 터미널 2 — Playground (http://localhost:56150, 브라우저 자동으로 열림)
+# 터미널 2 — 봇 (http://localhost:3978)
+.venv\Scripts\python.exe src\bot\main.py
+
+# 터미널 3 — Playground (http://localhost:56150, 브라우저 자동으로 열림)
 agentsplayground start -e http://localhost:3978/api/messages -c msteams
 ```
 
@@ -49,9 +56,21 @@ agentsplayground start -e http://localhost:3978/api/messages -c msteams
 
 **참고**
 
-- 봇 서버를 먼저 띄워야 합니다. Playground는 `/api/messages` 가 응답할 때까지 기다립니다.
-- 3978 / 56150 포트가 이미 사용 중이면 이전 프로세스를 종료하세요 (`netstat -ano | findstr :3978` → `taskkill /PID <번호> /F`).
-- 실제 Teams에 배포할 땐 `.env` 주석을 반대로 되돌리세요 (자격증명 활성화, `DANGEROUSLY_...` 비활성화).
+- 서버 → 봇 → Playground 순서로 띄웁니다. Playground는 `/api/messages`가 응답할 때까지 기다립니다.
+- 서버는 켜진 뒤 60초가 지나면 백그라운드로 Notion 지도를 동기화합니다(1시간마다).
+- 서버 로그의 `metric kind=menu …` 줄에서 메뉴마다 Notion·Groq 호출 수와 걸린 시간을 볼 수 있습니다.
+- 8000 / 3978 / 56150 포트가 이미 사용 중이면 이전 프로세스를 종료하세요(`netstat -ano | findstr :3978` → `taskkill /PID <번호> /F`).
+
+## 테스트
+
+```powershell
+cd src\server
+$env:GROQ_API_KEY=""; ..\..\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+```
+
+- `GROQ_API_KEY`는 비워 둔다(Groq 없는 경로를 확인하는 테스트가 있다).
+- `BOT_SERVER_SECRET`은 덮어쓰지 않는다(테스트가 `test-secret`을 쓴다).
+- 실제 Notion 녹화본(`src/server/tests/fixtures/notion_local/`)이 있으면 그것으로도 확인하고, 없으면 건너뛴다.
 
 ## 나중에 추가할 것 (TODO)
 
