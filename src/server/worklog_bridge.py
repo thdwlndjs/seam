@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+import metrics
 import worklog
 
 log = logging.getLogger("worklog")
@@ -70,8 +71,17 @@ def _groq_json(system_prompt: str, payload: Any) -> Any:
                 "response_format": {"type": "json_object"},
             },
         )
+        metrics.count_groq(usage_of(resp))
         resp.raise_for_status()
         return json.loads(resp.json()["choices"][0]["message"]["content"])
+
+
+def usage_of(resp: httpx.Response) -> dict | None:
+    """Groq 응답의 usage. 본문이 JSON이 아니면(오류 응답 등) None."""
+    try:
+        return resp.json().get("usage")
+    except Exception:
+        return None
 
 
 EXTRACT_PROMPT = """너는 팀 대화와 회의록에서 Task와 Decision 후보를 뽑는 분석기야.

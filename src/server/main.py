@@ -51,8 +51,10 @@ from pydantic import BaseModel
 # NOTION_RATE 등)를 읽어 두기 때문에, 순서가 바뀌면 .env 값이 그쪽에 전달되지 않는다.
 load_dotenv(os.environ.get("ENV_FILE"))
 
+import metrics  # noqa: E402
 import notion_map  # noqa: E402
 import worklog_bridge  # noqa: E402
+from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
 # ── 설정 ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -591,6 +593,12 @@ async def _handle_setup_message(turn: Turn, raw_text: str) -> None:
 
 # ── 메뉴 실행 ────────────────────────────────────────
 async def _run_action(turn: Turn, raw_text: str) -> None:
+    # 메뉴 응답 한 번 = metric 한 줄(Notion·Groq 호출 수, 걸린 시간). 문서: docs/v1.1/spec.md "계측"
+    with metrics.measure("menu", turn.team_key, raw_text):
+        await _run_menu(turn, raw_text)
+
+
+async def _run_menu(turn: Turn, raw_text: str) -> None:
     config = _get_config(turn.team_key)
     if config is None:
         await turn.send(_NO_CONFIG_TEXT)
@@ -820,18 +828,26 @@ async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None]
                     "stream": True,
                 },
             ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    payload = line[len("data: "):].strip()
-                    if payload == "[DONE]":
-                        break
-                    delta = json.loads(payload)["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        full_text += delta
-                        if on_chunk:
-                            on_chunk(delta)
+                usage: dict | None = None
+                try:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        payload = line[len("data: "):].strip()
+                        if payload == "[DONE]":
+                            break
+                        event = json.loads(payload)
+                        # Groq는 스트림 마지막 조각의 x_groq.usage에 토큰 수를 싣는다.
+                        usage = (event.get("x_groq") or {}).get("usage") or event.get("usage") or usage
+                        choices = event.get("choices") or [{}]
+                        delta = (choices[0].get("delta") or {}).get("content", "")
+                        if delta:
+                            full_text += delta
+                            if on_chunk:
+                                on_chunk(delta)
+                finally:
+                    metrics.count_groq(usage)
         return full_text.strip() or None
     except Exception:
         traceback.print_exc()
@@ -1013,6 +1029,7 @@ async def _classify_meeting_notes(note_lines: list[str], cache_key: str) -> dict
                     "temperature": 0.2,
                 },
             )
+            metrics.count_groq(_usage_of(resp))
             resp.raise_for_status()
             summary_text = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception:
@@ -1091,10 +1108,11 @@ async def _worklog_loop() -> None:
     last_collect = 0.0
     while True:
         try:
-            if time.monotonic() - last_collect >= worklog_bridge.NOTION_COLLECT_SECONDS:
-                last_collect = time.monotonic()
-                await asyncio.to_thread(_sync_notion_maps)
-            await asyncio.to_thread(worklog_bridge.analyze_due)
+            with metrics.measure("background"):
+                if time.monotonic() - last_collect >= worklog_bridge.NOTION_COLLECT_SECONDS:
+                    last_collect = time.monotonic()
+                    await asyncio.to_thread(_sync_notion_maps)
+                await asyncio.to_thread(worklog_bridge.analyze_due)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(worklog_bridge.ANALYZE_TICK_SECONDS)
