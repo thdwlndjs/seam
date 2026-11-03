@@ -360,6 +360,54 @@ class NotionMapTests(unittest.TestCase):
         self.assertNotIn("회의록 DB", titles)
         self.assertIn("김팀원", titles)
 
+    def shared_heading_workspace(self) -> str:
+        """실제 팀 구성: 한 제목 아래 WBS와 멘토링(회의록) DB가 함께 있고, Notion은 하이픈 있는 ID를 돌려준다.
+        설정에 저장되는 회의록 ID(하이픈 없음)를 돌려준다."""
+        wbs, mentor = "7c911be9-7ce7-83dc-87c1-01ddaf662024", "75e11be9-7ce7-83ea-919f-81730eb17064"
+        self.fake.pages["root"]["blocks"] += [heading("h-basic", "프로젝트 기본정보", 1),
+                                              child_db(wbs, "프로젝트 WBS"), child_db(mentor, "멘토링")]
+        self.fake.dbs[wbs] = [row("wbs-1", "0. 주제선정", "2026-11-01T02:00:00Z", body="주제 아이데이션")]
+        self.fake.dbs[mentor] = [row("mt-1", "1차 멘토링", "2026-11-02T02:04:00Z", body="센서 대체제 찾아보기"),
+                                 row("mt-2", "2차 멘토링(현직자)", "2026-11-02T02:04:00Z", body="신뢰성이 가장 우선")]
+        return mentor.replace("-", "")
+
+    def test_notes_db_sharing_a_heading_returns_only_its_own_rows(self) -> None:
+        notes_id = self.shared_heading_workspace()
+        stats = notion_map.sync_roots(self.store, SCOPE, ["root", notes_id], self.client, classify=self.llm)
+        self.assertEqual(stats["roots"][notes_id], "inside first root")  # 하이픈 유무가 달라도 같은 DB로 본다
+        texts = "\n".join(sections.meeting_notes(self.store, SCOPE, notes_id)["texts"])
+        self.assertIn("센서 대체제 찾아보기", texts)  # 제목만이 아니라 본문까지
+        self.assertIn("신뢰성이 가장 우선", texts)
+        self.assertNotIn("주제 아이데이션", texts)  # 같은 제목 아래 WBS 행은 섞이지 않는다
+        self.assertEqual(sum(1 for loc, _, _ in self.records() if loc == "notion:mt-1"), 1)  # 두 번 읽지 않는다
+
+    def test_rows_collected_before_parent_tracking_are_backfilled_without_rereading(self) -> None:
+        notes_id = self.shared_heading_workspace()
+        notion_map.sync_roots(self.store, SCOPE, ["root", notes_id], self.client, classify=self.llm)
+        with closing(sqlite3.connect(self.store)) as c, c:
+            c.execute("UPDATE source_units SET parent_id = NULL")  # 예전 버전이 모은 저장소
+        before = "\n".join(sections.meeting_notes(self.store, SCOPE, notes_id)["texts"])
+        self.assertIn("센서 대체제 찾아보기", before)  # 출처를 채우기 전에도 비지 않는다(섹션 전체로 대신)
+        self.fake.calls.clear()
+        notion_map.sync_roots(self.store, SCOPE, ["root", notes_id], self.client, classify=self.llm)
+        self.assertFalse([c for c in self.fake.calls if c in {"blocks:mt-1", "blocks:mt-2", "blocks:wbs-1"}])  # 본문은 다시 안 읽음
+        after = "\n".join(sections.meeting_notes(self.store, SCOPE, notes_id)["texts"])
+        self.assertIn("센서 대체제 찾아보기", after)
+        self.assertNotIn("주제 아이데이션", after)
+
+    def test_notes_root_read_separately_before_is_retired_once_found_inside(self) -> None:
+        notes_id = self.shared_heading_workspace()
+        # 예전 버전: ID 표기가 달라 회의록 DB를 따로 된 루트로 읽어 둔 지도
+        sections.save_page(self.store, SCOPE, notes_id, notes_id, "멘토링", "2026-11-02T02:04:54Z", "fp")
+        stats = notion_map.sync_roots(self.store, SCOPE, ["root", notes_id], self.client, classify=self.llm)
+        self.assertEqual(stats["roots"][notes_id], "inside first root")
+        self.assertNotIn(notes_id, {p["page_id"] for p in sections.pages(self.store, SCOPE)})
+
+    def test_configured_notes_without_any_record_ask_for_a_read(self) -> None:
+        self.sync(classify=None)  # 회의 역할로 판정된 섹션이 없는 상태
+        self.assertIsNone(sections.meeting_notes(self.store, SCOPE, "not-collected-yet"))  # 호출부가 한 번 읽어 온다
+        self.assertIsNotNone(sections.meeting_notes(self.store, SCOPE, None))  # 회의록 설정이 없으면 다시 읽지 않는다
+
     def test_meeting_notes_keep_the_most_recent_within_the_limit(self) -> None:
         self.fake.dbs["db-meeting"] = [row(f"r{i}", f"{i}차 회의", f"2026-11-{i:02d}T00:00:00Z", body="내용 " * 50) for i in range(1, 10)]
         self.sync()

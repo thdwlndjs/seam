@@ -26,7 +26,7 @@ Teams SDK에 전혀 의존하지 않는다. 카드 모양도 "제목 + 버튼 �
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone, tzinfo
 import concurrent.futures
 import hashlib
 import json
@@ -47,12 +47,15 @@ from fastapi.responses import StreamingResponse
 from notion_client import Client
 from pydantic import BaseModel
 
-import notion_map
-import worklog_bridge
+# .env는 아래 모듈들보다 먼저 읽는다. worklog_bridge·notion_read는 불러오는 순간 환경변수(GROQ_API_KEY,
+# NOTION_RATE 등)를 읽어 두기 때문에, 순서가 바뀌면 .env 값이 그쪽에 전달되지 않는다.
+load_dotenv(os.environ.get("ENV_FILE"))
+
+import notion_map  # noqa: E402
+import worklog_bridge  # noqa: E402
 
 # ── 설정 ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
-load_dotenv(os.environ.get("ENV_FILE"))
 BOT_SERVER_SECRET = os.environ["BOT_SERVER_SECRET"]  # 에코봇↔서버 간 검증용 (양쪽 .env에 같은 값)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -860,12 +863,20 @@ def _format_as_of(iso: str | None) -> str:
     if not iso:
         return ""
     try:
-        from zoneinfo import ZoneInfo
-
-        when = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ZoneInfo(DISPLAY_TZ))
+        when = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(_display_tz())
         return when.strftime("%m/%d %H:%M")
     except Exception:
         return iso
+
+
+def _display_tz() -> tzinfo:
+    """표시용 시간대. Windows처럼 시간대 데이터(tzdata)가 없는 곳에서도 한국 시간은 나오게 한다."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(DISPLAY_TZ)
+    except Exception:
+        return timezone(timedelta(hours=9), "KST") if DISPLAY_TZ == "Asia/Seoul" else timezone.utc
 
 
 async def _summarize_snapshot(team_key: str, snapshot: dict, on_chunk: Callable[[str], None] | None = None) -> str:

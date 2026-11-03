@@ -323,29 +323,44 @@ def _inline_text(client: Client, blocks: list[dict], section_id: str) -> str:
     return "\n".join(body)
 
 
-def _covered_ids(store: Path, scope: str) -> set[str]:
-    """지도에 이미 들어 있는 페이지·하위 페이지·DB의 ID."""
-    ids = {p["page_id"] for p in wsections.pages(store, scope)}
+def _covered_ids(store: Path, scope: str, other_than_root: str) -> set[str]:
+    """지도에 이미 들어 있는 페이지·하위 페이지·DB의 ID(비교용 표기). other_than_root 루트 자신의 지도는 뺀다."""
+    other = wdb.notion_id(other_than_root)
+    ids = {wdb.notion_id(p["page_id"]) for p in wsections.pages(store, scope) if wdb.notion_id(p["root_id"]) != other}
     for section in wsections.sections(store, scope):
-        ids.add(section["id"])
-        ids.update(item["id"] for key in ("pages", "databases") for item in section["layout"].get(key, []))
+        if wdb.notion_id(section["page_id"]) not in ids:
+            continue
+        ids.add(wdb.notion_id(section["id"]))
+        ids.update(wdb.notion_id(item["id"]) for key in ("pages", "databases") for item in section["layout"].get(key, []))
     return ids
+
+
+def _retire_root(store: Path, scope: str, root: str, stats: dict[str, Any]) -> None:
+    """루트 하나의 지도를 정리한다(쌓인 원문과 이력은 남는다)."""
+    for page in [p for p in wsections.pages(store, scope) if wdb.notion_id(p["root_id"]) == wdb.notion_id(root)]:
+        wsections.save_page(store, scope, page["page_id"], page["root_id"], page["path"], page["last_edited"],
+                            page["fingerprint"], status="gone")
+        stats["sections_removed"] += _remove_page_sections(store, scope, page["page_id"], keep=set())
 
 
 def sync_roots(store: Path, scope: str, roots: list[str], client: Client, classify: Classifier | None = None) -> dict[str, Any]:
     """루트 여러 개(팀 정보 페이지, 회의록 페이지)를 차례로 맞춘다.
 
     - 첫 루트(팀 정보 페이지)가 기준이다. 다음 루트가 이미 그 안에 들어 있으면(하위 페이지·DB로) 따로 읽지 않는다.
+      그 루트를 예전에 따로 읽어 둔 지도가 있으면 정리한다(같은 행을 두 섹션이 번갈아 차지하지 않게).
     - 설정에서 빠진 루트의 지도는 정리한다(쌓인 원문과 이력은 남는다).
+    - 설정에는 ID가 하이픈 없이, Notion 응답에는 하이픈 있게 들어온다. 비교는 항상 wdb.notion_id로 한다.
     """
-    roots = [r for i, r in enumerate(roots) if r and r not in roots[:i]]
-    stats: dict[str, Any] = {"pages_checked": 0, "structure_changed": [], "sections_added": [], "sections_removed": [],
+    roots = [r for i, r in enumerate(roots) if r and wdb.notion_id(r) not in {wdb.notion_id(x) for x in roots[:i]}]
+    wanted = {wdb.notion_id(r) for r in roots}
+    stats: dict[str, Any] = {"pages_checked": 0, "structure_changed": [], "sections_removed": [], "sections_added": [],
                              "judged": 0, "records_new": 0, "superseded": 0, "roots": {}}
-    for page_id, old in [(p["page_id"], p) for p in wsections.pages(store, scope) if p["root_id"] not in roots]:
+    for page_id, old in [(p["page_id"], p) for p in wsections.pages(store, scope) if wdb.notion_id(p["root_id"]) not in wanted]:
         wsections.save_page(store, scope, page_id, old["root_id"], old["path"], old["last_edited"], old["fingerprint"], status="gone")
         stats["sections_removed"] += _remove_page_sections(store, scope, page_id, keep=set())
     for index, root in enumerate(roots):
-        if index > 0 and root in _covered_ids(store, scope) - {p["page_id"] for p in wsections.pages(store, scope) if p["root_id"] == root}:
+        if index > 0 and wdb.notion_id(root) in _covered_ids(store, scope, other_than_root=root):
+            _retire_root(store, scope, root, stats)
             stats["roots"][root] = "inside first root"
             continue
         try:
@@ -388,12 +403,13 @@ def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classi
     stats: dict[str, Any] = {"pages_checked": 0, "structure_changed": [], "sections_added": [], "sections_removed": [],
                              "judged": 0, "records_new": 0, "superseded": 0}
     all_pages = {p["page_id"]: p for p in wsections.pages(store, scope)}
+    same_root = wdb.notion_id(root_id)
     if retire_other_roots:  # 루트 하나로 부를 때: 루트가 바뀌었으면 옛 지도 정리(sync_roots는 직접 정리한다)
         for page_id, old in all_pages.items():
-            if old["root_id"] != root_id:
+            if wdb.notion_id(old["root_id"]) != same_root:
                 wsections.save_page(store, scope, page_id, old["root_id"], old["path"], old["last_edited"], old["fingerprint"], status="gone")
                 stats["sections_removed"] += _remove_page_sections(store, scope, page_id, keep=set())
-    known = {pid: p for pid, p in all_pages.items() if p["root_id"] == root_id}
+    known = {pid: p for pid, p in all_pages.items() if wdb.notion_id(p["root_id"]) == same_root}
     queue: list[tuple[str, str | None, int]] = [(root_id, None, 0)]
     queue += [(pid, p["path"], p["path"].count(" > ")) for pid, p in known.items() if pid != root_id]
     seen_pages: set[str] = set()
@@ -453,7 +469,7 @@ def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classi
             wsections.save_page(store, scope, page_id, root_id, stored["path"], stored["last_edited"], stored["fingerprint"], status="gone")
             stats["sections_removed"] += _remove_page_sections(store, scope, page_id, keep=set())
 
-    mine = {p["page_id"] for p in wsections.pages(store, scope) if p["root_id"] == root_id}
+    mine = {p["page_id"] for p in wsections.pages(store, scope) if wdb.notion_id(p["root_id"]) == same_root}
     for section in wsections.sections(store, scope):
         hold = wsections.hold_for(section)
         if hold is False or section["page_id"] not in mine:  # 다른 루트의 섹션은 그 루트를 맞출 때 모은다
@@ -494,20 +510,24 @@ def _collect_section(store: Path, scope: str, client: Client, section: dict, fre
         except Exception:
             continue
         if edited and wsections.unit_edited(store, page["id"]) == edited:
+            wsections.set_unit_parent(store, page["id"], page["id"])  # 출처 기록 전에 모은 것: 출처만 채운다
             continue
         n, s = _save(store, scope, section, page["id"], _fetch_notion_page_by_id(page["id"], client), edited, hold)
         new, superseded = new + n, superseded + s
-        wsections.save_unit(store, section["id"], page["id"], edited or "")
+        wsections.save_unit(store, section["id"], page["id"], edited or "", parent_id=page["id"])
+    # 출처(어느 DB의 행인지)를 기록하기 전에 모은 행이 있으면, 이번 한 번은 커서 없이 전체 행 목록을 받아 출처를 채운다.
+    backfill = wsections.units_missing_parent(store, section["id"])
     for database in layout.get("databases", []):
         latest = section.get("cursor")
-        for row in _query_rows(client, database["id"], section.get("cursor")):
+        for row in _query_rows(client, database["id"], None if backfill else section.get("cursor")):
             edited = row.get("last_edited_time")
             if edited and wsections.unit_edited(store, row["id"]) == edited:
+                wsections.set_unit_parent(store, row["id"], database["id"])
                 continue
             body = "\n".join(line for b in _list_child_blocks(row["id"], client) for line in _block_text(b, client))
             n, s = _save(store, scope, section, row["id"], "\n".join(filter(None, [_row_text(row), body])), edited, hold)
             new, superseded = new + n, superseded + s
-            wsections.save_unit(store, section["id"], row["id"], edited or "")
+            wsections.save_unit(store, section["id"], row["id"], edited or "", parent_id=database["id"])
             latest = max(filter(None, [latest, edited]), default=None)
         if latest != section.get("cursor"):
             wsections.set_cursor(store, section["id"], latest)

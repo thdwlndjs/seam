@@ -191,11 +191,26 @@ def unit_edited(store: Path, unit_id: str) -> str | None:
         return row["last_edited"] if row else None
 
 
-def save_unit(store: Path, section_id: str, unit_id: str, last_edited: str) -> None:
+def save_unit(store: Path, section_id: str, unit_id: str, last_edited: str, parent_id: str | None = None) -> None:
+    """parent_id: 이 하위 페이지·행이 들어 있던 DB(또는 페이지). 모르면 None — 이미 아는 값은 지우지 않는다."""
     with db.write(store) as c:
-        c.execute("""INSERT INTO source_units(id, section_id, last_edited, collected_at) VALUES (?, ?, ?, ?)
+        c.execute("""INSERT INTO source_units(id, section_id, last_edited, collected_at, parent_id) VALUES (?, ?, ?, ?, ?)
                      ON CONFLICT(id) DO UPDATE SET section_id = excluded.section_id, last_edited = excluded.last_edited,
-                     collected_at = excluded.collected_at""", (unit_id, section_id, last_edited, db.now()))
+                     collected_at = excluded.collected_at, parent_id = COALESCE(excluded.parent_id, source_units.parent_id)""",
+                  (unit_id, section_id, last_edited, db.now(), parent_id))
+
+
+def set_unit_parent(store: Path, unit_id: str, parent_id: str) -> None:
+    """출처(parent_id)를 몰랐던 기존 행에 채워 넣는다. 본문은 다시 읽지 않는다."""
+    with db.write(store) as c:
+        c.execute("UPDATE source_units SET parent_id = ? WHERE id = ? AND parent_id IS NULL", (parent_id, unit_id))
+
+
+def units_missing_parent(store: Path, section_id: str) -> bool:
+    """이 섹션에 출처를 모르는 행이 있는지(parent_id가 생기기 전에 모은 것). 있으면 다음 수집 때 채운다."""
+    with closing(db.connect(store)) as c:
+        return c.execute("SELECT 1 FROM source_units WHERE section_id = ? AND parent_id IS NULL LIMIT 1",
+                         (section_id,)).fetchone() is not None
 
 
 def summary(store: Path, scope: str) -> dict[str, Any]:
@@ -259,25 +274,49 @@ def _latest_records(c: Any, section_id: str) -> list[dict[str, Any]]:
 
 
 def _root_pages(c: Any, scope: str, root_id: str) -> set[str]:
+    """루트 하나에 속한 페이지 ID들. 루트 ID는 하이픈 유무와 상관없이 같은 것으로 본다."""
+    root = db.notion_id(root_id)
     return {r["page_id"] for r in c.execute(
-        "SELECT page_id FROM source_pages WHERE scope = ? AND root_id = ? AND status = 'active'", (scope, root_id))}
+        "SELECT page_id, root_id FROM source_pages WHERE scope = ? AND status = 'active'", (scope,))
+        if db.notion_id(r["root_id"]) == root}
+
+
+def _records_from(c: Any, section_id: str, parent_id: str) -> list[dict[str, Any]]:
+    """섹션의 원문 중 parent_id(DB·페이지)에서 온 행·하위 페이지만."""
+    parent = db.notion_id(parent_id)
+    units = {r["id"]: r["parent_id"] for r in c.execute(
+        "SELECT id, parent_id FROM source_units WHERE section_id = ?", (section_id,))}
+    records = _latest_records(c, section_id)
+    if units and all(p is None for p in units.values()):
+        return records  # 출처를 기록하기 전에 모은 섹션: 다음 수집에서 채워질 때까지는 섹션 전체를 쓴다
+    return [r for r in records
+            if db.notion_id(units.get(r["locator"].removeprefix("notion:"))) == parent]
 
 
 def meeting_notes(store: Path, scope: str, notes_id: str | None, max_chars: int = 8000,
                   per_record: int = 2000) -> dict[str, Any] | None:
-    """2·3번 메뉴용 회의 기록: 회의 역할 섹션 + 설정된 회의록 페이지(또는 DB)에 속한 섹션의 저장된 원문.
-    최근 수정된 것부터 max_chars까지 담아 시간순으로 돌려준다(Notion 호출 없음). 아직 수집 전이면 None.
+    """2·3번 메뉴용 회의 기록: 회의 역할 섹션 + 설정된 회의록 페이지(또는 DB)의 저장된 원문.
+    회의록 DB가 다른 섹션 안에 들어 있으면(같은 제목 아래 WBS 등과 함께) 그 DB에서 온 행만 쓴다.
+    최근 수정된 것부터 max_chars까지 담아 시간순으로 돌려준다(Notion 호출 없음).
+    아직 수집 전이거나, 회의록이 설정됐는데 그 원문이 하나도 없으면 None — 호출부가 한 번 읽어 온다.
     한 건이 아주 길어도(회의록 한 행이 1만 자 넘는 경우) per_record까지만 담아, 최근 몇 건이 고르게 들어가게 한다."""
     db.initialize(store)
     found = sections(store, scope, page_order=True)
     if not found:
         return None
+    notes = db.notion_id(notes_id)
     with closing(db.connect(store)) as c:
-        notes_pages = _root_pages(c, scope, notes_id) if notes_id else set()
-        chosen = [s for s in found if s["role"] == "meeting" or s["page_id"] in notes_pages or s["id"] == notes_id
-                  or any(item["id"] == notes_id for key in ("pages", "databases") for item in s["layout"].get(key, []))]
-        records = [r for s in chosen for r in _latest_records(c, s["id"])]
+        notes_pages = {db.notion_id(p) for p in _root_pages(c, scope, notes_id)} if notes else set()
+        records: list[dict[str, Any]] = []
+        for s in found:
+            if s["role"] == "meeting" or (notes and (db.notion_id(s["page_id"]) in notes_pages or db.notion_id(s["id"]) == notes)):
+                records += _latest_records(c, s["id"])
+            elif notes and any(db.notion_id(item["id"]) == notes for key in ("pages", "databases")
+                               for item in s["layout"].get(key, [])):
+                records += _records_from(c, s["id"], notes)
         as_of = c.execute("SELECT MAX(checked_at) FROM source_pages WHERE scope = ? AND status = 'active'", (scope,)).fetchone()[0]
+    if not records and notes:
+        return None
     records.sort(key=lambda r: r["captured_at"] or "", reverse=True)
     picked: list[str] = []
     total = 0

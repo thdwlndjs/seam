@@ -307,5 +307,17 @@ class GroqBudgetTests(unittest.TestCase):
         self.assertTrue(all("이하 생략" in t for t in titles))
 
 
+class DisplayTests(unittest.TestCase):
+    def test_as_of_is_korean_time_even_without_tz_database(self) -> None:
+        with patch("zoneinfo.ZoneInfo", side_effect=Exception("No time zone found with key Asia/Seoul")):  # Windows
+            self.assertEqual(main._format_as_of("2026-11-02T07:45:47Z"), "11/02 16:45")
+
+    def test_env_file_is_loaded_before_modules_that_read_it(self) -> None:
+        # worklog_bridge·notion_read는 import 순간 GROQ_API_KEY 등을 읽는다. .env가 늦게 읽히면 그쪽만 키가 비어 버린다.
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        self.assertLess(source.index("load_dotenv(os.environ.get"), source.index("import worklog_bridge"))
+        self.assertLess(source.index("load_dotenv(os.environ.get"), source.index("import notion_map"))
+
+
 if __name__ == "__main__":
     unittest.main()
