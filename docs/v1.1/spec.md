@@ -60,29 +60,38 @@ v1.1에서 만드는 동작·데이터·화면의 규격이다. 구현과 테스
 
 ### P1-2 부분 분할과 블록 대조
 
-`parts.split_top_level(md: str) -> list[RawPart]`
+분할은 두 단계다. md를 최상위 블록 단위로 자르고(1), 블록을 부분으로 묶는다(2).
 
-- 들여쓰기(탭·공백)가 없는 줄을 새 최상위 항목의 시작으로 본다. 그 아래 들여쓴 줄, `<details>`·`<table>`·`<synced_block>` 안의 줄은 앞 항목에 속한다.
-- `<empty-block/>`만 있는 항목은 부분으로 만들지 않되, 블록 대조에서는 한 칸으로 센다.
-- `RawPart(position, title, md)`. `title`은 첫 줄에서 목록 기호(`1.`, `-`)와 마크업을 뺀 글자다.
+**(1) 최상위 블록 자르기** `parts.top_level_blocks(md: str) -> list[RawBlock]`
 
-`parts.align_blocks(raw: list[RawPart], top_blocks: list[dict]) -> list[Part] | None`
+실제 녹화본 5개(1·2·3차 멘토링, 3차 질문지, 팀 정보 페이지)로 확인한 규칙이다. 다섯 페이지 모두 최상위 블록 목록과 1:1로 맞았다(`tests/test_fixtures.py`).
 
-- `notion_map.top_blocks(client, page_id)`의 결과와 개수·순서를 맞춰 `block_id`를 붙인다.
-- 개수가 다르거나, 같은 위치의 블록 종류와 md 첫 줄이 어긋나면 `None`을 돌려준다. 이때 그 페이지는 블록 읽기로 부분을 만든다(블록 하나 = 부분 하나).
+- 중첩은 **탭**으로만 표시된다. 탭으로 시작하지 않는 줄이 새 최상위 블록이다. 공백으로 시작하는 줄(` \[클로바노트공유\]`)도 최상위 단락이다.
+- `<table>` … `</table>` 안의 `<tr>`·`<td>` 줄은 들여쓰기가 없어도 그 표에 속한다. 최상위 `<table>` 줄은 블록 하나다.
+- 들여쓰기 없는 닫는 태그(`</callout>` 등)는 앞 블록에 속한다.
+- 빈 단락은 `<empty-block/>`, 구분선은 `---`, 하위 페이지는 `<page url=…>제목</page>`, 인라인 DB는 `<database url=…>제목</database>`로 나온다.
+
+**(2) 부분으로 묶기** `parts.group_parts(blocks: list[RawBlock]) -> list[RawPart]`
+
+블록 하나를 부분 하나로 보면 너무 잘게 나뉜다. 1차 멘토링은 최상위 블록이 19개이고, 결론 `→` 줄 네 개도 각각 블록이다. 그래서 경계 블록 사이에 이어진 블록들을 한 부분으로 묶는다.
+
+- 경계: 빈 단락(`<empty-block/>`), 구분선(`---`), 제목(`#`, `##`, `###`). 빈 단락과 구분선은 부분에 넣지 않고, 제목은 다음 부분의 첫 줄이 된다.
+- 하위 페이지(`<page>`)와 인라인 DB(`<database>`)는 부분이 아니라 지도의 하위 항목이다(P1-1의 수집 대상).
+- `RawPart(position, title, md, block_positions)`. `title`은 첫 블록 첫 줄에서 목록 기호(`1.`, `-`, `- [ ]`)와 마크업을 뺀 글자다.
+
+`parts.align_blocks(blocks: list[RawBlock], top_blocks: list[dict]) -> list[str] | None`
+
+- `notion_map.top_blocks(client, page_id)`의 결과와 개수·순서를 맞춰 블록마다 `block_id`를 붙인다. 부분은 자기 블록들의 ID 목록(`block_ids`)을 갖는다.
+- 개수가 다르거나, 같은 위치가 어긋나면 `None`을 돌려준다(구분선 ↔ `---`, 빈 단락 ↔ `<empty-block/>`, 목록 ↔ `1.`·`-`, 제목 ↔ `#`, 표 ↔ `<table`, 하위 페이지 ↔ `<page`, DB ↔ `<database`). 이때 그 페이지는 블록 읽기로 부분을 만든다.
 - 경로(`path`)는 `페이지 경로 > 부분 제목`이다. 예: `프로젝트 기본정보 > 1차 멘토링 > 스마트 옷장`.
 
-**기대 결과 (1차 멘토링 fixture)**
+**기대 결과**
 
-| position | title | 종류(P1-3 후) |
-| --- | --- | --- |
-| 0 | 식기세척기 | meeting |
-| 1 | 스마트 옷장 | meeting (`구체화` 하위 항목은 document로 떼어 냄) |
-| 2 | 선박 | meeting |
-| 3 | 구독 관련 Agent(긍정적) | meeting |
-| 4 | ThinQ Claw | meeting |
-| 5 | 결론(`---` 아래 `→` 줄) | meeting |
-| 6 | 클로바노트 공유 | link |
+| fixture | 부분 (종류는 P1-3 후 기대값) |
+| --- | --- |
+| 1차 멘토링 (실제, 최상위 블록 19개) | 식기세척기 · 스마트 옷장(`구체화` 토글은 document로 떼어 냄) · 선박 · 구독 관련 Agent(긍정적) · ThinQ Claw · 결론(`→` 4줄 + 클로바노트 공유 링크) → **6개**, 떼어 낸 뒤 7개 |
+| 2차 멘토링 (실제, 16개) | 구독 · 식세기 · 스마트 옷장 · "3개 중에 어느걸 고를지?"와 그 아래 번호 3개 · 클로바노트 공유 → **5개** |
+| `meeting_sample.md` (가짜, 19개) | 1차 멘토링과 같은 구조 → **6개**, 떼어 낸 뒤 7개 |
 
 ### P1-3 종류 판정
 
@@ -376,7 +385,7 @@ CREATE TABLE source_parts (
     scope TEXT NOT NULL,
     origin TEXT NOT NULL,            -- notion | teams | clova
     page_id TEXT,                    -- notion만
-    block_id TEXT,                   -- 대조 성공 시
+    block_ids_json TEXT,             -- 대조 성공 시 이 부분의 최상위 블록 ID 목록
     parent_part_id TEXT,             -- split으로 떼어 낸 경우
     path TEXT NOT NULL,
     position INTEGER NOT NULL,
@@ -485,9 +494,9 @@ metric kind=<menu|apply|background> team=<scope> menu=<1-4|-> notion_calls=<n> g
 
 | ID | 기준 | 확인 | Phase | 성공 기준 |
 | --- | --- | --- | --- | --- |
-| A1 | 1차 멘토링 fixture가 부분 7개로 나뉜다 | `test_split_top_level_mentoring1` | 1 | 2 |
+| A1 | `meeting_sample.md`가 부분 6개로 나뉜다(실제 녹화본이 있으면 1차 6개, 2차 5개) | `test_group_parts_mentoring` | 1 | 2 |
 | A2 | `구체화` 토글이 `document` 부분으로 떼어지고, `스마트 옷장` 부분 md에는 없다 | `test_split_document_child` (가짜 Groq) | 1 | 2 |
-| A3 | 표 6개의 셀 내용이 부분 md에 있다 | `test_md_keeps_tables` | 1 | - |
+| A3 | fixture의 표 셀 내용이 모두 부분 md에 있다(`meeting_sample.md` 표 3개, 실제 1차 멘토링 표 6개) | `test_md_keeps_tables` | 1 | - |
 | A4 | 블록 수가 다르면 블록 읽기로 대체한다 | `test_align_mismatch_falls_back` | 1 | - |
 | A5 | 같은 (내용 해시, 프롬프트 버전)은 재시작해도 다시 추출하지 않는다 | `test_extract_cached_by_hash` | 2 | 4 |
 | A6 | 메뉴 2번 응답의 `groq_calls = 0` | `test_menu2_no_groq` + 계측 로그 | 2 | 4 |
@@ -525,5 +534,6 @@ metric kind=<menu|apply|background> team=<scope> menu=<1-4|-> notion_calls=<n> g
 
 | 날짜 | 바뀐 것 | 근거 |
 | --- | --- | --- |
+| 2026-11-03 | P1-2 분할 규칙: 블록 하나 = 부분 하나 → 경계(빈 단락·구분선·제목) 사이 블록 묶음. md 최상위 줄 규칙(탭만 중첩, 표 안 줄·닫는 태그는 앞 블록). 1차 멘토링 기대값 7개 → 6개, `block_id` → `block_ids_json` | Phase 0 실제 녹화본 5개: 1차 멘토링 최상위 블록 19개(빈 단락 7, 구분선 1, `→` 단락 4 포함) |
 | 2026-11-03 | P1-0 추가: 채팅 메시지 저장과 변경 후보·터미널 승인 경로를 없앤다 | 송지원 결정(숨은 기능이고 쌓인 데이터 0건) |
 | 2026-11-03 | 첫 작성. **[가정]** 값: 종류 판정 확신 0.6, 대체 확신 0.7, md 이어 받기 20회, 추출 분할 4,000토큰, 백그라운드 70%, 확인 대기 알림 3일, 게이트 기본값 12개(세부 단계 10개) | [report-2026-11-03.md](report-2026-11-03.md) |

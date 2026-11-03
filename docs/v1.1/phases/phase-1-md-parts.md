@@ -11,7 +11,7 @@
 ## 작업
 
 - [ ] 새 `src/server/notion_md.py`: `fetch_markdown(client, page_id)`. 버전 헤더, 잘린 응답 이어 받기(최대 20회), 실패 시 `notion_read._block_text`로 대체.
-- [ ] 새 `src/server/worklog/parts.py`: `split_top_level(md)`, `align_blocks(raw, top_blocks)`, 부분 저장·조회.
+- [ ] 새 `src/server/worklog/parts.py`: `top_level_blocks(md)`, `group_parts(blocks)`, `align_blocks(blocks, top_blocks)`, 부분 저장·조회. 최상위 줄 규칙은 Phase 0의 `tests/test_fixtures.py`의 `top_level_lines`와 같다(그 함수를 `parts.py`로 옮겨 테스트가 그것을 쓰게 한다).
 - [ ] `src/server/worklog/db.py`: 마이그레이션 5(`source_parts`).
 - [ ] `src/server/notion_map.py`
     - `_collect_section`에서 하위 페이지·DB 행 본문을 md로 받아 부분을 만든다. 수정 시각 비교(`source_units`)는 그대로.
@@ -24,7 +24,7 @@
 
 | ID | 테스트 | 입력 |
 | --- | --- | --- |
-| A1 | 1차 멘토링이 부분 7개로 나뉜다(spec P1-2 기대 결과 표) | fixture md |
+| A1 | `meeting_sample.md`가 부분 6개로 나뉜다. 실제 녹화본이 있으면 1차 6개, 2차 5개(spec P1-2 기대 결과 표) | `tests/fixtures/notion/`, `notion_local/` |
 | A2 | `구체화`가 `document` 부분으로 떼어지고, `스마트 옷장` 부분 md에는 없다 | fixture md + 가짜 Groq 응답 |
 | A3 | 표 6개의 셀 내용이 부분 md에 있다 | fixture md |
 | A4 | 블록 수가 다르면 블록 읽기로 대체한다 | 블록 하나를 뺀 fixture |
