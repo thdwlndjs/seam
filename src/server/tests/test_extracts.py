@@ -115,6 +115,27 @@ def meeting_kinds_for_all(page: dict) -> dict:
     return {"parts": [{"part_id": p["part_id"], "kind": "meeting", "confidence": 0.9, "split": []} for p in page["parts"]]}
 
 
+class DraftTests(unittest.TestCase):
+    def test_draft_lists_extracted_items_per_meeting_part(self) -> None:
+        import extract_draft
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = Path(tmp.name) / "w.sqlite3"
+        built = parts.build_unit_parts("unit-1", "멘토링 > 1차 멘토링", SAMPLE_MD, SAMPLE_BLOCKS)
+        parts.save_unit_parts(store, SCOPE, "notion", "unit-1", "sec-1", built)
+        with patch.object(worklog_bridge, "groq_classify_parts", split_classifier()), \
+                patch.object(worklog_bridge, "groq_extract_part", FakeExtractor()):
+            stats = extract_draft.organize(store, SCOPE, sleep=lambda s: None)
+        self.assertEqual(stats["pending"], 0)
+        text = extract_draft.draft(store, SCOPE, "차 멘토링")
+        self.assertIn("## 멘토링 > 1차 멘토링 > 화분 관리기", text)
+        self.assertIn("- 미정: AI를 어디에 쓸지", text)
+        self.assertIn('근거: "AI 어디에 사용?"', text)
+        self.assertIn("종류: document · 예시 기획서", text)
+        self.assertIn("버린 항목 1개", text)
+
+
 class QueueTests(unittest.TestCase):  # A21
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
