@@ -227,6 +227,29 @@ MIGRATIONS: list[list[str]] = [
         "CREATE INDEX source_parts_page ON source_parts(page_id, position)",
         "CREATE INDEX source_parts_parent ON source_parts(parent_part_id)",
     ],
+    # 6: 부분별 추출 결과와 LLM 공급자별 하루 사용량. 문서: docs/v1.1/spec.md P1-4, P1-8.
+    #    같은 내용(md 해시)·같은 프롬프트 판이면 다시 추출하지 않는다(재시작해도).
+    [
+        """CREATE TABLE part_extracts (
+            content_hash TEXT NOT NULL,      -- 부분 md(떼어 낸 뒤)의 해시
+            prompt_version TEXT NOT NULL,
+            model TEXT NOT NULL,
+            items_json TEXT NOT NULL,
+            dropped INTEGER NOT NULL DEFAULT 0,  -- 원문 인용이 맞지 않아 버린 항목 수
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (content_hash, prompt_version)
+        )""",
+        # 한도는 공급자(키) 단위라 팀과 상관없이 공급자별 하루 합계를 센다. 백그라운드는 이 합계로 하루 몫을 지킨다.
+        """CREATE TABLE llm_usage (
+            day TEXT NOT NULL,               -- UTC 날짜
+            provider TEXT NOT NULL,          -- groq | cerebras
+            tokens INTEGER NOT NULL,
+            background_tokens INTEGER NOT NULL,
+            PRIMARY KEY (day, provider)
+        )""",
+    ],
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

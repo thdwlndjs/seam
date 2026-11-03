@@ -51,9 +51,11 @@ from pydantic import BaseModel
 # NOTION_RATE 등)를 읽어 두기 때문에, 순서가 바뀌면 .env 값이 그쪽에 전달되지 않는다.
 load_dotenv(os.environ.get("ENV_FILE"))
 
+import llm_queue  # noqa: E402
 import metrics  # noqa: E402
 import notion_map  # noqa: E402
 import worklog_bridge  # noqa: E402
+from worklog import parts as wparts  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
 # ── 설정 ────────────────────────────────────────────────
@@ -88,7 +90,6 @@ def _spawn(coro) -> asyncio.Task:
 # ── 캐시 (메모리, 서버 프로세스 살아있는 동안만 유지) ──────────
 _project_status_field_cache: dict[tuple[str, int], tuple[str, str, str] | None] = {}
 _project_item_id_cache: dict[tuple[str, int], str | None] = {}
-_meeting_notes_classification_cache: dict[str, dict] = {}
 # team_key -> {"hash": 요약한 원문의 해시, "summary": 요약} — 저장된 팀 정보 원문이 같으면 Groq를 다시 부르지 않는다.
 _project_summary_cache: dict[str, dict] = {}
 
@@ -767,8 +768,12 @@ def _fit_for_groq(text: str, keep: str = "head") -> str:
 
 
 async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None] | None = None) -> str | None:
-    """요약을 돌려준다. Groq 키가 없거나 실패하면 None — 호출부가 원문 앞부분을 보여주고 캐시하지 않는다."""
-    if not GROQ_API_KEY or not raw_text.strip():
+    """요약을 돌려준다. LLM 키가 없거나 모두 실패하면 None — 호출부가 원문 앞부분을 보여주고 캐시하지 않는다.
+    Groq가 한도(429)에 걸렸거나 쉬는 중이면 같은 모델의 Cerebras로 넘긴다(docs/v1.1/spec.md P1-8)."""
+    candidates = [(p, p.key) for p in llm_queue.available(llm_queue.USER)]
+    if not candidates and GROQ_API_KEY:
+        candidates = [(llm_queue.PROVIDERS[0], GROQ_API_KEY)]
+    if not candidates or not raw_text.strip():
         return None
     raw_text = _fit_for_groq(raw_text)
 
@@ -778,47 +783,54 @@ async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None]
         "'[프로젝트명 입력]'처럼 아직 안 채워진 항목은 '미정'으로 짧게만 표시하거나 생략해.\n"
         "팀 규칙/협업 방식 같은 formality는 한두 줄로만 축약하고, 전체 5~10줄 이내로 정리해."
     )
-    try:
+    ready = [c for c in candidates if not llm_queue.cooling_down(c[0])] or candidates
+    for provider, key in ready:
         full_text = ""
-        async with httpx.AsyncClient(timeout=15) as client:
-            async with client.stream(
-                "POST",
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": raw_text},
-                    ],
-                    "temperature": 0.2,
-                    "stream": True,
-                },
-            ) as resp:
-                usage: dict | None = None
-                try:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        payload = line[len("data: "):].strip()
-                        if payload == "[DONE]":
-                            break
-                        event = json.loads(payload)
-                        # Groq는 스트림 마지막 조각의 x_groq.usage에 토큰 수를 싣는다.
-                        usage = (event.get("x_groq") or {}).get("usage") or event.get("usage") or usage
-                        choices = event.get("choices") or [{}]
-                        delta = (choices[0].get("delta") or {}).get("content", "")
-                        if delta:
-                            full_text += delta
-                            if on_chunk:
-                                on_chunk(delta)
-                finally:
-                    metrics.count_groq(usage)
-        return full_text.strip() or None
-    except Exception:
-        traceback.print_exc()
-        return None
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                async with client.stream(
+                    "POST",
+                    provider.url,
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": GROQ_MODEL if provider.name == "groq" else provider.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": raw_text},
+                        ],
+                        "temperature": 0.2,
+                        "stream": True,
+                    },
+                ) as resp:
+                    usage: dict | None = None
+                    try:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[len("data: "):].strip()
+                            if payload == "[DONE]":
+                                break
+                            event = json.loads(payload)
+                            # Groq는 마지막 조각의 x_groq.usage에, Cerebras는 usage에 토큰 수를 싣는다.
+                            usage = (event.get("x_groq") or {}).get("usage") or event.get("usage") or usage
+                            choices = event.get("choices") or [{}]
+                            delta = (choices[0].get("delta") or {}).get("content", "")
+                            if delta:
+                                full_text += delta
+                                if on_chunk:
+                                    on_chunk(delta)
+                    finally:
+                        metrics.count_groq(usage)
+                        # 사람이 기다리는 호출(순위 1)은 막지 않고, 쓴 양만 대기열에 알린다(백그라운드가 몫을 맞춘다).
+                        llm_queue.record(worklog_bridge.WORKLOG_STORE, provider.name, llm_queue.USER, resp.headers,
+                                         resp.status_code, int((usage or {}).get("total_tokens") or 0))
+            return full_text.strip() or None
+        except Exception:
+            traceback.print_exc()
+            if full_text:
+                return full_text.strip()  # 이미 보낸 글이 있으면 다른 공급자로 처음부터 다시 보내지 않는다
+    return None
 
 
 def _team_roots(config: dict) -> list[str]:
@@ -953,67 +965,25 @@ async def fetch_project_info(
     if on_stage:
         on_stage("🧠 요약 정리하는 중...")
     summary = await _summarize_snapshot(team_key, snapshot, on_chunk)
+    docs = _document_lines(await asyncio.to_thread(wparts.documents, worklog_bridge.WORKLOG_STORE, team_key))
+    if docs and on_chunk:
+        on_chunk("\n\n" + "\n".join(docs))
     as_of = _format_as_of(snapshot.get("as_of"))
     if as_of and on_chunk:
         on_chunk(f"\n\n(Notion 기준 {as_of})")
-    return summary
+    return "\n\n".join(filter(None, [summary, "\n".join(docs)]))
 
 
-# ── 회의록 → 확정 / 미정 분류 (Groq) ─────────────────────
-async def _classify_meeting_notes(note_lines: list[str], cache_key: str) -> dict[str, list[str]]:
-    empty = {"confirmed": [], "undecided": []}
-    if not GROQ_API_KEY or not note_lines:
-        return empty
-
-    raw_text = _fit_for_groq("\n".join(note_lines), keep="tail")  # 최근 회의가 남도록 뒤쪽을 남긴다
-    content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-    cached = _meeting_notes_classification_cache.get(cache_key)
-    if cached and cached["hash"] == content_hash:
-        return cached["result"]
-
-    system_prompt = (
-        "너는 회의록 원문을 읽고 두 갈래로 분류하는 도우미야.\n"
-        "1) [확정] — 담당자와 할 일이 명확히 정해진 것. '담당자: 할 일' 형식으로 한 줄씩 적어. "
-        "이슈 번호(#123) 같은 참조가 원문에 있으면 그대로 유지해.\n"
-        "2) [미정] — 담당자나 방향이 아직 안 정해져서 논의만 되고 결론이 안 난 사안. 한 줄씩 적어.\n"
-        "반드시 아래 형식 그대로만 출력하고, 다른 설명이나 인사말은 절대 붙이지 마:\n"
-        "[확정]\n"
-        "(항목들, 없으면 비워둠)\n"
-        "[미정]\n"
-        "(항목들, 없으면 비워둠)"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": raw_text},
-                    ],
-                    "temperature": 0.2,
-                },
-            )
-            metrics.count_groq(_usage_of(resp))
-            resp.raise_for_status()
-            summary_text = resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        traceback.print_exc()
-        return empty
-
-    confirmed_part, _, rest = summary_text.partition("[미정]")
-    confirmed_part = confirmed_part.replace("[확정]", "")
-
-    def _clean_lines(text: str) -> list[str]:
-        lines = [line.strip("-• ").strip() for line in text.splitlines()]
-        return [line for line in lines if line]
-
-    result = {"confirmed": _clean_lines(confirmed_part), "undecided": _clean_lines(rest)}
-    _meeting_notes_classification_cache[cache_key] = {"hash": content_hash, "result": result}
-    return result
+def _document_lines(docs: list[dict]) -> list[str]:
+    """1번 메뉴의 주요 문서: 제목 — 한 줄 설명 (Notion 링크). 문서: docs/v1.1/spec.md P1-9."""
+    if not docs:
+        return []
+    lines = ["📄 주요 문서"]
+    for doc in docs:
+        title = doc["path"].rsplit(" > ", 1)[-1]
+        link = f"https://www.notion.so/{(doc['page_id'] or '').replace('-', '')}" if doc.get("page_id") else ""
+        lines.append(f"- {title} — {doc['summary']}" + (f" ({link})" if link else ""))
+    return lines
 
 
 async def _get_commit_touched_issues(repo: str, token: str) -> set[int]:
@@ -1070,6 +1040,22 @@ def _sync_notion_maps() -> dict[str, dict]:
     return results
 
 
+def _organize_parts() -> dict[str, dict[str, int]]:
+    """모든 팀: 종류 판정 전인 부분을 판정하고, 회의 메모 부분을 추출한다(Notion은 부르지 않음).
+    Groq 대기열 몫(분당·하루)을 넘으면 멈추고 다음 주기에 이어 한다. 문서: docs/v1.1/spec.md P1-4, P1-8."""
+    results: dict[str, dict[str, int]] = {}
+    store = worklog_bridge.WORKLOG_STORE
+    for team_key in _load_team_configs():
+        try:
+            judged = wparts.judge_pending(store, team_key, worklog_bridge.groq_classify_parts)
+            extracted = wparts.extract_pending(store, team_key, worklog_bridge.groq_extract_part,
+                                               worklog_bridge.EXTRACT_PROMPT_VERSION)
+            results[team_key] = {"judged": judged, "extracted": extracted}
+        except Exception:
+            traceback.print_exc()
+    return results
+
+
 async def _worklog_loop() -> None:
     # 서버가 켜지자마자 수집을 시작하면 첫 사용자 요청과 겹친다. 잠시 기다렸다 시작한다.
     await asyncio.sleep(worklog_bridge.START_DELAY_SECONDS)
@@ -1077,11 +1063,12 @@ async def _worklog_loop() -> None:
     while True:
         try:
             # 1시간 분석(analyze_due → 변경 후보)은 돌리지 않는다(v1.1, docs/v1.1/spec.md P1-0).
-            # 회의록 정리는 Phase 1부터 부분별 추출로 바뀐다. 지금은 Notion 지도 동기화만 한다.
-            if time.monotonic() - last_collect >= worklog_bridge.NOTION_COLLECT_SECONDS:
-                last_collect = time.monotonic()
-                with metrics.measure("background"):
+            with metrics.measure("background"):
+                if time.monotonic() - last_collect >= worklog_bridge.NOTION_COLLECT_SECONDS:
+                    last_collect = time.monotonic()
                     await asyncio.to_thread(_sync_notion_maps)
+                # 주기마다(기본 5분) 부분 판정·추출을 조금씩 이어 한다. 메뉴는 그 결과만 읽는다.
+                await asyncio.to_thread(_organize_parts)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(worklog_bridge.ANALYZE_TICK_SECONDS)
@@ -1125,17 +1112,23 @@ async def fetch_team_status(config: dict, team_key: str,
         result = ["👥 팀 진행상황", "\n".join(lines) if lines else "(회의록도 없고 등록된 이슈도 없어요)"]
         return "\n".join(result + unassigned_hint + footer), unassigned_open
 
-    classified = await _classify_meeting_notes(note_lines, config["meeting_notes_page_id"])
-    confirmed, undecided = classified["confirmed"], classified["undecided"]
+    # 회의 메모는 백그라운드가 부분마다 한 번 추출해 둔 결과를 읽는다. 메뉴를 누를 때 Groq를 부르지 않는다
+    # (docs/v1.1/spec.md P1-9). 아직 확인 흐름(Phase 3)이 없어 "확인 전"으로 표시한다.
+    stored = await asyncio.to_thread(_stored_items, team_key)
+    confirmed, undecided = stored["confirmed"], stored["undecided"]
+    pending_hint = [f"(회의록 {stored['pending']}건 정리 중)"] if stored["pending"] else []
 
-    if not confirmed and not undecided:
-        text = "👥 팀 진행상황 (요약 실패, 회의록 원문)\n" + "\n".join(f"- {_brief(t)}" for t in note_lines[-10:])
-        return "\n".join([text] + unassigned_hint + footer), unassigned_open
+    if not confirmed and not undecided and not stored["decisions"] and not stored["feedback"]:
+        header = "👥 팀 진행상황 (회의록 정리 중, 원문)" if stored["pending"] else "👥 팀 진행상황 (회의록 원문)"
+        text = header + "\n" + "\n".join(f"- {_brief(t)}" for t in note_lines[-10:])
+        return "\n".join([text] + unassigned_hint + pending_hint + footer), unassigned_open
 
     commit_touched = await _get_commit_touched_issues(repo, github_token)
     tasks = _classify_tasks_by_github_state(confirmed, issue_state_by_number, commit_touched)
 
-    result = ["👥 팀 진행상황 (회의록 기준)"]
+    result = ["👥 팀 진행상황 (회의록 기준, 확인 전)"]
+    if stored["decisions"]:
+        result += ["", "📌 정한 것", *[f"- {t}" for t in stored["decisions"]]]
     if tasks["done"]:
         result += ["", "✅ 완료", *[f"- {t}" for t in tasks["done"]]]
     if tasks["in_progress"]:
@@ -1146,9 +1139,29 @@ async def fetch_team_status(config: dict, team_key: str,
         result += ["", "🆕 이슈 미등록 (회의에서만 언급됨)", *[f"- {t}" for t in tasks["unlinked"]]]
     if undecided:
         result += ["", "🤔 아직 정해야 할 사안", *[f"- {t}" for t in undecided[:10]]]
-    result += unassigned_hint + footer
+    if stored["feedback"]:
+        result += ["", "💬 멘토링 피드백", *[f"- {t}" for t in stored["feedback"]]]
+    result += unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer
 
     return "\n".join(result), unassigned_open
+
+
+def _stored_items(team_key: str) -> dict:
+    """메뉴 2번에 쓸 저장된 추출 결과(같은 항목은 합쳐짐, 최근 회의 먼저). Notion·Groq를 부르지 않는다."""
+    store = worklog_bridge.WORKLOG_STORE
+    items = wparts.meeting_items(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION)
+    by_kind: dict[str, list[dict]] = {}
+    for item in items:
+        by_kind.setdefault(item["kind"], []).append(item)
+    tasks = by_kind.get("task", [])
+    return {
+        "confirmed": [f"{t['owner']}: {t['title']}" for t in tasks if t.get("owner")],
+        "undecided": [t["title"] for t in by_kind.get("open", [])]
+                     + [f"{t['title']} – 담당자 미정" for t in tasks if not t.get("owner")],
+        "decisions": [d["title"] for d in by_kind.get("decision", [])][:5],
+        "feedback": [f["title"] for f in by_kind.get("feedback", [])][:5],
+        "pending": wparts.pending_count(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION),
+    }
 
 
 # ── 3. 내 역할 조회 ─────────────────────────────

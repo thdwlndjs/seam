@@ -28,6 +28,7 @@ v1.1 계획과 규격은 [docs/v1.1/](docs/v1.1/)에 있습니다([plan](docs/v1
 | `BOT_SERVER_SECRET` | 예 | 봇 ↔ 서버 검증용. 봇과 서버가 같은 값을 써야 한다. 없으면 둘 다 시작하지 않는다 |
 | `GROQ_API_KEY` | 아니요 | 없으면 요약·분류 없이 원문으로 답한다 |
 | `GROQ_MODEL` | 아니요 | 기본 `openai/gpt-oss-120b` |
+| `CEREBRAS_API_KEY` | 아니요 | 있으면 Groq 한도가 찼을 때 백그라운드 판정·추출을 Cerebras(같은 모델 gpt-oss-120b)로 넘긴다. 회의록이 Cerebras에도 전송된다 |
 | `DANGEROUSLY_ALLOW_UNAUTHENTICATED_REQUESTS` | 로컬만 | Playground로 테스트할 때 `true`. 실제 Teams 배포에서는 끈다 |
 | `CLIENT_ID`, `CLIENT_SECRET`, `TENANT_ID` | 배포만 | Teams 봇 자격증명. Playground에서는 주석 처리 |
 
@@ -69,6 +70,7 @@ $env:GROQ_API_KEY=""; ..\..\.venv\Scripts\python.exe -m unittest discover -s tes
 ```
 
 - `GROQ_API_KEY`는 비워 둔다(Groq 없는 경로를 확인하는 테스트가 있다).
+- 테스트는 실제 저장소(`src/worklog.sqlite3`)를 쓰지 않는다. 모든 테스트 모듈이 `tests/isolation.py`를 맨 먼저 불러 임시 저장소를 쓰게 한다.
 - `BOT_SERVER_SECRET`은 덮어쓰지 않는다(테스트가 `test-secret`을 쓴다).
 - 실제 Notion 녹화본(`src/server/tests/fixtures/notion_local/`)이 있으면 그것으로도 확인하고, 없으면 건너뛴다.
 

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import isolation  # noqa: F401,I001  실제 저장소·키를 쓰지 않게(맨 먼저)
+
 import sqlite3
 import sys
 import tempfile
@@ -640,6 +642,27 @@ class MarkdownCollectTests(unittest.TestCase):
         self.assertEqual((found["회의록"]["role"], found["회의록"]["role_source"]), ("meeting", "llm"))
         self.assertIn("md:r1", self.fake.calls)  # 바뀌지 않은 행도 다시 읽는다(DB 조회 커서도 지운다)
         self.assertTrue(parts.has_parts(self.store, SCOPE, "r1"))
+
+    def test_reindex_can_rejudge_llm_part_kinds_but_keeps_human_ones(self) -> None:
+        import reindex
+        from worklog import parts
+
+        md = "1. 인증\n\t- OAuth로 확정\n<empty-block/>\n1. 일정\n\t- 금요일 배포"
+        client = MarkdownClientView(self.fake, {"r1": md})
+        notion_map.sync(self.store, SCOPE, "root", client, classify=FakeClassifier(), classify_parts=meeting_kinds)
+        stored = {p["path"].rsplit(" > ", 1)[-1]: p for p in parts.list_parts(self.store, SCOPE, page_id="r1")}
+        parts.set_part_kind(self.store, stored["일정"]["id"], "document", actor="lead")
+
+        def all_documents(page: dict) -> dict:
+            return {"parts": [{"part_id": p["part_id"], "kind": "document", "confidence": 0.9, "summary": "문서",
+                               "split": []} for p in page["parts"]]}
+
+        stats = reindex.reindex(self.store, SCOPE, ["root"], client, classify=FakeClassifier(),
+                                classify_parts=all_documents, sleep=lambda s: None, rejudge_parts=True)
+        self.assertGreaterEqual(stats["parts_rejudged"], 1)
+        after = {p["path"].rsplit(" > ", 1)[-1]: p for p in parts.list_parts(self.store, SCOPE, page_id="r1")}
+        self.assertEqual((after["인증"]["kind"], after["인증"]["kind_source"]), ("document", "llm"))  # 다시 판정됨
+        self.assertEqual((after["일정"]["kind"], after["일정"]["kind_source"]), ("document", "human"))  # 사람이 정한 것은 그대로
 
     def test_link_outside_headings_is_scanned_like_a_subpage(self) -> None:
         self.fake.pages["root"]["blocks"].insert(1, {"id": "lnk", "type": "link_to_page", "has_children": False,

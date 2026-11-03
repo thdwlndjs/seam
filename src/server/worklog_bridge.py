@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+import llm_queue
 import metrics
 import worklog
 
@@ -55,25 +56,57 @@ def record(*, scope: str, kind: str, conversation_key: str, locator: str, text: 
         return False
 
 
-# ── Groq 호출 (동기 — 분석은 별도 스레드에서 돈다) ─────────────────
-def _groq_json(system_prompt: str, payload: Any) -> Any:
-    with httpx.Client(timeout=60) as client:
-        resp = client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-            },
-        )
-        metrics.count_groq(usage_of(resp))
+# ── LLM 호출 (동기 — 분석은 별도 스레드에서 돈다) ─────────────────
+def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGROUND) -> tuple[Any, dict, str]:
+    """JSON 응답 한 번. (응답 JSON, usage, "공급자:모델")을 돌려준다.
+
+    백그라운드(순위 2·3)는 공급자를 차례로 시도한다(Groq → Cerebras, 키가 있는 것만). 대기열 한도에 막히거나
+    429를 받으면 다음 공급자로 넘기고, 모두 막히면 llm_queue.Busy를 낸다(호출부는 그 주기를 멈춘다)."""
+    body = json.dumps(payload, ensure_ascii=False)
+    estimated = len(body) * 3 // 4 + len(system_prompt) // 2
+    candidates = llm_queue.available(priority) or llm_queue.PROVIDERS[:1]
+    busy: llm_queue.Busy | None = None
+    for provider in candidates:
+        try:
+            llm_queue.check(provider, priority, estimated, WORKLOG_STORE)
+        except llm_queue.Busy as error:
+            busy = error
+            continue
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                provider.url,
+                headers={"Authorization": f"Bearer {provider.key}"},
+                json={
+                    "model": provider.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": body},
+                    ],
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        usage = usage_of(resp) or {}
+        status = getattr(resp, "status_code", 200)
+        metrics.count_groq(usage)
+        llm_queue.record(WORKLOG_STORE, provider.name, priority, getattr(resp, "headers", None), status,
+                         int(usage.get("total_tokens") or 0))
+        if status == 429 and priority > llm_queue.USER:
+            busy = llm_queue.Busy("minute", 60, provider.name)
+            log.info("%s 한도 초과 → 다음 공급자", provider.name)
+            continue
         resp.raise_for_status()
-        return json.loads(resp.json()["choices"][0]["message"]["content"])
+        return json.loads(resp.json()["choices"][0]["message"]["content"]), usage, f"{provider.name}:{provider.model}"
+    raise busy or llm_queue.Busy("minute", 60)
+
+
+def _groq_json(system_prompt: str, payload: Any) -> Any:
+    return _llm_call(system_prompt, payload)[0]
+
+
+def llm_ready() -> bool:
+    """키가 있는 LLM 공급자가 하나라도 있는지."""
+    return bool(llm_queue.available())
 
 
 def usage_of(resp: httpx.Response) -> dict | None:
@@ -127,7 +160,7 @@ confidence가 low인 판정은 분석에 쓰이지 않고 원문 보관만 된�
 
 def groq_classify_sections(items: list[dict]) -> dict[str, dict]:
     """새로 생기거나 이름이 바뀐 섹션만 판정한다. 판정은 바로 쓰이고, 확신이 low면 원문만 보관한다."""
-    if not GROQ_API_KEY or not items:
+    if not (GROQ_API_KEY or llm_ready()) or not items:
         return {}
     data = _groq_json(CLASSIFY_PROMPT, {"sections": items})
     found = data.get("sections") if isinstance(data, dict) else None
@@ -135,8 +168,12 @@ def groq_classify_sections(items: list[dict]) -> dict[str, dict]:
 
 
 PART_KIND_PROMPT = """너는 팀 Notion 회의록·문서 페이지를 나눈 '부분'이 어떤 글인지 고르는 분류기야.
-입력: page_path(페이지 위치)와 parts 배열. 각 part에 part_id, path, title, chars(길이), head(앞부분),
+입력: page_path(페이지 위치), page(페이지 전체: title, chars 전체 길이, part_count 부분 수, outline 부분 제목 목차),
+parts 배열. 각 part에 part_id, path, title, chars(길이), head(앞부분),
 children(그 부분 안의 접힌 토글: child_path, chars)이 있다.
+먼저 페이지 전체가 무엇인지 본다. 페이지가 회의록·멘토링 기록이 아니라 기획서·보고서·조사 자료·발표 준비·산출물
+정리 같은 문서이면(긴 페이지, 제목으로 나뉜 목차, 페르소나·산출물·역할 분담 같은 내용), 그 안의 부분은
+메모처럼 보여도 모두 "document"다. "meeting"은 회의·멘토링·피드백 자리를 적은 페이지의 부분만이다.
 kind:
 - "meeting": 회의·멘토링에서 나온 메모, 피드백, 결정, 할 일, 질문과 답
 - "document": 기획서·제안서·조사 자료처럼 따로 쓴 긴 문서, 양식, 소개 글
@@ -150,11 +187,46 @@ JSON 하나만 출력해: {"parts": [{"part_id": "...", "kind": "...", "confiden
 
 
 def groq_classify_parts(page: dict) -> dict:
-    """한 페이지의 새로 생기거나 바뀐 부분만 종류를 판정한다(docs/v1.1/spec.md P1-3). Groq 키가 없으면 미룬다."""
-    if not GROQ_API_KEY or not page.get("parts"):
+    """한 페이지의 새로 생기거나 바뀐 부분만 종류를 판정한다(docs/v1.1/spec.md P1-3). LLM 키가 없으면 미룬다."""
+    if not (GROQ_API_KEY or llm_ready()) or not page.get("parts"):
         return {}
     data = _groq_json(PART_KIND_PROMPT, page)
     return data if isinstance(data, dict) else {}
+
+
+# 추출 지시문의 판. 지시문이나 항목 구성을 바꾸면 올린다(같은 내용도 새 판으로 다시 추출된다).
+EXTRACT_PROMPT_VERSION = "part-extract-3"  # 2: 한국어 제목, 멘토 발언은 피드백, 아이디어 설명은 항목 아님 / 3: 질문지는 팀의 질문, 담당은 사람만
+
+PART_EXTRACT_PROMPT = """너는 팀 회의·멘토링 메모에서 항목을 뽑는 분석기야. 입력: path(회의 위치)와 text(메모 원문).
+뽑을 항목(kind):
+- "decision": 정한 것, 확정된 방향
+- "task": 누가 무엇을 해야 하는 일. owner(메모에 적힌 이름, 없으면 null), due(YYYY-MM-DD, 없으면 null),
+  role_hint("plan" 기획 | "design" 디자인 | "dev" 개발 | null)
+- "open": 아직 정하지 못했거나 논의가 필요한 것, 열린 질문
+- "feedback": 멘토·외부 사람이 준 조언·지적·의견
+- "insight": 고객·사용자 조사(VOC)에서 얻은 사실이나 발견
+구분 규칙:
+- 멘토링·피드백 회의에서 "멘토링", "피드백" 아래 적힌 줄과 끝의 결론 줄(→ …)은 멘토가 한 말이다. 조언·지적·의견은
+  질문 형태라도 "feedback"이다. 팀이 그 자리에서 정했다고 적힌 것만 "decision"이다.
+- "기능", "아이디어" 아래처럼 팀이 낸 아이디어·기능을 설명하는 줄은 항목으로 뽑지 마. 할 일·결정이 아니다.
+- 원문에 정했다는 말이 없으면 decision을 만들지 마. 짧은 단어 하나("진동 제어")를 결정으로 늘리지 마.
+- 질문지(멘토·고객에게 물어보려고 팀이 미리 적은 질문)는 팀의 질문이다. "feedback"이 아니라 "open"이다.
+- owner는 사람 이름만 쓴다. 부서·팀·회사 이름이면 null이다.
+각 항목: {"kind", "title"(한국어 한 줄, 40자 안팎), "detail"(필요하면 한국어 한두 문장, 없으면 null), "owner", "due",
+"role_hint", "quote"(근거가 된 원문을 text에서 그대로 복사한 짧은 구절), "confidence"(0.0~1.0)}.
+title·detail은 반드시 한국어로 쓴다. quote는 반드시 text 안에 글자 그대로 있어야 한다. 근거 없는 항목은 만들지 마.
+JSON 하나만 출력해: {"items": [...]}. 뽑을 것이 없으면 {"items": []}."""
+
+
+def groq_extract_part(payload: dict) -> dict:
+    """회의 메모 부분 하나에서 항목을 뽑는다(docs/v1.1/spec.md P1-4). {"items", "usage", "model"}.
+    LLM 키가 없으면 빈 dict(추출을 미룬다). Groq가 막히면 Cerebras로 넘기고, 모두 막히면 llm_queue.Busy.
+    model에는 "공급자:모델"을 남긴다(정답지 비교 때 어느 쪽 결과인지 구분)."""
+    if not (GROQ_API_KEY or llm_ready()):
+        return {}
+    data, usage, label = _llm_call(PART_EXTRACT_PROMPT, payload, llm_queue.BACKGROUND)
+    items = data.get("items") if isinstance(data, dict) else None
+    return {"items": items if isinstance(items, list) else [], "usage": usage, "model": label}
 
 
 def groq_extract(records: list[dict]) -> list[dict]:

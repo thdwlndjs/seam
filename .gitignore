@@ -9,3 +9,7 @@ member_profiles.json
 
 # 실제 Notion 녹화본(공개 저장소라 커밋하지 않음)
 src/server/tests/fixtures/notion_local/
+
+# 실행 로그와 추출 초안(실제 회의 내용이 들어감, 공개 저장소라 커밋하지 않음)
+devTools/*.log
+devTools/extract-draft-*.md
