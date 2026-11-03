@@ -17,5 +17,7 @@ REAL_STORE = Path(__file__).resolve().parents[2] / "worklog.sqlite3"
 os.environ["WORKLOG_STORE"] = str(TEST_STORE)
 os.environ.setdefault("BOT_SERVER_SECRET", "test-secret")
 os.environ["WORKLOG_LOOP"] = "0"
-for name in ("CEREBRAS_API_KEY",):  # 테스트는 예비 공급자를 부르지 않는다(필요한 테스트가 직접 넣는다)
-    os.environ.pop(name, None)
+# 테스트는 실제 LLM을 부르지 않는다(필요한 테스트가 patch.dict로 가짜 키를 넣는다). 지우기만 하면 서버 모듈이
+# 불러올 때 .env를 읽어 다시 채우므로(load_dotenv는 이미 있는 값만 덮어쓰지 않는다) 빈 값으로 넣어 둔다.
+for name in ("GROQ_API_KEY", "CEREBRAS_API_KEY"):
+    os.environ[name] = ""

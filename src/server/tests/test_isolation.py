@@ -18,6 +18,13 @@ class IsolationTests(unittest.TestCase):
         self.assertNotEqual(Path(worklog_bridge.WORKLOG_STORE).resolve(), isolation.REAL_STORE.resolve())
         self.assertEqual(Path(worklog_bridge.WORKLOG_STORE), isolation.TEST_STORE)
 
+    def test_tests_have_no_real_llm_keys_even_after_dotenv(self) -> None:
+        import llm_queue
+        import main  # noqa: F401  main은 불러올 때 .env를 읽는다
+
+        self.assertEqual(llm_queue.available(), [])
+        self.assertFalse(worklog_bridge.GROQ_API_KEY)
+
 
 if __name__ == "__main__":
     unittest.main()
