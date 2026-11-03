@@ -77,6 +77,13 @@ def save_page(store: Path, scope: str, page_id: str, root_id: str, path: str, la
         )
 
 
+def touch_page(store: Path, scope: str, page_id: str) -> None:
+    """바뀐 게 없어도 확인한 시각을 남긴다. 메뉴의 "(Notion 기준 MM/DD)"는 마지막으로 확인한 시각이다(spec P1-9)."""
+    db.initialize(store)
+    with db.write(store) as c:
+        c.execute("UPDATE source_pages SET checked_at = ? WHERE scope = ? AND page_id = ?", (db.now(), scope, page_id))
+
+
 # ---------------------------------------------------------------- sections
 
 

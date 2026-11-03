@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+import groq_queue
 import metrics
 import worklog
 
@@ -56,24 +57,36 @@ def record(*, scope: str, kind: str, conversation_key: str, locator: str, text: 
 
 
 # ── Groq 호출 (동기 — 분석은 별도 스레드에서 돈다) ─────────────────
-def _groq_json(system_prompt: str, payload: Any) -> Any:
+def _groq_call(system_prompt: str, payload: Any, priority: int = groq_queue.BACKGROUND,
+               model: str | None = None) -> tuple[Any, dict]:
+    """JSON 응답 한 번. 백그라운드(순위 2·3)는 먼저 대기열 한도를 확인한다(넘으면 groq_queue.Busy).
+    (응답 JSON, usage)를 돌려준다."""
+    body = json.dumps(payload, ensure_ascii=False)
+    groq_queue.check(priority, len(body) * 3 // 4 + len(system_prompt) // 2, WORKLOG_STORE)
     with httpx.Client(timeout=60) as client:
         resp = client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json={
-                "model": GROQ_MODEL,
+                "model": model or GROQ_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    {"role": "user", "content": body},
                 ],
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
             },
         )
-        metrics.count_groq(usage_of(resp))
+        usage = usage_of(resp) or {}
+        metrics.count_groq(usage)
+        groq_queue.record(WORKLOG_STORE, priority, getattr(resp, "headers", None), getattr(resp, "status_code", 200),
+                          int(usage.get("total_tokens") or 0))
         resp.raise_for_status()
-        return json.loads(resp.json()["choices"][0]["message"]["content"])
+        return json.loads(resp.json()["choices"][0]["message"]["content"]), usage
+
+
+def _groq_json(system_prompt: str, payload: Any) -> Any:
+    return _groq_call(system_prompt, payload)[0]
 
 
 def usage_of(resp: httpx.Response) -> dict | None:
@@ -155,6 +168,34 @@ def groq_classify_parts(page: dict) -> dict:
         return {}
     data = _groq_json(PART_KIND_PROMPT, page)
     return data if isinstance(data, dict) else {}
+
+
+# 추출 지시문의 판. 지시문이나 항목 구성을 바꾸면 올린다(같은 내용도 새 판으로 다시 추출된다).
+EXTRACT_PROMPT_VERSION = "part-extract-1"
+GROQ_BACKGROUND_MODEL = os.environ.get("GROQ_BACKGROUND_MODEL") or GROQ_MODEL
+
+PART_EXTRACT_PROMPT = """너는 팀 회의·멘토링 메모에서 항목을 뽑는 분석기야. 입력: path(회의 위치)와 text(메모 원문).
+뽑을 항목(kind):
+- "decision": 정한 것, 확정된 방향
+- "task": 누가 무엇을 해야 하는 일. owner(메모에 적힌 이름, 없으면 null), due(YYYY-MM-DD, 없으면 null),
+  role_hint("plan" 기획 | "design" 디자인 | "dev" 개발 | null)
+- "open": 아직 정하지 못했거나 논의가 필요한 것, 열린 질문
+- "feedback": 멘토·외부 사람이 준 조언·지적·의견
+- "insight": 고객·사용자 조사(VOC)에서 얻은 사실이나 발견
+각 항목: {"kind", "title"(한 줄, 40자 안팎), "detail"(필요하면 한두 문장, 없으면 null), "owner", "due",
+"role_hint", "quote"(근거가 된 원문을 text에서 그대로 복사한 짧은 구절), "confidence"(0.0~1.0)}.
+quote는 반드시 text 안에 글자 그대로 있어야 한다. 근거 없는 항목은 만들지 마.
+JSON 하나만 출력해: {"items": [...]}. 뽑을 것이 없으면 {"items": []}."""
+
+
+def groq_extract_part(payload: dict) -> dict:
+    """회의 메모 부분 하나에서 항목을 뽑는다(docs/v1.1/spec.md P1-4). {"items", "usage", "model"}.
+    Groq 키가 없으면 빈 dict(추출을 미룬다). 백그라운드 순위라 한도에 걸리면 groq_queue.Busy."""
+    if not GROQ_API_KEY:
+        return {}
+    data, usage = _groq_call(PART_EXTRACT_PROMPT, payload, groq_queue.BACKGROUND, GROQ_BACKGROUND_MODEL)
+    items = data.get("items") if isinstance(data, dict) else None
+    return {"items": items if isinstance(items, list) else [], "usage": usage, "model": GROQ_BACKGROUND_MODEL}
 
 
 def groq_extract(records: list[dict]) -> list[dict]:

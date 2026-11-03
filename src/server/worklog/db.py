@@ -227,6 +227,27 @@ MIGRATIONS: list[list[str]] = [
         "CREATE INDEX source_parts_page ON source_parts(page_id, position)",
         "CREATE INDEX source_parts_parent ON source_parts(parent_part_id)",
     ],
+    # 6: 부분별 추출 결과와 Groq 하루 사용량. 문서: docs/v1.1/spec.md P1-4, P1-8.
+    #    같은 내용(md 해시)·같은 프롬프트 판이면 다시 추출하지 않는다(재시작해도).
+    [
+        """CREATE TABLE part_extracts (
+            content_hash TEXT NOT NULL,      -- 부분 md(떼어 낸 뒤)의 해시
+            prompt_version TEXT NOT NULL,
+            model TEXT NOT NULL,
+            items_json TEXT NOT NULL,
+            dropped INTEGER NOT NULL DEFAULT 0,  -- 원문 인용이 맞지 않아 버린 항목 수
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (content_hash, prompt_version)
+        )""",
+        # Groq 한도는 조직(키) 단위라 팀과 상관없이 하루 합계를 센다. 백그라운드는 이 합계로 하루 몫을 지킨다.
+        """CREATE TABLE groq_usage (
+            day TEXT PRIMARY KEY,            -- UTC 날짜
+            tokens INTEGER NOT NULL,
+            background_tokens INTEGER NOT NULL
+        )""",
+    ],
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

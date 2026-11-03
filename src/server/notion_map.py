@@ -467,6 +467,7 @@ def sync(store: Path, scope: str, root_id: str, client: Client, classify: Classi
         edited = meta.get("last_edited_time")
         stored = known.get(page_id)
         if stored and stored["last_edited"] == edited:
+            wsections.touch_page(store, scope, page_id)  # 확인한 시각만 남긴다
             continue  # 아무것도 안 바뀜: 블록 목록도 읽지 않는다
         blocks = top_blocks(client, page_id)
         fresh_blocks[page_id] = blocks

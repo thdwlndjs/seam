@@ -414,3 +414,159 @@ def list_parts(store: Path, scope: str, page_id: str | None = None, include_gone
     query += " ORDER BY page_id, position, parent_part_id IS NOT NULL, path"
     with closing(db.connect(store)) as c:
         return [dict(r) for r in c.execute(query, args)]
+
+
+# ── 5. 추출 (docs/v1.1/spec.md P1-4) ────────────────────────
+
+ITEM_KINDS = {"decision", "task", "open", "feedback", "insight"}
+ROLE_HINTS = {"plan", "design", "dev"}
+EXTRACT_BUDGET_TOKENS = 4000  # [가정] 한 번에 보내는 추출 입력(추정)의 상한. 넘는 부분은 줄 단위로 나눠 보낸다
+
+PartExtractor = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+def extract_hash(part: dict) -> str:
+    """추출 키: 떼어 낸 뒤의 실제 md. (원래 md 해시인 content_hash와 다르다.)"""
+    return db.sha256(part["md"])
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_items(items: list[Any], text: str) -> tuple[list[dict[str, Any]], int]:
+    """형식이 맞고 원문 인용(quote)이 실제 text 안에 있는 항목만 남긴다. (남긴 것, 버린 수)."""
+    haystack = _squash(text)
+    kept: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict) or raw.get("kind") not in ITEM_KINDS or not str(raw.get("title") or "").strip():
+            continue
+        quote = _squash(str(raw.get("quote") or ""))
+        if not quote or quote not in haystack:
+            continue
+        try:
+            confidence = float(raw.get("confidence") if raw.get("confidence") is not None else 1)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        due = raw.get("due") if isinstance(raw.get("due"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw["due"]) else None
+        kept.append({"kind": raw["kind"], "title": _squash(str(raw["title"])), "detail": raw.get("detail") or None,
+                     "owner": raw.get("owner") or None, "due": due,
+                     "role_hint": raw.get("role_hint") if raw.get("role_hint") in ROLE_HINTS else None,
+                     "quote": quote, "confidence": confidence})
+    valid = sum(1 for raw in items if isinstance(raw, dict))
+    return kept, valid - len(kept)
+
+
+def _chunks(text: str, limit_tokens: int) -> list[str]:
+    """줄 단위로 limit_tokens(추정)를 넘지 않게 나눈다. 한 줄이 넘으면 그 줄만 따로."""
+    limit_chars = max(200, (limit_tokens - PROMPT_TOKENS) * 4 // 3)
+    out: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in text.split("\n"):
+        if current and size + len(line) + 1 > limit_chars:
+            out.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        out.append("\n".join(current))
+    return out
+
+
+def pending_extracts(store: Path, scope: str, prompt_version: str) -> list[dict[str, Any]]:
+    """추출할 회의 메모 부분(종류 meeting, 이 판의 추출이 아직 없음). 최근 수정된 것부터."""
+    db.initialize(store)
+    with closing(db.connect(store)) as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting'", (scope,))]
+        done = {r["content_hash"] for r in c.execute(
+            "SELECT content_hash FROM part_extracts WHERE prompt_version = ?", (prompt_version,))}
+    pending = [r for r in rows if extract_hash(r) not in done]
+    return sorted(pending, key=lambda r: (r["last_edited"] or "", r["page_id"] or "", -r["position"]), reverse=True)
+
+
+def pending_count(store: Path, scope: str, prompt_version: str) -> int:
+    """"n건 정리 중": 종류 판정 전인 부분 + 추출 전인 회의 메모 부분."""
+    db.initialize(store)
+    with closing(db.connect(store)) as c:
+        unjudged = c.execute("""SELECT COUNT(*) FROM source_parts WHERE scope = ? AND status = 'active' AND kind IS NULL
+                                AND parent_part_id IS NULL""", (scope,)).fetchone()[0]
+    return unjudged + len(pending_extracts(store, scope, prompt_version))
+
+
+def save_extract(store: Path, content_hash: str, prompt_version: str, model: str, items: list[dict], dropped: int,
+                 usage: dict | None) -> None:
+    usage = usage or {}
+    with db.write(store) as c:
+        c.execute("""INSERT OR REPLACE INTO part_extracts(content_hash, prompt_version, model, items_json, dropped,
+                         input_tokens, output_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (content_hash, prompt_version, model, json.dumps(items, ensure_ascii=False), dropped,
+                   usage.get("prompt_tokens"), usage.get("completion_tokens"), db.now()))
+
+
+def extract_pending(store: Path, scope: str, extract: PartExtractor | None, prompt_version: str,
+                    budget_tokens: int | None = EXTRACT_BUDGET_TOKENS) -> int:
+    """추출 전인 회의 메모 부분을 최근 것부터 추출해 저장한다. 추출한 부분 수.
+    LLM이 없거나 실패하면(한도 초과 포함) 멈추고 다음 주기에 이어 한다. 문서(document)는 추출하지 않는다."""
+    if extract is None:
+        return 0
+    done = spent = 0
+    for part in pending_extracts(store, scope, prompt_version):
+        text = md_to_text(part["md"])
+        pieces = _chunks(text, EXTRACT_BUDGET_TOKENS) if estimate_tokens(text) > EXTRACT_BUDGET_TOKENS else [text]
+        cost = sum(estimate_tokens(piece) for piece in pieces)
+        if budget_tokens is not None and spent and spent + cost > budget_tokens:
+            break
+        items: list[Any] = []
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        model = ""
+        try:
+            for piece in pieces:
+                answer = extract({"path": part["path"], "text": piece}) or {}
+                if "items" not in answer:
+                    return done  # LLM 없음: 이번에는 멈춘다
+                items += answer["items"]
+                model = answer.get("model") or model
+                for key in usage:
+                    usage[key] += int((answer.get("usage") or {}).get(key) or 0)
+        except Exception:
+            return done  # 한도 초과(429·대기열 Busy) 등: 남은 것은 다음 주기에
+        kept, dropped = clean_items(items, text)
+        save_extract(store, extract_hash(part), prompt_version, model, kept, dropped, usage)
+        spent += cost
+        done += 1
+    return done
+
+
+def meeting_items(store: Path, scope: str, prompt_version: str) -> list[dict[str, Any]]:
+    """메뉴용 항목: 회의 메모 부분들의 추출 결과를 합친다. 같은 종류·같은 제목(정규화)은 하나로 합치고
+    근거(부분 경로·인용)를 모두 남긴다. 최근 수정된 회의의 항목이 먼저."""
+    db.initialize(store)
+    with closing(db.connect(store)) as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting'", (scope,))]
+        extracts = {r["content_hash"]: json.loads(r["items_json"]) for r in c.execute(
+            "SELECT content_hash, items_json FROM part_extracts WHERE prompt_version = ?", (prompt_version,))}
+    rows.sort(key=lambda r: (r["last_edited"] or "", r["page_id"] or "", -r["position"]), reverse=True)
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        for item in extracts.get(extract_hash(row), []):
+            key = (item["kind"], db.normalize_text(item["title"]))
+            entry = merged.get(key)
+            if entry is None:
+                merged[key] = entry = dict(item, sources=[], last_edited=row["last_edited"])
+            entry["sources"].append({"part_id": row["id"], "path": row["path"], "quote": item["quote"]})
+            for field_name in ("owner", "due", "detail", "role_hint"):
+                entry[field_name] = entry.get(field_name) or item.get(field_name)
+    return list(merged.values())
+
+
+def documents(store: Path, scope: str, limit: int = 5) -> list[dict[str, Any]]:
+    """1번 메뉴의 주요 문서: 문서로 판정된 부분(한 줄 설명이 있는 것), 최근 수정된 것부터."""
+    db.initialize(store)
+    with closing(db.connect(store)) as c:
+        return [dict(r) for r in c.execute(
+            """SELECT id, page_id, path, summary, last_edited FROM source_parts
+               WHERE scope = ? AND status = 'active' AND kind = 'document' AND summary IS NOT NULL AND summary != ''
+               ORDER BY COALESCE(last_edited, '') DESC, chars DESC LIMIT ?""", (scope, limit))]
