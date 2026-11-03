@@ -20,6 +20,8 @@ from typing import Any
 
 from notion_client import Client
 
+import metrics
+
 NOTION_RATE = float(os.environ.get("NOTION_RATE", "3"))
 NOTION_BACKGROUND_RATE = float(os.environ.get("NOTION_BACKGROUND_RATE", "1"))
 NOTION_CONCURRENCY = int(os.environ.get("NOTION_CONCURRENCY", "3"))
@@ -64,6 +66,7 @@ class _Gate:
             self.background.acquire()
         self.all.acquire()
         with self.slots:
+            metrics.count_notion()
             return fn(*args, **kwargs)
 
 
@@ -109,7 +112,7 @@ def _map_parallel(fn: Callable[[dict], list[str]], items: list[dict]) -> list[li
     # 재귀 호출마다 풀이 생기므로 동시 스레드는 단계마다 곱해진다. 단계당 개수를 묶어 두고, 실제 API 호출 수는
     # 관문(_Gate)이 토큰 단위로 다시 묶는다. 관문은 API 호출 순간만 잡으므로 재귀 대기와 얽혀 막히지 않는다.
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(items), PARALLEL_READS)) as pool:
-        return list(pool.map(fn, items))
+        return list(pool.map(metrics.in_context(fn), items))
 
 
 def _list_child_blocks(block_id: str, notion_client: Client) -> list[dict]:

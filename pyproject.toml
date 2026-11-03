@@ -1,7 +1,7 @@
 [project]
 name = "echo-bot"
 version = "0.1.0"
-description = "A Microsoft Teams echo bot"
+description = "PM bot for Microsoft Teams: answers from the team's Notion and GitHub"
 authors = [{ name = "Your Name", email = "you@example.com" }]
 readme = "README.md"
 requires-python = ">=3.12"
@@ -9,7 +9,11 @@ requires-python = ">=3.12"
 dependencies = [
   "python-dotenv>=1.0.0",
   "microsoft-teams-apps",
-  "notion-client>=2.3.0"
+  "notion-client>=2.3.0",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "httpx>=0.27",
+  "pydantic>=2.6",
 ]
 
 [dependency-groups]
@@ -17,8 +21,9 @@ dev = [
     "pyright>=1.1.406",
 ]
 
+# 실행은 스크립트 대신 README의 명령으로 한다: 서버 `src/server/main.py`, 봇 `src/bot/main.py`.
+# (예전 `start = "src.main:main"`은 bot/server로 나뉘기 전의 src/main.py를 가리켰다.)
 [project.scripts]
-start = "src.main:main"
 typecheck = "pyright.cli:entrypoint"
 
 [build-system]

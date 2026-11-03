@@ -51,8 +51,10 @@ from pydantic import BaseModel
 # NOTION_RATE 등)를 읽어 두기 때문에, 순서가 바뀌면 .env 값이 그쪽에 전달되지 않는다.
 load_dotenv(os.environ.get("ENV_FILE"))
 
+import metrics  # noqa: E402
 import notion_map  # noqa: E402
 import worklog_bridge  # noqa: E402
+from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
 # ── 설정 ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -434,9 +436,8 @@ async def handle_turn(turn: Turn) -> None:
     raw_text = turn.req.text.strip()
     aad_id = turn.aad_id
 
-    if _is_team_record(aad_id, raw_text):
-        await asyncio.to_thread(_record_turn_text, turn, raw_text)
-
+    # 채팅 메시지는 저장하지 않는다. 예전엔 메뉴가 아닌 메시지를 몰래 저장해 변경 후보를 만들었다(v1.1에서 없앰,
+    # docs/v1.1/spec.md P1-0). 회의록은 Notion이나 '회의록 올리기'로만 받는다.
     if raw_text.lower() in _CANCEL_TRIGGERS and _cancel_pending_sessions(aad_id):
         await turn.send("취소했어요. 처음부터 다시 하려면 원하는 메뉴나 '설정'을 입력해주세요.")
         return
@@ -462,38 +463,6 @@ async def handle_turn(turn: Turn) -> None:
         return
 
     await _run_action(turn, raw_text)
-
-
-def _is_team_record(aad_id: str, raw_text: str) -> bool:
-    """팀 기록으로 남길 메시지인지. 메뉴 명령·인사, 그리고 토큰이 오갈 수 있는 설정/온보딩 답은 남기지 않는다."""
-    if not raw_text or aad_id in setup_sessions or aad_id in github_onboarding_sessions:
-        return False
-    lowered = raw_text.lower()
-    return not (
-        lowered in _CANCEL_TRIGGERS
-        or raw_text in ("설정", "0")
-        or re.fullmatch(r"[1-4]", raw_text)
-        or _GREETING_RE.fullmatch(raw_text)
-    )
-
-
-def _record_turn_text(turn: Turn, raw_text: str) -> None:
-    req = turn.req
-    conversation_id = req.conversation.id if req.conversation else turn.team_key
-    message_ref = req.message_id or db_safe_hash(f"{turn.aad_id}|{req.sent_at}|{raw_text}")
-    worklog_bridge.record(
-        scope=turn.team_key,
-        kind="teams_message",
-        conversation_key=f"teams:{conversation_id}",
-        locator=f"teams:{conversation_id}:{message_ref}",
-        text=raw_text,
-        author=turn.user_name or turn.aad_id,
-        sent_at=req.sent_at,
-    )
-
-
-def db_safe_hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
 def _cancel_pending_sessions(aad_id: str) -> bool:
@@ -591,6 +560,12 @@ async def _handle_setup_message(turn: Turn, raw_text: str) -> None:
 
 # ── 메뉴 실행 ────────────────────────────────────────
 async def _run_action(turn: Turn, raw_text: str) -> None:
+    # 메뉴 응답 한 번 = metric 한 줄(Notion·Groq 호출 수, 걸린 시간). 문서: docs/v1.1/spec.md "계측"
+    with metrics.measure("menu", turn.team_key, raw_text):
+        await _run_menu(turn, raw_text)
+
+
+async def _run_menu(turn: Turn, raw_text: str) -> None:
     config = _get_config(turn.team_key)
     if config is None:
         await turn.send(_NO_CONFIG_TEXT)
@@ -820,18 +795,26 @@ async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None]
                     "stream": True,
                 },
             ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    payload = line[len("data: "):].strip()
-                    if payload == "[DONE]":
-                        break
-                    delta = json.loads(payload)["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        full_text += delta
-                        if on_chunk:
-                            on_chunk(delta)
+                usage: dict | None = None
+                try:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        payload = line[len("data: "):].strip()
+                        if payload == "[DONE]":
+                            break
+                        event = json.loads(payload)
+                        # Groq는 스트림 마지막 조각의 x_groq.usage에 토큰 수를 싣는다.
+                        usage = (event.get("x_groq") or {}).get("usage") or event.get("usage") or usage
+                        choices = event.get("choices") or [{}]
+                        delta = (choices[0].get("delta") or {}).get("content", "")
+                        if delta:
+                            full_text += delta
+                            if on_chunk:
+                                on_chunk(delta)
+                finally:
+                    metrics.count_groq(usage)
         return full_text.strip() or None
     except Exception:
         traceback.print_exc()
@@ -1013,6 +996,7 @@ async def _classify_meeting_notes(note_lines: list[str], cache_key: str) -> dict
                     "temperature": 0.2,
                 },
             )
+            metrics.count_groq(_usage_of(resp))
             resp.raise_for_status()
             summary_text = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception:
@@ -1091,10 +1075,12 @@ async def _worklog_loop() -> None:
     last_collect = 0.0
     while True:
         try:
+            # 1시간 분석(analyze_due → 변경 후보)은 돌리지 않는다(v1.1, docs/v1.1/spec.md P1-0).
+            # 회의록 정리는 Phase 1부터 부분별 추출로 바뀐다. 지금은 Notion 지도 동기화만 한다.
             if time.monotonic() - last_collect >= worklog_bridge.NOTION_COLLECT_SECONDS:
                 last_collect = time.monotonic()
-                await asyncio.to_thread(_sync_notion_maps)
-            await asyncio.to_thread(worklog_bridge.analyze_due)
+                with metrics.measure("background"):
+                    await asyncio.to_thread(_sync_notion_maps)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(worklog_bridge.ANALYZE_TICK_SECONDS)

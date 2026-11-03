@@ -1,0 +1,2 @@
+# Notion fixture는 실제 응답과 같은 LF 줄바꿈을 유지한다
+src/server/tests/fixtures/** text eol=lf

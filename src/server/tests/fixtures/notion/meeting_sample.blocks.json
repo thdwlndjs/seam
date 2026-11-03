@@ -1,0 +1,21 @@
+[
+ {"id": "blk-00", "type": "numbered_list_item", "has_children": true, "text": "화분 관리기"},
+ {"id": "blk-01", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "blk-02", "type": "numbered_list_item", "has_children": true, "text": "스마트 책장"},
+ {"id": "blk-03", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "blk-04", "type": "numbered_list_item", "has_children": true, "text": "배낭"},
+ {"id": "blk-05", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "blk-06", "type": "numbered_list_item", "has_children": true, "text": "정기 배송 Agent(긍정적)"},
+ {"id": "blk-07", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "blk-08", "type": "numbered_list_item", "has_children": true, "text": "음성 비서"},
+ {"id": "blk-09", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "blk-10", "type": "divider", "has_children": false, "text": ""},
+ {"id": "blk-11", "type": "paragraph", "has_children": false, "text": "→ 정기 배송 쪽으로 가면 비즈니스적으로 설명하기는 좋을듯"},
+ {"id": "blk-12", "type": "paragraph", "has_children": false, "text": "→ 스마트 책장"},
+ {"id": "blk-13", "type": "paragraph", "has_children": false, "text": "→ 식상한거 하지말고 흥미를 끌만한 주제로"},
+ {"id": "blk-14", "type": "paragraph", "has_children": true, "text": "→ 어느정도까지 구현? "},
+ {"id": "blk-15", "type": "paragraph", "has_children": false, "text": "[녹음 노트 공유]"},
+ {"id": "blk-16", "type": "paragraph", "has_children": false, "text": "새로운 노트\nhttps://example.com/s/sample"},
+ {"id": "blk-17", "type": "paragraph", "has_children": false, "text": ""},
+ {"id": "blk-18", "type": "paragraph", "has_children": false, "text": ""}
+]
