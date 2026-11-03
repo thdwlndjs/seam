@@ -1,8 +1,8 @@
 """서버 ↔ worklog(같은 폴더의 패키지) 연결.
 
-- 원문 저장: Teams 메시지와 Notion 회의록 행을 받는 즉시 worklog 저장소에 넣는다.
-- 분석: 주기적으로 분석 정책(Teams 60분 유휴 / Notion 수정 후 2시간 / 20개·3,000토큰)에 걸린 묶음을 Groq로 분석한다.
-  결과는 변경 후보로만 저장되고, Task·Decision 반영은 사람이 `python -m worklog approve`로 승인해야 한다.
+- 원문 저장: Notion 회의록 행을 worklog 저장소에 넣는다. Teams 채팅 메시지는 v1.1부터 저장하지 않는다.
+- 분석(`analyze_due`): 분석 정책에 걸린 묶음을 Groq로 분석해 변경 후보로 저장하는 예전 경로다. v1.1부터 서버 루프에서
+  부르지 않고, Phase 3에서 미리보기 확인 반영으로 바뀐다(docs/v1.1/spec.md P1-0).
 
 Notion·GitHub 데이터는 읽기만 하고 절대 바꾸지 않는다.
 """

@@ -436,9 +436,8 @@ async def handle_turn(turn: Turn) -> None:
     raw_text = turn.req.text.strip()
     aad_id = turn.aad_id
 
-    if _is_team_record(aad_id, raw_text):
-        await asyncio.to_thread(_record_turn_text, turn, raw_text)
-
+    # 채팅 메시지는 저장하지 않는다. 예전엔 메뉴가 아닌 메시지를 몰래 저장해 변경 후보를 만들었다(v1.1에서 없앰,
+    # docs/v1.1/spec.md P1-0). 회의록은 Notion이나 '회의록 올리기'로만 받는다.
     if raw_text.lower() in _CANCEL_TRIGGERS and _cancel_pending_sessions(aad_id):
         await turn.send("취소했어요. 처음부터 다시 하려면 원하는 메뉴나 '설정'을 입력해주세요.")
         return
@@ -464,38 +463,6 @@ async def handle_turn(turn: Turn) -> None:
         return
 
     await _run_action(turn, raw_text)
-
-
-def _is_team_record(aad_id: str, raw_text: str) -> bool:
-    """팀 기록으로 남길 메시지인지. 메뉴 명령·인사, 그리고 토큰이 오갈 수 있는 설정/온보딩 답은 남기지 않는다."""
-    if not raw_text or aad_id in setup_sessions or aad_id in github_onboarding_sessions:
-        return False
-    lowered = raw_text.lower()
-    return not (
-        lowered in _CANCEL_TRIGGERS
-        or raw_text in ("설정", "0")
-        or re.fullmatch(r"[1-4]", raw_text)
-        or _GREETING_RE.fullmatch(raw_text)
-    )
-
-
-def _record_turn_text(turn: Turn, raw_text: str) -> None:
-    req = turn.req
-    conversation_id = req.conversation.id if req.conversation else turn.team_key
-    message_ref = req.message_id or db_safe_hash(f"{turn.aad_id}|{req.sent_at}|{raw_text}")
-    worklog_bridge.record(
-        scope=turn.team_key,
-        kind="teams_message",
-        conversation_key=f"teams:{conversation_id}",
-        locator=f"teams:{conversation_id}:{message_ref}",
-        text=raw_text,
-        author=turn.user_name or turn.aad_id,
-        sent_at=req.sent_at,
-    )
-
-
-def db_safe_hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
 def _cancel_pending_sessions(aad_id: str) -> bool:
@@ -1108,11 +1075,12 @@ async def _worklog_loop() -> None:
     last_collect = 0.0
     while True:
         try:
-            with metrics.measure("background"):
-                if time.monotonic() - last_collect >= worklog_bridge.NOTION_COLLECT_SECONDS:
-                    last_collect = time.monotonic()
+            # 1시간 분석(analyze_due → 변경 후보)은 돌리지 않는다(v1.1, docs/v1.1/spec.md P1-0).
+            # 회의록 정리는 Phase 1부터 부분별 추출로 바뀐다. 지금은 Notion 지도 동기화만 한다.
+            if time.monotonic() - last_collect >= worklog_bridge.NOTION_COLLECT_SECONDS:
+                last_collect = time.monotonic()
+                with metrics.measure("background"):
                     await asyncio.to_thread(_sync_notion_maps)
-                await asyncio.to_thread(worklog_bridge.analyze_due)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(worklog_bridge.ANALYZE_TICK_SECONDS)

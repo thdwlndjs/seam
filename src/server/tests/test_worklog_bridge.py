@@ -63,11 +63,25 @@ class BridgeTests(unittest.TestCase):
         with closing(sqlite3.connect(self.store)) as c:
             return c.execute("SELECT locator, content FROM sources ORDER BY rowid").fetchall()
 
-    def test_free_text_is_stored_once_and_the_reply_is_unchanged(self) -> None:
+    def test_free_text_is_not_stored_and_the_reply_is_unchanged(self) -> None:
+        # A33: 메뉴가 아닌 채팅을 몰래 저장하던 기능은 v1.1에서 없앴다(docs/v1.1/spec.md P1-0).
         reply = self.post(turn("배포는 금요일로 확정했습니다", "m1"))
         self.assertIn("올바른 값을 입력하세요", reply)  # 기존 동작 그대로
-        self.post(turn("배포는 금요일로 확정했습니다", "m1"))  # 재전송
-        self.assertEqual(self.sources(), [("teams:C1:m1", "배포는 금요일로 확정했습니다")])
+        self.assertEqual(self.sources(), [])
+
+    def test_background_loop_does_not_run_batch_analysis(self) -> None:
+        # A34: 1시간 분석(analyze_due)은 돌리지 않는다. Notion 지도 동기화는 그대로 돈다.
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        sleeps = AsyncMock(side_effect=[None, None, asyncio.CancelledError()])
+        analyze, sync = MagicMock(return_value=[]), MagicMock(return_value={})
+        with patch.object(main.asyncio, "sleep", sleeps), patch.object(worklog_bridge, "analyze_due", analyze), \
+                patch.object(main, "_sync_notion_maps", sync):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(main._worklog_loop())
+        sync.assert_called()
+        analyze.assert_not_called()
 
     def test_commands_and_setup_answers_are_never_stored(self) -> None:
         for i, text in enumerate(["1", "설정", "hi", "취소"]):
@@ -79,7 +93,10 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.sources(), [])
 
     def test_recorded_messages_flow_to_candidates_without_changing_state(self) -> None:
-        self.post(turn("인증은 OAuth로 가기로 결정, 로그인 화면 #4와 토큰 갱신 #5에 영향", "m2"))
+        # 후보 경로는 Phase 3에서 없앤다. 그때까지는 원문을 직접 넣어 이 경로를 확인한다.
+        worklog_bridge.record(scope="team:T1", kind="teams_message", conversation_key="teams:C1",
+                              locator="teams:C1:m2", text="인증은 OAuth로 가기로 결정, 로그인 화면 #4와 토큰 갱신 #5에 영향",
+                              author="김팀원", sent_at="2026-11-02T01:00:00Z")
 
         def fake_groq(system_prompt, payload):
             if system_prompt is worklog_bridge.EXTRACT_PROMPT:
