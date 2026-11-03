@@ -17,5 +17,6 @@
  {"id": "tp-15", "type": "heading_3", "has_children": false, "text": "팀원별 진행상황 기록"},
  {"id": "tp-16", "type": "table", "has_children": true, "text": ""},
  {"id": "tp-17", "type": "paragraph", "has_children": false, "text": " [녹음 노트 공유]"},
- {"id": "tp-18", "type": "paragraph", "has_children": false, "text": ""}
+ {"id": "tp-18", "type": "toggle", "has_children": true, "text": "팀원A 메모"},
+ {"id": "tp-19", "type": "paragraph", "has_children": false, "text": ""}
 ]

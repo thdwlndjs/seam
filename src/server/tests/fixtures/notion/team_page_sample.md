@@ -27,4 +27,12 @@
 </tr>
 </table>
  \[녹음 노트 공유\]
+<details>
+<summary>팀원A 메모</summary>
+	화면 흐름 초안
+	```
+[SCENE 1: 아침 준비] ➔ [SCENE 2: 선택]
+두 번째 줄도 들여쓰기 없이 나온다
+```
+</details>
 <empty-block/>

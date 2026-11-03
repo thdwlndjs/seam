@@ -44,7 +44,7 @@ class RawBlock:
 
 def top_level_blocks(md: str) -> list[RawBlock]:
     blocks: list[RawBlock] = []
-    in_table = False
+    in_table = in_code = False
     # splitlines()는   같은 문자에서도 끊으므로 쓰지 않는다.
     for line in md.replace("\r\n", "\n").split("\n"):
         stripped = line.strip()
@@ -52,11 +52,18 @@ def top_level_blocks(md: str) -> list[RawBlock]:
             blocks[-1].lines.append(line)
             in_table = not stripped.startswith("</table")
             continue
-        if line and not line.startswith("\t") and not stripped.startswith("</"):
+        if in_code:  # 코드 블록 안의 둘째 줄부터는 들여쓰기가 없어도 그 코드 블록에 속한다
+            blocks[-1].lines.append(line)
+            in_code = not stripped.startswith("```")
+            continue
+        # 최상위 토글은 `<details>`와 `<summary>…</summary>`가 둘 다 들여쓰기 없이 나온다. 둘이 한 블록이다.
+        toggle_title = stripped.startswith("<summary") and bool(blocks) and blocks[-1].lines[-1].strip() == "<details>"
+        if line and not line.startswith("\t") and not stripped.startswith("</") and not toggle_title:
             blocks.append(RawBlock(len(blocks), [line]))
         elif blocks:
             blocks[-1].lines.append(line)
         in_table = stripped.startswith("<table") and "</table" not in stripped and bool(blocks)
+        in_code = stripped.startswith("```") and stripped.count("```") == 1 and bool(blocks)
     for block in blocks:  # 블록 사이의 빈 줄은 앞 블록 끝에 붙는다. 내용에 넣지 않는다.
         while len(block.lines) > 1 and not block.lines[-1].strip():
             block.lines.pop()
@@ -116,8 +123,15 @@ def group_parts(blocks: list[RawBlock]) -> list[RawPart]:
             groups.append(current)
         else:
             current.append(block)
-    return [RawPart(i, plain_title(g[0].first), "\n".join(line for b in g for line in b.lines), [b.position for b in g])
+    return [RawPart(i, _block_title(g[0]), "\n".join(line for b in g for line in b.lines), [b.position for b in g])
             for i, g in enumerate(groups)]
+
+
+def _block_title(block: RawBlock) -> str:
+    """토글 블록이면 <summary>의 글자, 아니면 첫 줄."""
+    if block.first.strip() == "<details>" and len(block.lines) > 1:
+        return plain_title(block.lines[1])
+    return plain_title(block.first)
 
 
 # ── 3. 블록 대조 ────────────────────────────────────────────
@@ -274,7 +288,7 @@ def judge_pending(store: Path, scope: str, classify: PartClassifier | None) -> i
         try:
             answer = classify({"page_path": page_rows[0]["path"].rsplit(" > ", 1)[0], "parts": items}) or {}
         except Exception:
-            continue
+            break  # 한도 초과(429) 등: 이번 동기화에서는 멈추고 남은 페이지는 다음 동기화에서 판정한다
         by_id = {a.get("part_id"): a for a in answer.get("parts", []) if isinstance(a, dict)}
         with db.write(store) as c:
             for row in page_rows:

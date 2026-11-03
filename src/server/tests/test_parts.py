@@ -142,6 +142,20 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(parts.judge_pending(other, SCOPE, None), 0)  # LLM이 없으면 판정을 미룬다
         self.assertTrue(all(p["kind"] is None for p in parts.list_parts(other, SCOPE)))
 
+    def test_a_failed_judgment_stops_this_round_and_retries_next_time(self) -> None:
+        for unit in ("unit-1", "unit-2"):
+            built = parts.build_unit_parts(unit, f"회의록 > {unit}", SAMPLE_MD, SAMPLE_BLOCKS)
+            parts.save_unit_parts(self.store, SCOPE, "notion", unit, "sec-1", built)
+        calls = []
+
+        def rate_limited(page: dict) -> dict:
+            calls.append(page["page_path"])
+            raise RuntimeError("429 Too Many Requests")
+
+        self.assertEqual(parts.judge_pending(self.store, SCOPE, rate_limited), 0)
+        self.assertEqual(len(calls), 1)  # 한도에 걸리면 다음 페이지를 바로 부르지 않는다
+        self.assertEqual(parts.judge_pending(self.store, SCOPE, split_classifier()), 12)  # 다음 번에 두 페이지 6개씩 판정
+
     def test_parts_that_disappear_are_marked_gone(self) -> None:
         self.collect()
         shorter = SAMPLE_MD.split("1. 음성 비서")[0] + "<empty-block/>\n"
