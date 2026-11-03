@@ -160,6 +160,18 @@ def record(store: Path, provider: str, priority: int, headers: Mapping[str, str]
         if status_code == 429:
             wait = float(headers.get("retry-after") or 0) or parse_duration(headers.get("x-ratelimit-reset-tokens")) or 60.0
             _minute[provider] = {"remaining": 0, "reset_at": now + wait}
+        elif "x-ratelimit-remaining-tokens-minute" in headers:
+            # Cerebras: 분·시간·하루 남은 양을 따로 준다(리셋 시각은 없음). 분 단위는 길어야 1분 뒤 풀린다.
+            try:
+                minute_left = float(headers["x-ratelimit-remaining-tokens-minute"])
+                requests_left = [float(headers[h]) for h in ("x-ratelimit-remaining-requests-minute",
+                                                             "x-ratelimit-remaining-requests-hour",
+                                                             "x-ratelimit-remaining-requests-day") if h in headers]
+            except ValueError:
+                minute_left, requests_left = None, []
+            hour_or_day_out = any(left <= 0 for left in requests_left[1:])
+            _minute[provider] = {"remaining": 0 if hour_or_day_out or (requests_left and requests_left[0] <= 0) else minute_left,
+                                 "reset_at": now + (3600 if hour_or_day_out else 60)}
         elif "x-ratelimit-remaining-tokens" in headers:
             try:
                 remaining = float(headers["x-ratelimit-remaining-tokens"])

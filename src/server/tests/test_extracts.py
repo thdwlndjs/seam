@@ -188,6 +188,20 @@ class QueueTests(unittest.TestCase):  # A21
             llm_queue.check(self.CEREBRAS, llm_queue.BACKGROUND, 100, self.store)
         self.assertEqual((busy.exception.reason, busy.exception.provider), ("minute", "cerebras"))
 
+    def test_cerebras_headers_are_read(self) -> None:
+        headers = {"x-ratelimit-remaining-tokens-minute": "800", "x-ratelimit-remaining-requests-minute": "3",
+                   "x-ratelimit-remaining-requests-hour": "149", "x-ratelimit-remaining-requests-day": "2399"}
+        llm_queue.record(self.store, "cerebras", llm_queue.BACKGROUND, headers, 200, 100)
+        llm_queue.check(self.CEREBRAS, llm_queue.BACKGROUND, 700, self.store)
+        with self.assertRaises(llm_queue.Busy):
+            llm_queue.check(self.CEREBRAS, llm_queue.BACKGROUND, 900, self.store)  # 분당 남은 토큰보다 큼
+        llm_queue.reset_for_tests()
+        headers["x-ratelimit-remaining-requests-hour"] = "0"  # 시간당 요청을 다 씀: 한 시간 쉰다
+        llm_queue.record(self.store, "cerebras", llm_queue.BACKGROUND, headers, 200, 100)
+        with self.assertRaises(llm_queue.Busy) as busy:
+            llm_queue.check(self.CEREBRAS, llm_queue.BACKGROUND, 10, self.store)
+        self.assertGreater(busy.exception.wait_seconds, 3000)
+
     def test_background_falls_back_to_cerebras_when_groq_is_used_up(self) -> None:
         calls: list[str] = []
 
