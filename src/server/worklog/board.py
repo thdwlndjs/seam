@@ -115,10 +115,7 @@ def snapshot(store: Path, scope: str, now: datetime | None = None) -> dict[str, 
         s = sources[part_id]
         pages.setdefault(s["page_id"] or part_id, {"page_id": s["page_id"] or part_id, "title": s["title"], "date": s["date"]})
     found = stages.board(store, scope)
-    # 단계 상세에서 강조할 단계: 확정된 단계, 없으면 단계 질문 카드가 묻는 후보(회의록이 앞서 있으면 그 단계)
-    seen = stages.assessment(store, scope) or {}
-    ahead = (seen.get("discussing") or {}).get("stage")
-    candidate = found["stage"] or (ahead if ahead in stages.ORDER else None) or found["shown"]
+    candidate = found["candidate"]  # 확정 > AI 추정(논의 중) > 게이트 기준: 메뉴 2·단계 카드와 같은 값
     return {"items": items, "changes": changes, "kinds": KINDS,
             "sources": sorted(pages.values(), key=lambda p: (p["date"] or "", p["title"])),
             "members": [m["display_name"] for m in people.team(store, scope) if m.get("display_name")],

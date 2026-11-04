@@ -1370,7 +1370,7 @@ async def fetch_team_status(config: dict, team_key: str,
         pending_hint.append(f"⏳ 회의록 {stored['pending']}건 정리 중")
 
     shown_any = confirmed or undecided or stored["decisions"] or stored["feedback"] or stored["discussion"]
-    if not shown_any and not stored["board"]["shown"]:
+    if not shown_any and not stored["board"]["candidate"]:
         header = "👥 팀 진행상황 (아직 확인된 회의록이 없어요, 원문)"
         text = header + "\n" + "\n".join(f"- {_brief(t)}" for t in note_lines[-10:])
         return "\n".join([text] + unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer), unassigned_open
@@ -1381,14 +1381,13 @@ async def fetch_team_status(config: dict, team_key: str,
     # 6개 분류(spec P2-7): 현재 단계 / 확정된 흐름 / 지금 진행 중 / 이전 단계에서 남은 것 / 추가 논의 필요 / 천천히 정해도 되는 것
     board = stored["board"]
     result = ["👥 팀 진행상황 (회의록 기준)"]
-    if board["shown"]:
-        state = "" if board["approved"] else " (제안, 권한자 승인 전)"
-        met = f" · 끝낸 것: {', '.join(g['text'] for g in board['met'])}" if board["met"] else ""
-        result += ["", f"🧭 현재 단계: {wstages.label(board['shown'])}{state}{met}"]
+    if board["candidate"]:  # 확정 단계, 없으면 AI 추정(단계 카드·탭과 같은 기준). 게이트 문장은 여기서 보이지 않는다
+        stage_line = (f"확정 {wstages.label(board['stage'])}" if board["approved"]
+                      else f"AI 추정 {wstages.label(board['candidate'])} (확정 전)")
+        result += ["", f"🧭 현재 단계: {stage_line}"]
     if stored["decisions"]:
         result += ["", "📌 확정된 흐름", *[f"- {t}" for t in stored["decisions"]]]
-    doing = [f"- 정할 것: {g['text']}" for g in board["doing"]]
-    doing += [f"- ✅ {t}" for t in tasks["done"]] + [f"- 🔨 {t} (커밋 있음)" for t in tasks["in_progress"]]
+    doing = [f"- ✅ {t}" for t in tasks["done"]] + [f"- 🔨 {t} (커밋 있음)" for t in tasks["in_progress"]]
     doing += [f"- 📋 {t} (이슈만 등록)" for t in tasks["not_started"]] + [f"- 🆕 {t} (이슈 미등록)" for t in tasks["unlinked"]]
     if doing:
         result += ["", "🔨 지금 진행 중", *doing]

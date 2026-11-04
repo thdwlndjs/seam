@@ -73,8 +73,9 @@ class StageTests(unittest.TestCase):
         self.assertIn("1-2 방향 확정", found[0]["text"])
         stages.answer(self.store, SCOPE, "stage_init", found[0]["key"], "start_here", "관리자")
         self.assertEqual(stages.current(self.store, SCOPE), "1-2")
-        missing = [p["gate_id"] for p in stages.proposals(self.store, SCOPE) if p["kind"] == "gate_missing"]
-        self.assertEqual(missing, ["core_problem", "topic_decided"])
+        # 단계를 정한 직후 비어 있는 게이트를 묻지 않는다(게이트 판정은 자동, 상태는 메뉴·탭에서 본다)
+        self.assertEqual(stages.proposals(self.store, SCOPE), [])
+        self.assertEqual({g["gate_id"] for g in stages.board(self.store, SCOPE)["doing"]}, {"core_problem", "topic_decided"})
         payload = self.judge.calls[0]
         self.assertEqual({i["id"] for i in payload["items"]}, {"i-cand-1", "i-cand-2", "i-fb-1"})
         self.assertNotIn("backlog", {g["gate_id"] for g in payload["gates"]})  # 코드로 보는 게이트는 LLM에 안 보낸다
@@ -113,35 +114,34 @@ class StageTests(unittest.TestCase):
         history = stages._row(self.store, SCOPE)["history"]
         self.assertEqual([(h["to"], h["by"]) for h in history], [("1-2", "관리자")])
 
-    def test_an_answered_question_is_not_asked_again_until_the_gate_changes(self) -> None:  # A16
+    def test_an_answered_question_is_not_asked_again_until_the_evidence_changes(self) -> None:  # A16
         stages.assess(self.store, SCOPE, {}, self.judge)
         stages.answer(self.store, SCOPE, "stage_init", stages.proposals(self.store, SCOPE)[0]["key"], "start_here", "관리자")
-        topic = next(p for p in stages.proposals(self.store, SCOPE) if p.get("gate_id") == "topic_decided")
-        stages.answer(self.store, SCOPE, "gate_missing", topic["key"], "decide", "관리자")
-        self.assertNotIn("topic_decided", [p.get("gate_id") for p in stages.proposals(self.store, SCOPE)])
+        all_met = ScriptedJudge({g["gate_id"]: {"met": True, "evidence": ["i-cand-1"]} for g in stages.gates(self.store, SCOPE)})
+        stages.assess(self.store, SCOPE, {"open_issues": 1, "milestones": 1, "closed_issues": 1}, all_met, force=True)
+        advance = next(p for p in stages.proposals(self.store, SCOPE) if p["kind"] == "stage_advance")
+        stages.answer(self.store, SCOPE, "stage_advance", advance["key"], "stay", "관리자")
+        self.assertEqual([p["kind"] for p in stages.proposals(self.store, SCOPE)], [])
         with self.assertRaises(db.ConflictError):
-            stages.answer(self.store, SCOPE, "gate_missing", topic["key"], "decide", "관리자")
-        # 근거가 바뀌면(새 항목이 다른 판정을 낳으면) 새 질문으로 본다
-        add_item(self.store, "i-half", "open", "주제 확정 투표 일정")
-        self.judge.gates["topic_decided"] = {"met": False, "evidence": ["i-half"]}
-        stages.assess(self.store, SCOPE, {}, self.judge)
-        self.assertIn("topic_decided", [p.get("gate_id") for p in stages.proposals(self.store, SCOPE)])
+            stages.answer(self.store, SCOPE, "stage_advance", advance["key"], "stay", "관리자")
+        # 근거가 바뀌면(다른 항목이 충족 근거가 되면) 새 질문으로 본다
+        add_item(self.store, "i-more", "decision", "주제는 공유 우산 대여로 확정")
+        changed = ScriptedJudge({g["gate_id"]: {"met": True, "evidence": ["i-more"]} for g in stages.gates(self.store, SCOPE)})
+        stages.assess(self.store, SCOPE, {"open_issues": 1, "milestones": 1, "closed_issues": 1}, changed, force=True)
+        self.assertEqual([p["kind"] for p in stages.proposals(self.store, SCOPE)], ["stage_advance"])
 
-    def test_discussing_ahead_asks_about_skipped_gates_and_skip_removes_them(self) -> None:
+    def test_choosing_a_later_stage_asks_no_gate_questions_and_keeps_stored_later_gates(self) -> None:
         add_item(self.store, "i-voc-plan", "decision", "대학생 10명 인터뷰로 검증")
         judge = ScriptedJudge(self.judge.gates, discussing={"stage": "2-1", "evidence": ["i-voc-plan"]})
         stages.assess(self.store, SCOPE, {}, judge)
         key = stages.proposals(self.store, SCOPE)[0]["key"]
         stages.answer(self.store, SCOPE, "stage_init", key, "not_ahead", "관리자")
-        stages.answer(self.store, SCOPE, "stage_init", key, "choose", "관리자", "1-2")  # 직접 선택: 1-2
-        ahead = [p for p in stages.proposals(self.store, SCOPE) if p["kind"] == "skipped_ahead"]
-        self.assertEqual({p["gate_id"] for p in ahead}, {"assumptions", "target_customer"})  # 1-3 단계의 빈 게이트
-        target = next(p for p in ahead if p["gate_id"] == "target_customer")
-        self.assertIn("건너뛰었어요", stages.answer(self.store, SCOPE, "skipped_ahead", target["key"], "skip", "관리자"))
-        self.assertEqual({g["gate_id"]: g["state"] for g in stages.gates(self.store, SCOPE, "1-3")}["target_customer"], "skipped")
-        later = next(p for p in stages.proposals(self.store, SCOPE) if p.get("gate_id") == "assumptions")
-        stages.answer(self.store, SCOPE, "skipped_ahead", later["key"], "later", "관리자")
-        self.assertEqual([g["gate_id"] for g in stages.board(self.store, SCOPE)["earlier"]], [])  # 1-3은 현재(1-2)보다 뒤
+        stages.answer(self.store, SCOPE, "stage_init", key, "choose", "관리자", "2-1")
+        # 앞 단계의 빈 게이트도, 현재 단계의 빈 게이트도 질문으로 묻지 않는다
+        self.assertEqual(stages.proposals(self.store, SCOPE), [])
+        # 예전에 "나중에"로 저장된 상태는 그대로 보인다(이전 단계에서 남은 것)
+        stages.set_gate_state(self.store, SCOPE, "1-3", "assumptions", "later", "관리자")
+        self.assertEqual([g["gate_id"] for g in stages.board(self.store, SCOPE)["earlier"]], ["assumptions"])
 
     def test_first_proposal_offers_the_discussed_stage_when_it_is_ahead(self) -> None:
         add_item(self.store, "i-voc-run", "insight", "커뮤니티 VOC에서 우산 분실 고민 반복")
@@ -152,11 +152,8 @@ class StageTests(unittest.TestCase):
         self.assertEqual([a for a, _ in init["answers"]], ["start_discussing", "not_ahead"])  # 질문 하나, 답은 맞아요/아니요
         stages.answer(self.store, SCOPE, "stage_init", init["key"], "start_discussing", "관리자")
         self.assertEqual(stages.current(self.store, SCOPE), "2-2")
-        behind = {p["gate_id"] for p in stages.proposals(self.store, SCOPE) if p["kind"] == "skipped_ahead"}
-        # 건너뛴 앞 단계의 빈 게이트를 묻는다(후보 주제는 충족이라 빠진다)
-        self.assertEqual(behind, {"topic_decided", "core_problem", "assumptions", "target_customer", "voc_method"})
-        missing = {p["gate_id"] for p in stages.proposals(self.store, SCOPE) if p["kind"] == "gate_missing"}
-        self.assertEqual(missing, set())  # 2-2의 게이트(VOC 수집)는 insight로 충족
+        # 확정 뒤에는 게이트 질문이 없고, 이 단계의 사안이 충족됐으니 단계 넘기기만 묻는다
+        self.assertEqual([p["kind"] for p in stages.proposals(self.store, SCOPE)], ["stage_advance"])
 
     def test_no_opens_the_chooser_and_choosing_saves_once(self) -> None:
         add_item(self.store, "i-voc-run", "insight", "커뮤니티 VOC에서 우산 분실 고민 반복")
@@ -188,6 +185,17 @@ class StageTests(unittest.TestCase):
         init = stages.proposals(self.store, SCOPE)[0]
         self.assertEqual(stages.answer(self.store, SCOPE, "stage_init", init["key"], "start_discussing", "관리자"),
                          "현재 단계를 '2-2 VOC 수집'으로 설정했어요.")
+
+    def test_board_candidate_follows_confirmed_then_discussed_then_gate_stage(self) -> None:
+        add_item(self.store, "i-voc-run", "insight", "커뮤니티 VOC에서 우산 분실 고민 반복")
+        self.assertIsNone(stages.board(self.store, SCOPE)["candidate"])  # 판정 전
+        stages.assess(self.store, SCOPE, {}, ScriptedJudge(self.judge.gates, discussing={"stage": "2-2", "evidence": ["i-voc-run"]}))
+        found = stages.board(self.store, SCOPE)
+        self.assertEqual((found["candidate"], found["shown"], found["approved"]), ("2-2", "1-2", False))  # 메뉴·카드·탭 모두 candidate
+        key = stages.proposals(self.store, SCOPE)[0]["key"]
+        stages.answer(self.store, SCOPE, "stage_init", key, "start_discussing", "관리자")
+        self.assertEqual(stages.board(self.store, SCOPE)["candidate"], "2-2")
+        self.assertTrue(stages.board(self.store, SCOPE)["approved"])
 
     def test_voc_overturning_an_assumption_offers_to_go_back(self) -> None:
         add_item(self.store, "i-voc-2", "insight", "아무도 대여소 위치 알림을 원하지 않음")

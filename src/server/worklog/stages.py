@@ -233,10 +233,6 @@ def _evidence_key(found: dict | None, gate_id: str) -> str:
     return f"{'met' if gate.get('met') else 'open'}:{','.join(sorted(gate.get('evidence') or []))}"
 
 
-def _gate_text(store: Path, scope: str, stage: str, gate_id: str) -> str:
-    return next((g["text"] for g in gates(store, scope, stage) if g["gate_id"] == gate_id), gate_id)
-
-
 def proposals(store: Path, scope: str) -> list[dict[str, Any]]:
     """지금 물어볼 단계 제안(답한 것은 뺀다). 각 {kind, key, text, answers: [(답, 버튼 글)]}. 판정 전이면 빈 목록."""
     found = assessment(store, scope)
@@ -264,24 +260,6 @@ def proposals(store: Path, scope: str) -> list[dict[str, Any]]:
             out.append({"kind": "stage_advance", "key": _key(now, *[_evidence_key(found, g["gate_id"]) for g in stage_gates]),
                         "stage": now, "text": f"{label(now)}에서 정할 사안을 완료했어요. 다음 단계로 넘어갈까요?",
                         "answers": [("advance", "넘어갈게요"), ("stay", "아직이요")]})
-        for gate in open_gates:
-            out.append({"kind": "gate_missing", "key": _key(now, gate["gate_id"], _evidence_key(found, gate["gate_id"])),
-                        "stage": now, "gate_id": gate["gate_id"],
-                        "text": f"현재 {label(now)} 단계예요. '{gate['text']}'만 확정하고 넘어갈까요?",
-                        "answers": [("decide", "정할게요"), ("later", "나중에")]})
-        ahead = found["discussing"].get("stage")
-        reach = ahead if ahead and ORDER.index(ahead) > ORDER.index(now) else now
-        behind = [st for st in ORDER[:ORDER.index(now)]]  # 이미 지나온 단계(첫 제안에서 앞 단계로 건너뛴 경우 등)
-        between = ORDER[ORDER.index(now) + 1:ORDER.index(reach)]  # 논의가 앞서 있어 건너뛴 단계
-        if behind or between:
-            for stage in behind + between:
-                for gate in gates(store, scope, stage):
-                    if not _done(gate, found):
-                        out.append({"kind": "skipped_ahead", "key": _key(stage, gate["gate_id"], reach,
-                                                                         _evidence_key(found, gate["gate_id"])),
-                                    "stage": stage, "gate_id": gate["gate_id"],
-                                    "text": f"이미 {label(reach)} 내용을 진행하고 있는데 '{gate['text']}'({label(stage)})가 없어요.",
-                                    "answers": [("decide", "정할게요"), ("later", "나중에 할게요"), ("skip", "건너뛰기")]})
         turned = found.get("overturned")
         if turned and ORDER.index(now) >= ORDER.index("2-1"):
             assumption = str(turned.get("assumption") or "가정")[:60]
@@ -333,7 +311,7 @@ def answer(store: Path, scope: str, kind: str, key: str, reply: str, actor: str,
         raise db.ConflictError("이미 답했거나 상황이 바뀐 질문이에요")
     if reply not in {a for a, _ in prompt["answers"]} | ({"choose"} if kind == "stage_init" else set()):
         raise db.ValidationError(f"알 수 없는 답 {reply}")
-    stage, gate_id = prompt["stage"], prompt.get("gate_id")
+    stage = prompt["stage"]
     message = "알겠어요."
     if reply == "not_ahead":  # 아직 정한 것이 없다: 질문은 그대로 두어, 선택 카드를 놓쳐도 다시 물을 수 있다
         return "알겠어요. 현재 진행 중인 단계를 선택해 주세요."
@@ -359,21 +337,20 @@ def answer(store: Path, scope: str, kind: str, key: str, reply: str, actor: str,
                      ON CONFLICT(scope, kind, key) DO UPDATE SET answer = excluded.answer,
                          answered_by = excluded.answered_by, answered_at = excluded.answered_at""",
                   (scope, kind, key, reply, actor, db.now(), db.now()))
-    if gate_id and reply in ("decide", "later", "skip"):
-        set_gate_state(store, scope, stage, gate_id, {"decide": "open", "later": "later", "skip": "skipped"}[reply], actor)
-        message = {"decide": f"'{_gate_text(store, scope, stage, gate_id)}'을 2번 메뉴 '지금 진행 중'에 올렸어요.",
-                   "later": "나중에 다시 볼게요. 2번 메뉴 '이전 단계에서 남은 것'에 남겨 둘게요.",
-                   "skip": "건너뛰었어요. 목록에서 뺐어요."}[reply]
     return message
 
 
 def board(store: Path, scope: str) -> dict[str, Any]:
-    """2번 메뉴용: 현재 단계, 지금 진행 중인 게이트, 이전 단계에서 남은 게이트."""
+    """현재 단계 표시용: 확정 단계, 화면에 보일 후보 단계(candidate), 이 단계에서 남은 게이트, 이전 단계에서 나중으로 미룬 게이트."""
     found = assessment(store, scope)
     now = current(store, scope)
-    shown = now or (first_open_stage(store, scope, found) if found and found.get("judged") else None)
+    first = first_open_stage(store, scope, found) if found and found.get("judged") else None
+    shown = now or first
+    # 화면에 보일 "현재 단계": 확정 > 회의록이 논의 중인 단계(AI 추정) > 게이트 기준 첫 미완 단계. 메뉴 2·단계 카드·탭이 같은 값을 쓴다.
+    ahead = ((found or {}).get("discussing") or {}).get("stage")
+    candidate = now or (ahead if ahead in ORDER else None) or first
     doing = [g for g in gates(store, scope, shown) if not _done(g, found)] if shown else []
     earlier = [g for g in gates(store, scope) if shown and ORDER.index(g["stage"]) < ORDER.index(shown)
                and g["state"] == "later"]
-    return {"stage": now, "shown": shown, "approved": now is not None, "doing": doing, "earlier": earlier,
+    return {"stage": now, "shown": shown, "candidate": candidate, "approved": now is not None, "doing": doing, "earlier": earlier,
             "met": [g for g in gates(store, scope, shown) if _met(found, g["gate_id"])] if shown else []}

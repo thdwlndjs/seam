@@ -79,9 +79,10 @@ class MenuTests(unittest.TestCase):
         stages.assess(self.store, SCOPE, {}, ScriptedJudge({"candidates": {"met": True, "evidence": ["i-cand"]}}))
         with patch.object(main, "_stored_notes", new=AsyncMock(return_value={"texts": ["회의 원문"], "as_of": None})):
             text, _ = asyncio.run(main.fetch_team_status(self.config, SCOPE))
-        self.assertIn("🧭 현재 단계: 1-2 방향 확정 (제안, 권한자 승인 전)", text)
+        self.assertIn("🧭 현재 단계: AI 추정 1-2 방향 확정 (확정 전)", text)
         self.assertIn("📌 확정된 흐름\n- 주간 회의는 화요일", text)
-        self.assertIn("- 정할 것: 주제 확정 결정이 있다", text)
+        self.assertNotIn("정할 것", text)  # 게이트 문장은 진행 중 목록에 섞지 않는다
+        self.assertNotIn("주제 확정 결정이 있다", text)
         self.assertIn("🐢 천천히 정해도 되는 것", text)
         self.assertIn("후보 주제: 공유 우산 대여", text)
         self.assertIn("💬 멘토링 피드백", text)

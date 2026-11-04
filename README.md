@@ -73,6 +73,7 @@ $env:GROQ_API_KEY=""; ..\..\.venv\Scripts\python.exe -m unittest discover -s tes
 - 테스트는 실제 저장소(`src/worklog.sqlite3`)를 쓰지 않는다. 모든 테스트 모듈이 `tests/isolation.py`를 맨 먼저 불러 임시 저장소를 쓰게 한다.
 - `BOT_SERVER_SECRET`은 덮어쓰지 않는다(테스트가 `test-secret`을 쓴다).
 - 실제 Notion 녹화본(`src/server/tests/fixtures/notion_local/`)이 있으면 그것으로도 확인하고, 없으면 건너뛴다.
+- **Playground로 직접 눌러 볼 때는 실제 저장소를 쓰지 않는다.** 버튼을 누르면 단계·항목이 실제로 저장된다. 저장소를 복사해(`Copy-Item src\worklog.sqlite3 $env:TEMP\w.sqlite3`) `WORKLOG_STORE=$env:TEMP\w.sqlite3`로 서버를 띄운다. 복사는 서버를 멈춘 뒤에 한다(WAL 파일이 함께 있다).
 
 ## 나중에 추가할 것 (TODO)
 
