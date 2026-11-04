@@ -344,6 +344,9 @@ def main_card_alerts(team_key: str, approver: bool = True, admin: bool = False) 
         buttons += [{"title": f"지우기: {title[:16]}", "data": {"action": "gone_remove", "part_id": gone["id"]}},
                     {"title": f"그대로: {title[:16]}", "data": {"action": "gone_keep", "part_id": gone["id"]}}]
     found = stages.proposals(store, team_key)[:2]  # 단계 제안·게이트 질문(spec P2-4)
+    fresh = apply.auto_applied_count(store, team_key, actor=apply.AUTO_NEW_ACTOR)
+    if fresh:
+        lines.append(f"✅ 새 회의록을 자동 반영했어요 (항목 {fresh}건, 최근 24시간) — 구조 보기·고치기에서 확인·수정할 수 있어요")
     stages.mark_asked(store, team_key, found)
     for prompt in found:
         lines.append(f"🧭 {prompt['text']}" + ("" if approver else " (권한자 확인 대기 중)"))

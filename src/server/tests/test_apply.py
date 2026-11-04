@@ -66,6 +66,28 @@ class ApplyTests(unittest.TestCase):
             actors = {r[0] for r in c.execute("SELECT actor FROM revisions")}
         self.assertEqual(actors, {"송지원"})  # 확인한 사람이 반영자
 
+    def test_auto_apply_waits_two_hours_and_follows_date_order(self) -> None:
+        """새 회의록은 묻지 않고, 마지막 수정 2시간 뒤에, 날짜 속성 순서로 반영한다."""
+        older = EDITED  # 마지막 수정은 이쪽이 앞이지만 날짜 속성은 더 늦다
+        core.record(self.store, scope=SCOPE, kind="notion_record", conversation_key="notion:sec-2", locator="notion:unit-2",
+                    text="날짜: 2026-09-20" + chr(10) + parts.md_to_text(SAMPLE_MD), sent_at=older)
+        core.record(self.store, scope=SCOPE, kind="notion_record", conversation_key="notion:sec-1", locator="notion:unit-1",
+                    text="날짜: 2026-09-30" + chr(10) + parts.md_to_text(SAMPLE_MD), sent_at=older)
+        built = parts.build_unit_parts("unit-2", "회의록 > 0차", SAMPLE_MD, SAMPLE_BLOCKS)
+        parts.save_unit_parts(self.store, SCOPE, "notion", "unit-2", "sec-2", built, last_edited=older)
+        parts.judge_pending(self.store, SCOPE, split_classifier(), budget_tokens=None)
+        parts.extract_pending(self.store, SCOPE, FakeExtractor(), V, budget_tokens=None)
+        too_early = datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)
+        self.assertEqual(apply.auto_apply_due(self.store, SCOPE, V, now=too_early), [])  # 아직 작성 중일 수 있다
+        done = apply.auto_apply_due(self.store, SCOPE, V, now=datetime(2026, 11, 1, 3, 0, tzinfo=timezone.utc))
+        self.assertEqual([r["page_id"] for r in done], ["unit-2", "unit-1"])  # 날짜가 이른 것부터
+        self.assertEqual(apply.pending_pages(self.store, SCOPE), [])
+        self.assertEqual(apply.auto_apply_due(self.store, SCOPE, V, now=datetime(2026, 11, 2, tzinfo=timezone.utc)), [])
+        with patch.object(worklog_bridge, "WORKLOG_STORE", self.store):
+            lines, buttons = confirm_flow.main_card_alerts(SCOPE)
+        self.assertTrue([line for line in lines if "자동 반영" in line])
+        self.assertFalse([b for b in buttons if b["data"].get("action") == "stage_answer"])  # 단계 질문은 별도 카드
+
     def test_cancel_skips_the_page(self) -> None:  # A7
         apply.request_confirm(self.store, SCOPE, "unit-1")
         self.assertGreater(apply.skip_page(self.store, SCOPE, "unit-1", "송지원"), 0)

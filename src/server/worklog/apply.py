@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,14 @@ CONFIDENCE = 0.7  # [가정] 이 아래면 반영하지 않고 "추가 논의 �
 SETTLE = timedelta(hours=2)  # 자동 감지된 새 회의록은 마지막 수정 후 이만큼 지나야 확인 대기로 올린다(작성 중 초안 방지)
 LLM_JUDGED_KINDS = {"task", "decision"}  # 관련 항목과 비교할 때 LLM 판정을 쓰는 종류. 나머지는 규칙만
 APPLIED = ("approved", "auto_applied")
+AUTO_NEW_ACTOR = "자동(새 회의록 반영)"
+_DATE_RE = re.compile(r"(?m)^[^:\n]*(?:날짜|일자|date)[^:\n]*:\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+
+
+def date_from(content: str | None, fallback: str | None) -> str | None:
+    """회의록 날짜: 원문 기록의 날짜 속성(예: "날짜: 2026-09-28"). 없으면 마지막 수정일."""
+    found = _DATE_RE.search(content or "")
+    return found.group(1) if found else ((fallback or "")[:10] or None)
 
 
 def _part(c: Any, part_id: str) -> dict[str, Any]:
@@ -312,13 +321,14 @@ def recent_applied(store: Path, scope: str, limit: int = 10) -> list[dict[str, A
     return [dict(r) for r in rows]
 
 
-def auto_applied_count(store: Path, scope: str, hours: int = 24, now: datetime | None = None) -> int:
+def auto_applied_count(store: Path, scope: str, hours: int = 24, now: datetime | None = None,
+                       actor: str = AUTO_ACTOR) -> int:
     """확인된 회의록이 수정돼 자동으로 반영된 항목 수(최근 hours시간). 메인 카드 "반영 n건" 알림."""
     since = ((now or datetime.now().astimezone()) - timedelta(hours=hours)).astimezone()
     db.initialize(store)
     with closing(db.connect(store)) as c:
         rows = c.execute("""SELECT decided_at FROM change_candidates WHERE scope = ? AND status = 'auto_applied'
-                            AND decided_by = ?""", (scope, AUTO_ACTOR)).fetchall()
+                            AND decided_by = ?""", (scope, actor)).fetchall()
     return sum(1 for r in rows if r["decided_at"] and _parse(r["decided_at"]) >= since)
 
 
@@ -435,3 +445,25 @@ def stale_pending_once(store: Path, scope: str, now: datetime | None = None) -> 
             c.execute("""INSERT INTO prompts_asked(scope, kind, key, answer, asked_at, answered_at)
                          VALUES (?, 'pending_reminder', ?, 'shown', ?, ?)""", (scope, page["page_id"], db.now(), db.now()))
     return fresh
+
+
+def auto_apply_due(store: Path, scope: str, prompt_version: str, judge: core.Judge | None = None,
+                   now: datetime | None = None) -> list[dict[str, Any]]:
+    """묻지 않고 반영: 추출이 끝나고 마지막 수정 후 SETTLE이 지난 새 회의록(사람이 취소한 것은 제외)을 날짜 속성 순서로
+    반영한다. 나중 회의록이 앞선 결정을 바꾸면 결정 대체로 남고(되돌리기·구조 화면에서 고치기), 판단이 갈리면
+    "추가 논의 필요"로 둔다. 같은 날짜끼리는 마지막 수정 순."""
+    limit = ((now or datetime.now().astimezone()) - SETTLE).astimezone()
+    with closing(db.connect(store)) as c:
+        rows = [dict(r) for r in c.execute(
+            """SELECT page_id, MAX(last_edited) AS last_edited FROM source_parts WHERE scope = ? AND status = 'active'
+               AND kind = 'meeting' AND state IN ('extracted', 'pending_confirm') AND confirmed_by IS NULL
+               GROUP BY page_id""", (scope,))]
+        contents = {r["locator"]: r["content"] for r in c.execute(
+            "SELECT locator, content FROM sources ORDER BY captured_at, rowid")}
+    due = [r for r in rows if r["page_id"] and r["last_edited"] and _parse(r["last_edited"]) <= limit]
+    due.sort(key=lambda r: (date_from(contents.get(f"notion:{r['page_id']}"), r["last_edited"]) or "", r["last_edited"]))
+    results = []
+    for row in due:
+        summary = apply_page(store, scope, row["page_id"], AUTO_NEW_ACTOR, prompt_version, None, judge)
+        results.append(dict(summary, page_id=row["page_id"]))
+    return results

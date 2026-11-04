@@ -1233,8 +1233,10 @@ def _organize_parts() -> dict[str, dict[str, int]]:
             judged = wparts.judge_pending(store, team_key, worklog_bridge.groq_classify_parts)
             extracted = wparts.extract_pending(store, team_key, worklog_bridge.groq_extract_part,
                                                worklog_bridge.EXTRACT_PROMPT_VERSION)
-            # 새 회의록: 마지막 수정 후 2시간이 지나면 확인 대기로. 확인된 회의록의 수정: 새 항목만 자동 반영.
-            promoted = wapply.promote_due(store, team_key)
+            # 새 회의록: 마지막 수정 후 2시간이 지나면 묻지 않고 날짜 순서로 반영한다(고치기는 구조 화면). 확인된
+            # 회의록의 수정: 새 항목만 자동 반영.
+            promoted = len(wapply.auto_apply_due(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION,
+                                                 worklog_bridge.groq_judge))
             edits = wapply.apply_edits(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION, worklog_bridge.groq_judge)
             results[team_key] = {"judged": judged, "extracted": extracted, "promoted": promoted, "edited": len(edits)}
         except Exception:
