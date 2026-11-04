@@ -452,6 +452,7 @@ async def handle_turn(turn: Turn) -> None:
     config = _get_config(turn.team_key)
     if config is not None:
         await asyncio.to_thread(_sync_member, turn, config)
+        _check_on_open(turn.team_key, config)
 
     # 카드 버튼(Action.Submit / Action.Execute) — 에코봇이 data를 value에 그대로 실어 보낸다.
     value = turn.req.value
@@ -1146,6 +1147,7 @@ def _sync_notion_maps() -> dict[str, dict]:
         if not root or not config.get("notion_token"):
             continue
         try:
+            _last_team_check[team_key] = time.monotonic()
             results[team_key] = _sync_team_map(team_key, _team_roots(config), config["notion_token"], background=True)
         except Exception:
             traceback.print_exc()
@@ -1189,6 +1191,31 @@ async def _worklog_loop() -> None:
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(worklog_bridge.ANALYZE_TICK_SECONDS)
+
+
+OPEN_CHECK_SECONDS = 600  # 챗봇을 열 때 Notion 수정 시각 확인은 팀마다 10분에 한 번(spec P2-6)
+_last_team_check: dict[str, float] = {}
+
+
+def _check_on_open(team_key: str, config: dict) -> None:
+    """그 팀 사용자의 턴마다: 마지막 확인이 10분보다 오래됐으면 수정 시각 확인(바뀐 페이지만 다시 읽기)을
+    백그라운드로 돌린다. 턴 응답은 기다리지 않는다. 1시간 주기 확인도 같은 시각을 쓴다."""
+    if os.environ.get("WORKLOG_LOOP", "1") == "0":  # 백그라운드 작업을 끈 실행(테스트)
+        return
+    if not config.get("notion_page_id") or not config.get("notion_token"):
+        return
+    now = time.monotonic()
+    if now - _last_team_check.get(team_key, -OPEN_CHECK_SECONDS) < OPEN_CHECK_SECONDS:
+        return
+    _last_team_check[team_key] = now
+
+    async def run() -> None:
+        try:
+            await asyncio.to_thread(_sync_team_map, team_key, _team_roots(config), config["notion_token"], True)
+        except Exception:
+            traceback.print_exc()
+
+    _spawn(run())
 
 
 async def _github_stage_facts(config: dict) -> dict:
