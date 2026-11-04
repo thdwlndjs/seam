@@ -331,8 +331,29 @@ MIGRATIONS: list[list[str]] = [
         "INSERT INTO stage_gates(scope, stage, gate_id, text, state, updated_at) VALUES ('*', '3-3', 'milestones', '마일스톤별 진행이 기록된다', 'open', '2026-11-04T00:00:00+00:00')",
         "INSERT INTO stage_gates(scope, stage, gate_id, text, state, updated_at) VALUES ('*', '3-4', 'release', '릴리스 기준과 충족 여부가 기록됐다', 'open', '2026-11-04T00:00:00+00:00')",
     ],
+    [  # 9: 지식 검색 색인(파생 데이터)과 해결된 항목. 문서: docs/implementation/v2.1/plan.md 2.3, Phase 1
+        # 색인은 work_items에서 언제든 다시 만들 수 있다(worklog/search.py rebuild). 만든 직후 기존 항목으로 채운다(POST_MIGRATION).
+        # trigram: 3글자 미만 검색어는 MATCH가 아니라 부분 일치(LIKE)로 찾는다(search.py).
+        """CREATE VIRTUAL TABLE knowledge_fts USING fts5(
+            item_id UNINDEXED, scope UNINDEXED, kind, title, body, extra, tokenize = 'trigram'
+        )""",
+        # 해결된(resolved) 항목은 같은 제목의 새 항목을 막지 않는다(대체·되돌림·취소와 같다).
+        "DROP INDEX work_items_live_title",
+        """CREATE UNIQUE INDEX work_items_live_title ON work_items(scope, kind, normalized_title)
+           WHERE status NOT IN ('superseded', 'reverted', 'cancelled', 'resolved')""",
+    ],
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
+
+
+def _fill_knowledge_fts(connection: sqlite3.Connection) -> None:
+    from . import search  # 순환 import 피하려고 늦게 불러온다(search가 db를 쓴다)
+
+    search.rebuild_connection(connection)
+
+
+# 마이그레이션을 막 적용한 직후, 같은 트랜잭션에서 한 번 하는 일(SQL만으로 안 되는 것).
+POST_MIGRATION = {9: _fill_knowledge_fts}
 
 
 def notion_id(value: str | None) -> str:
@@ -391,6 +412,8 @@ def initialize(store: Path) -> dict[str, Any]:
         for version in range(current + 1, SCHEMA_VERSION + 1):
             for statement in MIGRATIONS[version - 1]:
                 connection.execute(statement)
+            if version in POST_MIGRATION:
+                POST_MIGRATION[version](connection)
         if current != SCHEMA_VERSION:
             connection.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
                                (str(SCHEMA_VERSION),))

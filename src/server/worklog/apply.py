@@ -346,7 +346,7 @@ def resolve_gone_part(store: Path, scope: str, part_id: str, remove_items: bool,
     with db.write(store) as c:
         if remove_items:
             for row in c.execute("SELECT id, attributes_json FROM work_items WHERE scope = ? AND status NOT IN "
-                                 "('superseded', 'reverted', 'cancelled')", (scope,)).fetchall():
+                                 "('superseded', 'reverted', 'cancelled', 'resolved')", (scope,)).fetchall():
                 if part_id in (json.loads(row["attributes_json"]).get("part_ids") or []):
                     core._write_item(c, row["id"], {"status": "cancelled"}, f"원문 부분 {part_id} 삭제 확인", actor, db.now())
                     removed += 1
@@ -402,7 +402,7 @@ def live_items(store: Path, scope: str) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {}
     with closing(db.connect(store)) as c:
         for row in c.execute(
-                """SELECT * FROM work_items WHERE scope = ? AND status NOT IN ('superseded', 'reverted', 'cancelled', 'done')
+                """SELECT * FROM work_items WHERE scope = ? AND status NOT IN ('superseded', 'reverted', 'cancelled', 'resolved', 'done')
                    ORDER BY updated_at DESC, rowid DESC""", (scope,)):
             item = dict(row)
             attributes = json.loads(item.pop("attributes_json"))
@@ -425,7 +425,8 @@ def take_task(store: Path, scope: str, item_id: str, assignee: str, actor: str) 
             raise ConflictError(f"이미 {attributes['assignee']}님이 맡았어요")
         attributes["assignee"] = assignee
         core._write_item(c, item_id, {"attributes_json": attributes}, "내가 맡기", actor, db.now())
-    return {"id": item_id, "title": row["title"], "assignee": assignee, "issue_refs": attributes.get("issue_refs") or []}
+    # 명시적으로 연결된 이슈만 돌려준다(github_refs가 없으면 예전 issue_refs를 명시적 이슈로 읽는다)
+    return {"id": item_id, "title": row["title"], "assignee": assignee, "issue_refs": core.issue_numbers(attributes)}
 
 
 STALE_DAYS = 3  # [가정] 확인 대기가 이보다 오래 쌓이면 관리자에게 한 번 더 알린다(spec P2-5)

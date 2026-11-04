@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+import prompts
 import llm_queue
 import metrics
 import worklog
@@ -133,18 +134,6 @@ items 배열 하나만 담은 JSON 객체를 출력해: {"items": [...]}.
 원문에 없는 내용을 지어내지 마. 확정 표현이 없으면 decision의 certainty는 "proposed"다.
 단순 진행 보고는 decision이 아니라 progress다. 해당 사항이 없으면 {"items": []}."""
 
-JUDGE_PROMPT = """너는 새 기록에서 나온 항목(item)을 기존 Task·Decision 목록(related)과 비교하는 판정기야.
-JSON 객체 하나만 출력해: {"change_type", "target_id", "affected_task_ids", "rationale"}.
-change_type:
-- "unchanged": 기존 항목과 같은 내용
-- "supplementary": 기존 항목에 세부 사항·진행 상태를 더할 뿐 의미를 바꾸지 않음
-- "proposed": 기존 어떤 항목과도 다른 새 항목 (target_id는 null)
-- "conflicting": 기존 항목과 모순되지만 교체한다는 말은 없음
-- "superseding": 기존 결정을 명시적으로 대체함 (decision끼리만)
-target_id: 비교 대상 기존 항목의 id (related 안의 값만, 같은 kind만). proposed면 null.
-affected_task_ids: item이 decision일 때 영향을 받는 기존 task id (related 안의 값만).
-rationale: 판단 근거 한두 문장. 확신이 없으면 conflicting으로 두고 이유를 적어."""
-
 
 CLASSIFY_PROMPT = """너는 팀 Notion 페이지의 섹션이 어떤 기록인지 고르는 분류기야.
 입력 sections 배열의 각 항목에 id, path(페이지 안 위치), title, container(담는 방식), sample(내용 앞부분)이 있다.
@@ -194,29 +183,6 @@ def groq_classify_parts(page: dict, priority: int = llm_queue.BACKGROUND) -> dic
     return data if isinstance(data, dict) else {}
 
 
-# 추출 지시문의 판. 지시문이나 항목 구성을 바꾸면 올린다(같은 내용도 새 판으로 다시 추출된다).
-EXTRACT_PROMPT_VERSION = "part-extract-3"  # 2: 한국어 제목, 멘토 발언은 피드백, 아이디어 설명은 항목 아님 / 3: 질문지는 팀의 질문, 담당은 사람만
-
-PART_EXTRACT_PROMPT = """너는 팀 회의·멘토링 메모에서 항목을 뽑는 분석기야. 입력: path(회의 위치)와 text(메모 원문).
-뽑을 항목(kind):
-- "decision": 정한 것, 확정된 방향
-- "task": 누가 무엇을 해야 하는 일. owner(메모에 적힌 이름, 없으면 null), due(YYYY-MM-DD, 없으면 null),
-  role_hint("plan" 기획 | "design" 디자인 | "dev" 개발 | null)
-- "open": 아직 정하지 못했거나 논의가 필요한 것, 열린 질문
-- "feedback": 멘토·외부 사람이 준 조언·지적·의견
-- "insight": 고객·사용자 조사(VOC)에서 얻은 사실이나 발견
-구분 규칙:
-- 멘토링·피드백 회의에서 "멘토링", "피드백" 아래 적힌 줄과 끝의 결론 줄(→ …)은 멘토가 한 말이다. 조언·지적·의견은
-  질문 형태라도 "feedback"이다. 팀이 그 자리에서 정했다고 적힌 것만 "decision"이다.
-- "기능", "아이디어" 아래처럼 팀이 낸 아이디어·기능을 설명하는 줄은 항목으로 뽑지 마. 할 일·결정이 아니다.
-- 원문에 정했다는 말이 없으면 decision을 만들지 마. 짧은 단어 하나("진동 제어")를 결정으로 늘리지 마.
-- 질문지(멘토·고객에게 물어보려고 팀이 미리 적은 질문)는 팀의 질문이다. "feedback"이 아니라 "open"이다.
-- owner는 사람 이름만 쓴다. 부서·팀·회사 이름이면 null이다.
-각 항목: {"kind", "title"(한국어 한 줄, 40자 안팎), "detail"(필요하면 한국어 한두 문장, 없으면 null), "owner", "due",
-"role_hint", "quote"(근거가 된 원문을 text에서 그대로 복사한 짧은 구절), "confidence"(0.0~1.0)}.
-title·detail은 반드시 한국어로 쓴다. quote는 반드시 text 안에 글자 그대로 있어야 한다. 근거 없는 항목은 만들지 마.
-JSON 하나만 출력해: {"items": [...]}. 뽑을 것이 없으면 {"items": []}."""
-
 
 def groq_extract_part(payload: dict, priority: int = llm_queue.BACKGROUND) -> dict:
     """회의 메모 부분 하나에서 항목을 뽑는다(docs/v1.1/spec.md P1-4). {"items", "usage", "model"}.
@@ -224,7 +190,7 @@ def groq_extract_part(payload: dict, priority: int = llm_queue.BACKGROUND) -> di
     model에는 "공급자:모델"을 남긴다(정답지 비교 때 어느 쪽 결과인지 구분)."""
     if not (GROQ_API_KEY or llm_ready()):
         return {}
-    data, usage, label = _llm_call(PART_EXTRACT_PROMPT, payload, priority)
+    data, usage, label = _llm_call(prompts.load("interpret").text, payload, priority)
     items = data.get("items") if isinstance(data, dict) else None
     return {"items": items if isinstance(items, list) else [], "usage": usage, "model": label}
 
@@ -260,7 +226,7 @@ def groq_stage_judge(payload: dict, priority: int = llm_queue.BACKGROUND) -> dic
 
 
 def groq_judge(item: dict, related: list[dict], priority: int = llm_queue.BACKGROUND) -> dict:
-    return _llm_call(JUDGE_PROMPT, {"item": item, "related": related}, priority)[0]
+    return _llm_call(prompts.load("reconcile").text, {"item": item, "related": related}, priority)[0]
 
 
 def analyze_due() -> list[dict]:
@@ -288,3 +254,11 @@ def meeting_notes(scope: str, notes_id: str | None, max_chars: int = 8000) -> di
     from worklog import sections
 
     return sections.meeting_notes(WORKLOG_STORE, scope, notes_id, max_chars=max_chars)
+
+
+def __getattr__(name: str):
+    """EXTRACT_PROMPT_VERSION: 추출 지침(prompts/interpret.md)의 판. 지침 파일을 고치면 판이 바뀌어 해석 캐시가 무효가 된다.
+    (예전에는 이 파일의 수동 문자열이었다. 기존 판 이름 "part-extract-3"은 본문이 그대로이면 유지된다.)"""
+    if name == "EXTRACT_PROMPT_VERSION":
+        return prompts.load("interpret").version
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

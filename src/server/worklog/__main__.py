@@ -5,6 +5,8 @@ python -m worklog trace   <Task·결정·후보 ID>
 python -m worklog map     --scope team:<팀ID> [--json]   (섹션별 역할 보기)
 python -m worklog map-set --scope team:<팀ID> "<섹션 이름>" <진행|회의|보관|제외> --actor <이름>   (역할 바꾸기)
 python -m worklog extract-eval --scope team:<팀ID> [--prompt-version ...]   (정답지와 추출 비교)
+python -m worklog reindex-fts [--scope team:<팀ID>]   (지식 검색 색인을 항목에서 다시 만든다. 색인은 파생 데이터)
+python -m worklog search --scope team:<팀ID> "<질문>" [--kind decision ...] [--limit 8] [--max-tokens 3000]   (색인 검색)
 
 저장소 위치: --store > WORKLOG_STORE > server/../worklog.sqlite3
 결과는 JSON으로 출력한다. 종료 코드: 0 성공, 2 입력 오류, 3 충돌(이미 처리됨·오래된 후보), 4 없음.
@@ -19,7 +21,7 @@ from pathlib import Path
 
 from contextlib import closing
 
-from . import apply, core, db, sections
+from . import apply, core, db, search, sections
 from .db import ConflictError, NotFoundError, WorklogError
 
 DEFAULT_STORE = Path(__file__).resolve().parents[2] / "worklog.sqlite3"
@@ -44,6 +46,15 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = sub.add_parser("extract-eval", help="정답지(봇에서 고친 목록)와 지금 추출 비교")
     evaluate.add_argument("--scope", required=True)
     evaluate.add_argument("--prompt-version", help="비교할 추출 버전 (기본: 가장 최근에 쓴 버전)")
+    reindex = sub.add_parser("reindex-fts", help="지식 검색 색인 다시 만들기")
+    reindex.add_argument("--scope", help="이 팀만(기본: 전체)")
+    find = sub.add_parser("search", help="지식 검색(색인)")
+    find.add_argument("text", help="질문 또는 검색어")
+    find.add_argument("--scope", required=True)
+    find.add_argument("--kind", action="append", help="종류 제한(여러 번 가능)")
+    find.add_argument("--limit", type=int, default=search.DEFAULT_LIMIT)
+    find.add_argument("--max-tokens", type=int, default=search.DEFAULT_MAX_TOKENS)
+    find.add_argument("--json", action="store_true", help="Markdown 대신 JSON")
     return parser
 
 
@@ -71,6 +82,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "extract-eval":
             version = args.prompt_version or _latest_prompt_version(store)
             data = {"prompt_version": version, **apply.extract_eval(store, args.scope, version or "")}
+        elif args.command == "reindex-fts":
+            data = {"scope": args.scope, "indexed": search.rebuild(store, args.scope)}
+        elif args.command == "search":
+            result = search.query(store, args.scope, args.text, kinds=args.kind, limit=args.limit, max_tokens=args.max_tokens)
+            if not args.json:
+                print(result["markdown"] or f"(결과 없음) 조회 범위: {json.dumps(result['searched'], ensure_ascii=False)}")
+                return 0
+            data = result
         elif args.command == "map":
             rows = sections.role_table(store, args.scope)
             if not args.json:

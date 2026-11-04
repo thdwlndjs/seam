@@ -59,6 +59,7 @@ import meeting_inputs  # noqa: E402
 import llm_queue  # noqa: E402
 import metrics  # noqa: E402
 import notion_map  # noqa: E402
+import prompts  # noqa: E402
 import worklog_bridge  # noqa: E402
 from worklog import apply as wapply  # noqa: E402
 from worklog import parts as wparts  # noqa: E402
@@ -963,12 +964,7 @@ async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None]
         return None
     raw_text = _fit_for_groq(raw_text)
 
-    system_prompt = (
-        "너는 팀 소개/프로젝트 정보 페이지 원문을 읽고 핵심만 간결하게 요약하는 도우미야.\n"
-        "팀 이름, 팀원과 역할, 프로젝트명과 목적, 현재 진행 단계 위주로 정리해.\n"
-        "'[프로젝트명 입력]'처럼 아직 안 채워진 항목은 '미정'으로 짧게만 표시하거나 생략해.\n"
-        "팀 규칙/협업 방식 같은 formality는 한두 줄로만 축약하고, 전체 5~10줄 이내로 정리해."
-    )
+    system_prompt = prompts.load("project-info").text
     ready = [c for c in candidates if not llm_queue.cooling_down(c[0])] or candidates
     for provider, key in ready:
         full_text = ""
@@ -1064,7 +1060,8 @@ def _display_tz() -> tzinfo:
 
 async def _summarize_snapshot(team_key: str, snapshot: dict, on_chunk: Callable[[str], None] | None = None) -> str:
     """저장된 팀 정보 원문을 요약한다. 원문이 지난번과 같으면(해시 동일) Groq를 다시 부르지 않는다."""
-    content_hash = hashlib.sha256(snapshot["text"].encode("utf-8")).hexdigest()
+    # 입력 원문과 지침의 판이 모두 같을 때만 캐시를 쓴다(지침 파일을 고치면 다시 요약)
+    content_hash = hashlib.sha256((snapshot["text"] + "\0" + prompts.load("project-info").version).encode("utf-8")).hexdigest()
     cached = _project_summary_cache.get(team_key)
     if cached and cached["hash"] == content_hash:
         if on_chunk:

@@ -21,7 +21,7 @@ from . import apply, core, db, people, stages
 from .db import ConflictError, NotFoundError, ValidationError
 
 KINDS = {"decision": "결정", "open": "미정", "task": "할 일", "insight": "인사이트", "feedback": "피드백"}
-HIDDEN = ("superseded", "reverted", "cancelled")
+HIDDEN = ("superseded", "reverted", "cancelled", "resolved")
 EDIT_REASON = "구조 화면에서 고침"
 
 

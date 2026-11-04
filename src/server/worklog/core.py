@@ -39,6 +39,16 @@ CANDIDATE_STATUSES = {"pending", "approved", "rejected", "recorded"}
 # A decision is a key decision when it touches one of these, or affects two or more tasks.
 KEY_DECISION_AREAS = {"goal", "scope", "architecture", "budget", "schedule"}
 LINK_AFFECTS, LINK_SUPERSEDES = "AFFECTS", "SUPERSEDES"
+# v2.1 Phase 1: 지식 모델 확장(docs/implementation/v2.1/plan.md 2.3). 표 구조는 그대로이고 값만 늘었다.
+LINK_DERIVED_FROM, LINK_RESOLVES, LINK_ALTERNATIVE_TO, LINK_RELATED_TO = "DERIVED_FROM", "RESOLVES", "ALTERNATIVE_TO", "RELATED_TO"
+LINK_TYPES = {LINK_AFFECTS, LINK_SUPERSEDES, LINK_DERIVED_FROM, LINK_RESOLVES, LINK_ALTERNATIVE_TO, LINK_RELATED_TO}
+KNOWLEDGE_KINDS = ("decision", "open", "task", "insight", "feedback", "artifact", "requirement", "hypothesis")
+MATURITY = ("draft", "recommended", "discussed", "agreed")  # 가안 / 조언 / 논의 / 합의
+# 살아 있는 항목이 아닌 상태. 같은 제목의 새 항목을 막지 않고, 비교·목록에서 빠진다(resolved: 미정이 답을 얻음).
+INACTIVE_STATUSES = ("superseded", "reverted", "cancelled", "resolved")
+OPTIONAL_ATTRIBUTES = ("maturity", "artifact_type", "summary", "github_refs")  # 항목 생성 때 속성으로 옮기는 값
+GITHUB_REF_TYPES = ("issue", "pr")
+GITHUB_REF_BASIS = ("explicit", "inferred")  # 명시적(본문·커밋의 #번호) / 의미상 추정
 RELATED_LIMIT = 5
 
 # Ends like a question or an open suggestion: "…할까요?", "…어때요", "…인가요".
@@ -257,8 +267,8 @@ def find_related(c: sqlite3.Connection, scope: str, item: dict[str, Any], limit:
     key = normalize_text(item["title"])
     refs = set(item.get("issue_refs") or [])
     scored: list[tuple[float, dict[str, Any]]] = []
-    for row in c.execute("SELECT * FROM work_items WHERE scope = ? AND status NOT IN ('superseded', 'cancelled', 'reverted')",
-                         (scope,)):
+    for row in c.execute(f"SELECT * FROM work_items WHERE scope = ? AND status NOT IN ({','.join('?' * len(INACTIVE_STATUSES))})",
+                         (scope, *INACTIVE_STATUSES)):
         candidate = _item_dict(row)
         title, statement = candidate["title"].casefold(), candidate["statement_md"].casefold()
         score = 10.0 if candidate["normalized_title"] == key else 0.0
@@ -417,6 +427,7 @@ def _insert_candidate(c: sqlite3.Connection, scope: str, run_id: str, item: dict
     target = judgment["target"]
     candidate_id = new_id()
     proposal = {k: item[k] for k in ("title", "statement", "status", "areas", "assignee", "due", "issue_refs", "extracted_kind")}
+    proposal.update({k: item[k] for k in OPTIONAL_ATTRIBUTES if item.get(k)})  # 성숙도 등(없으면 넣지 않아 기존 지문·형식 그대로)
     proposal["affected_task_ids"] = judgment["affected"]
     status = "recorded" if judgment["change_type"] == "unchanged" else "pending"
     c.execute(
@@ -479,19 +490,66 @@ def _write_item(c: sqlite3.Connection, item_id: str, changes: dict[str, Any], re
     values = [to_json(v) if k == "attributes_json" else v for k, v in changes.items()]
     c.execute(f"UPDATE work_items SET {sets}, version = ?, updated_at = ? WHERE id = ?", (*values, version, ts, item_id))
     db.add_revision(c, "work_item", item_id, version, _snapshot(c, item_id), reason, ts, new_id(), actor=actor)
+    _index(c, [item_id])
     return version
+
+
+def _index(c: sqlite3.Connection, item_ids: list[str]) -> None:
+    """검색 색인을 같은 트랜잭션에서 갱신한다(search는 core를 쓰므로 늦게 불러온다)."""
+    from . import search
+
+    search.index_items(c, item_ids)
+
+
+def github_refs(attributes: dict[str, Any]) -> list[dict[str, Any]]:
+    """항목의 GitHub 연결. `github_refs`(명시/추정 구분)가 있으면 그것을, 없으면 예전 `issue_refs`를 명시적 이슈로 읽는다."""
+    refs = attributes.get("github_refs")
+    if isinstance(refs, list):
+        return [r for r in refs if isinstance(r, dict) and r.get("type") in GITHUB_REF_TYPES and str(r.get("number")).isdigit()]
+    return [{"type": "issue", "number": int(n), "basis": "explicit"} for n in attributes.get("issue_refs") or [] if str(n).isdigit()]
+
+
+def issue_numbers(attributes: dict[str, Any], explicit_only: bool = True) -> list[int]:
+    """연결된 GitHub 이슈 번호. 기본은 명시적 연결만(담당 배정처럼 실제로 바꾸는 일에는 추정 연결을 쓰지 않는다)."""
+    return sorted({int(r["number"]) for r in github_refs(attributes)
+                   if r["type"] == "issue" and (not explicit_only or r.get("basis", "explicit") == "explicit")})
+
+
+def _clean_optional_attributes(proposal: dict[str, Any]) -> dict[str, Any]:
+    """생성 때 받는 선택 속성(성숙도·산출물 종류·요약·GitHub 연결)을 검증해서 돌려준다."""
+    out: dict[str, Any] = {}
+    for key in OPTIONAL_ATTRIBUTES:
+        value = proposal.get(key)
+        if not value:
+            continue
+        if key == "maturity" and value not in MATURITY:
+            raise ValidationError(f"maturity must be one of {list(MATURITY)}")
+        if key == "github_refs":
+            if not isinstance(value, list):
+                raise ValidationError("github_refs must be a list")
+            for ref in value:
+                if (not isinstance(ref, dict) or ref.get("type") not in GITHUB_REF_TYPES or not str(ref.get("number")).isdigit()
+                        or ref.get("basis") not in GITHUB_REF_BASIS):
+                    raise ValidationError(f"github_refs entries need type {list(GITHUB_REF_TYPES)}, number, basis {list(GITHUB_REF_BASIS)}")
+            value = [{"type": r["type"], "number": int(r["number"]), "basis": r["basis"]} for r in value]
+        out[key] = value
+    return out
 
 
 def _create_item(c: sqlite3.Connection, scope: str, kind: str, proposal: dict[str, Any], reason: str, actor: str, ts: str) -> str:
     title = proposal["title"]
-    clash = c.execute("SELECT id FROM work_items WHERE scope = ? AND kind = ? AND normalized_title = ? "
-                      "AND status NOT IN ('superseded', 'reverted', 'cancelled')",
-                      (scope, kind, normalize_text(title))).fetchone()
+    if kind not in KNOWLEDGE_KINDS:
+        raise ValidationError(f"kind must be one of {list(KNOWLEDGE_KINDS)}")
+    optional = _clean_optional_attributes(proposal)
+    clash = c.execute(f"SELECT id FROM work_items WHERE scope = ? AND kind = ? AND normalized_title = ? "
+                      f"AND status NOT IN ({','.join('?' * len(INACTIVE_STATUSES))})",
+                      (scope, kind, normalize_text(title), *INACTIVE_STATUSES)).fetchone()
     if clash is not None:
         raise ConflictError(f"DUPLICATE: a live {kind} with this title already exists ({clash['id']}); re-analyze to compare with it")
     item_id = new_id()
     attributes = {k: proposal.get(k) for k in ("assignee", "due") if proposal.get(k)}
     attributes["issue_refs"] = proposal.get("issue_refs") or []
+    attributes.update(optional)
     if kind == "decision":
         attributes["areas"] = proposal.get("areas") or []
         attributes["accountable"] = actor
@@ -502,6 +560,7 @@ def _create_item(c: sqlite3.Connection, scope: str, kind: str, proposal: dict[st
         (item_id, scope, kind, title, normalize_text(title), proposal["statement"], status, to_json(attributes), ts, ts),
     )
     db.add_revision(c, "work_item", item_id, 1, _snapshot(c, item_id), reason, ts, new_id(), actor=actor)
+    _index(c, [item_id])
     return item_id
 
 
