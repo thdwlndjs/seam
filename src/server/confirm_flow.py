@@ -5,7 +5,7 @@
 - [고치기]: 카드에 입력칸이 없어 채팅으로 고친다. `3: 새 문장`(3번 제목 바꾸기), `+ 할 일: 문장`(추가),
   `- n`(지우기, [삭제 n] 버튼은 12번까지), [다 고쳤어요]. 고친 전후는 정답지(extract_corrections)로 남는다. 세션은 10분.
 - 직접 반영이 100초 시한 안에 안 끝나면 "끝나면 메인 카드에 올려 둘게요"라고 답하고 이어서 정리한다.
-- 되돌리기·삭제 확인은 권한자만(Phase 5 전까지는 관리자: team_configs.json의 admin_aad_id).
+- 되돌리기·삭제 확인은 권한자만(main._is_approver → worklog.people.can_approve). 다른 팀원에게는 그 버튼이 안 보인다.
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ async def show_preview(turn: Any, team_key: str, page_id: str, items: list[dict]
     await turn.send_buttons("\n".join([header, *_preview_lines(items, numbered=False)]), buttons)
 
 
-async def apply_page(turn: Any, team_key: str, page_id: str) -> None:
+async def apply_page(turn: Any, team_key: str, page_id: str, approver: bool = True) -> None:
     session = edit_sessions.get(turn.aad_id)
     corrected = None
     if session and session["page_id"] == page_id and session["team_key"] == team_key:
@@ -148,6 +148,7 @@ async def apply_page(turn: Any, team_key: str, page_id: str) -> None:
         lines.append(f"🔁 결정이 바뀌었어요: {change['old']} → {change['new']}")
         buttons.append({"title": f"↩️ 되돌리기: {change['new'][:20]}", "data": {"action": "revert",
                                                                               "candidate_id": change["candidate_id"]}})
+    buttons = for_viewer(buttons, approver)
     if buttons:
         await turn.send_buttons("\n".join(lines), buttons)
     else:
@@ -252,23 +253,27 @@ def _save_corrections(session: dict, actor: str) -> None:
 
 # ── 최근 반영 내역·되돌리기 ─────────────────────────────────
 
-async def show_applied_list(turn: Any, team_key: str) -> None:
+async def show_applied_list(turn: Any, team_key: str, approver: bool = True) -> None:
     rows = await asyncio.to_thread(apply.recent_applied, _store(), team_key, 10)
     if not rows:
         await turn.send("아직 반영한 항목이 없어요.")
         return
-    lines = ["↩️ 최근 반영 내역 (되돌리기는 관리자만)"]
+    lines = ["↩️ 최근 반영 내역 (되돌리기는 권한자만)"]
     buttons = []
     for n, row in enumerate(rows, 1):
         change = f" (대체: {row['target_title']})" if row["change_type"] == "superseding" and row["target_title"] else ""
         lines.append(f"{n}. ({KIND_LABELS.get(row['kind'], row['kind'])}) {row['title']}{change} · {row['decided_by']}")
         buttons.append({"title": f"↩️ {n}", "data": {"action": "revert", "candidate_id": row["id"]}})
-    await turn.send_buttons("\n".join(lines), buttons)
+    buttons = for_viewer(buttons, approver)
+    if buttons:
+        await turn.send_buttons("\n".join(lines), buttons)
+    else:
+        await turn.send("\n".join(lines))
 
 
 async def revert(turn: Any, team_key: str, candidate_id: str, is_approver: bool) -> None:
     if not is_approver:
-        await turn.send("되돌리기는 관리자만 할 수 있어요.")
+        await turn.send("되돌리기는 권한자(관리자·개발·권한을 받은 사람)만 할 수 있어요.")
         return
     try:
         await asyncio.to_thread(apply.revert, _store(), candidate_id, turn.user_name or turn.aad_id)
@@ -280,7 +285,7 @@ async def revert(turn: Any, team_key: str, candidate_id: str, is_approver: bool)
 
 async def resolve_gone(turn: Any, team_key: str, part_id: str, remove: bool, is_approver: bool) -> None:
     if not is_approver:
-        await turn.send("삭제 확인은 관리자만 할 수 있어요.")
+        await turn.send("삭제 확인은 권한자(관리자·개발·권한을 받은 사람)만 할 수 있어요.")
         return
     removed = await asyncio.to_thread(apply.resolve_gone_part, _store(), team_key, part_id, remove,
                                       turn.user_name or turn.aad_id)
@@ -289,8 +294,17 @@ async def resolve_gone(turn: Any, team_key: str, part_id: str, remove: bool, is_
 
 # ── 메인 카드 알림 ───────────────────────────────────────
 
-def main_card_alerts(team_key: str) -> tuple[list[str], list[dict]]:
-    """메인 카드 위쪽 알림(최대 5개)과 버튼. Notion·LLM을 부르지 않는다."""
+APPROVER_ACTIONS = {"revert", "gone_remove", "gone_keep", "stage_answer"}
+
+
+def for_viewer(buttons: list[dict], approver: bool) -> list[dict]:
+    """권한자만 누를 수 있는 버튼(되돌리기·삭제 확인·단계 답)은 다른 팀원에게 보이지 않는다(spec P2-5, A14)."""
+    return buttons if approver else [b for b in buttons if b["data"].get("action") not in APPROVER_ACTIONS]
+
+
+def main_card_alerts(team_key: str, approver: bool = True) -> tuple[list[str], list[dict]]:
+    """메인 카드 위쪽 알림(최대 5개)과 버튼. Notion·LLM을 부르지 않는다. 권한 없는 사람에게는 답 버튼을 빼고
+    "권한자가 답해요"를 붙인다."""
     store = _store()
     lines: list[str] = []
     buttons: list[dict] = []
@@ -308,13 +322,17 @@ def main_card_alerts(team_key: str) -> tuple[list[str], list[dict]]:
         buttons.append({"title": f"↩️ 되돌리기: {change['title'][:18]}", "data": {"action": "revert", "candidate_id": change["id"]}})
     for gone in apply.gone_confirmed_parts(store, team_key)[:2]:
         title = gone["path"].rsplit(" > ", 1)[-1]
-        lines.append(f"🗑 회의록에서 사라진 부분: {title} — 거기서 나온 항목을 지울까요? (관리자)")
+        lines.append(f"🗑 회의록에서 사라진 부분: {title} — 거기서 나온 항목을 지울까요?")
         buttons += [{"title": f"지우기: {title[:16]}", "data": {"action": "gone_remove", "part_id": gone["id"]}},
                     {"title": f"그대로: {title[:16]}", "data": {"action": "gone_keep", "part_id": gone["id"]}}]
     working = parts.pending_count(store, team_key, _version())
     if working:
         lines.append(f"⏳ 회의록 {working}건 정리 중")
-    return lines[:5], buttons
+    shown = for_viewer(buttons, approver)
+    lines = lines[:5]
+    if len(shown) < len(buttons):
+        lines.append("(🔒 되돌리기·삭제 확인은 권한자가 답해요)")
+    return lines, shown
 
 
 # ── 회의록 올리기 (Notion 밖 회의록, spec P1-7) ──────────────────

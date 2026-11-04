@@ -52,6 +52,7 @@ from pydantic import BaseModel
 load_dotenv(os.environ.get("ENV_FILE"))
 
 import confirm_flow  # noqa: E402
+import member_flow  # noqa: E402
 import meeting_inputs  # noqa: E402
 import llm_queue  # noqa: E402
 import metrics  # noqa: E402
@@ -59,6 +60,7 @@ import notion_map  # noqa: E402
 import worklog_bridge  # noqa: E402
 from worklog import apply as wapply  # noqa: E402
 from worklog import parts as wparts  # noqa: E402
+from worklog import people  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
 # ── 설정 ────────────────────────────────────────────────
@@ -246,13 +248,29 @@ def _save_member_profiles(data: dict) -> None:
 
 
 def _get_github_id(aad_id: str) -> str | None:
+    """GitHub 아이디: worklog의 members(v1.1)가 먼저, 없으면 예전 member_profiles.json."""
+    member = people.get(worklog_bridge.WORKLOG_STORE, aad_id)
+    if member and member["github_login"]:
+        return member["github_login"]
     return _load_member_profiles().get(aad_id, {}).get("github_id")
 
 
 def _set_github_id(aad_id: str, github_id: str) -> None:
+    people.set_github(worklog_bridge.WORKLOG_STORE, aad_id, github_id)
     profiles = _load_member_profiles()
     profiles.setdefault(aad_id, {})["github_id"] = github_id
     _save_member_profiles(profiles)
+
+
+def _sync_member(turn: "Turn", config: dict) -> None:
+    """말을 건 사람을 팀원으로 기록하고, 예전 파일의 값(관리자, GitHub 아이디)을 이 사람 몫만 옮긴다(spec P2-2)."""
+    store = worklog_bridge.WORKLOG_STORE
+    member = people.touch(store, turn.team_key, turn.aad_id, turn.user_name)
+    if config.get("admin_aad_id") == turn.aad_id and not people.is_admin(store, turn.team_key, turn.aad_id):
+        people.set_admin(store, turn.team_key, turn.aad_id)
+    legacy = _load_member_profiles().get(turn.aad_id, {}).get("github_id")
+    if legacy and not member["github_login"]:
+        people.set_github(store, turn.aad_id, legacy)
 
 
 def _get_config(team_key: str) -> dict | None:
@@ -430,25 +448,71 @@ async def handle_turn(turn: Turn) -> None:
         await _send_welcome(turn)
         return
 
+    config = _get_config(turn.team_key)
+    if config is not None:
+        await asyncio.to_thread(_sync_member, turn, config)
+
     # 카드 버튼(Action.Submit / Action.Execute) — 에코봇이 data를 value에 그대로 실어 보낸다.
     value = turn.req.value
     if isinstance(value, dict):
         action = value.get("action")
-        if action == "menu" and "choice" in value:
-            await _run_action(turn, str(value["choice"]))
+        if action == "set_role" and value.get("role") in people.ROLES:
+            await member_flow.handle_role(turn, str(value["role"]), lambda resume: _resume(turn, resume))
             return
-        if action == "claim_issue" and "issue_number" in value:
-            await _handle_claim_click(turn, int(value["issue_number"]))
+        if action == "onboard_skip":
+            await member_flow.handle_skip(turn, lambda resume: _resume(turn, resume))
             return
-        if action == "dismiss_claim_card":
-            await turn.send("알겠어요, 넘어갈게요.")
+        if action in ("perm_toggle", "perm_admin"):
+            await member_flow.toggle_permission(turn, str(value.get("user") or ""), action == "perm_admin")
             return
-        if action in _CONFIRM_ACTIONS:
-            await _handle_confirm_action(turn, action, value)
+        if await _onboarding_gate(turn, config, {"value": value}):
+            return
+        if await _dispatch_value(turn, value):
             return
 
     raw_text = turn.req.text.strip()
     aad_id = turn.aad_id
+    await _handle_text(turn, config, raw_text, aad_id)
+
+
+async def _onboarding_gate(turn: "Turn", config: dict | None, resume: dict) -> bool:
+    """처음 쓰는 팀원은 역할부터 고른다(필수, spec P2-2). 등록을 시작했으면 True."""
+    if config is None or not member_flow.enabled() or turn.aad_id in setup_sessions:
+        return False
+    if member_flow.has_session(turn.aad_id) or not member_flow.needs_onboarding(turn.aad_id):
+        return False
+    await member_flow.start(turn, resume)
+    return True
+
+
+async def _resume(turn: "Turn", resume: dict) -> None:
+    """처음 등록 뒤 처음 하려던 동작을 이어서 한다."""
+    if "value" in resume:
+        await _dispatch_value(turn, resume["value"])
+    elif resume.get("menu"):
+        await _run_action(turn, resume["menu"])
+
+
+async def _dispatch_value(turn: "Turn", value: dict) -> bool:
+    """카드 버튼 하나를 처리한다. 처리했으면 True."""
+    action = value.get("action")
+    if action == "menu" and "choice" in value:
+        await _run_action(turn, str(value["choice"]))
+    elif action == "claim_issue" and "issue_number" in value:
+        await _handle_claim_click(turn, int(value["issue_number"]))
+    elif action == "dismiss_claim_card":
+        await turn.send("알겠어요, 넘어갈게요.")
+    elif action in _CONFIRM_ACTIONS:
+        await _handle_confirm_action(turn, action, value)
+    else:
+        return False
+    return True
+
+
+async def _handle_text(turn: "Turn", config: dict | None, raw_text: str, aad_id: str) -> None:
+    if raw_text.lower() not in _CANCEL_TRIGGERS and member_flow.has_session(aad_id):
+        await member_flow.handle_text(turn, raw_text, lambda resume: _resume(turn, resume))  # 처음 등록·별칭
+        return
 
     # 채팅 메시지는 저장하지 않는다. 예전엔 메뉴가 아닌 메시지를 몰래 저장해 변경 후보를 만들었다(v1.1에서 없앰,
     # docs/v1.1/spec.md P1-0). 회의록은 Notion이나 '회의록 올리기'로만 받는다.
@@ -480,6 +544,17 @@ async def handle_turn(turn: Turn) -> None:
         await _start_setup(turn)
         return
 
+    if raw_text == "별칭" and config is not None:
+        await member_flow.start_aliases(turn)
+        return
+
+    if raw_text == "권한" and config is not None:
+        await member_flow.show_team_card(turn)
+        return
+
+    if re.fullmatch(r"[1-4]", raw_text) and await _onboarding_gate(turn, config, {"menu": raw_text}):
+        return
+
     if _GREETING_RE.fullmatch(raw_text):
         await turn.send("Hello! How can I assist you today?")
         return
@@ -502,6 +577,8 @@ def _cancel_pending_sessions(aad_id: str) -> bool:
     if confirm_flow.edit_sessions.pop(aad_id, None) is not None:
         cancelled = True
     if confirm_flow.upload_sessions.pop(aad_id, None) is not None:
+        cancelled = True
+    if member_flow.sessions.pop(aad_id, None) is not None:
         cancelled = True
     return cancelled
 
@@ -580,6 +657,8 @@ async def _handle_setup_message(turn: Turn, raw_text: str) -> None:
         configs = _load_team_configs()
         configs[session["team_key"]] = session["data"]
         _save_team_configs(configs)
+        people.touch(worklog_bridge.WORKLOG_STORE, session["team_key"], aad_id, turn.user_name)
+        people.set_admin(worklog_bridge.WORKLOG_STORE, session["team_key"], aad_id)
         del setup_sessions[aad_id]
         await turn.send(f"**✅ 설정 완료**\n\n{summary}\n\n이제 1~4번 이 설정으로 동작해요.")
         return
@@ -1211,8 +1290,10 @@ _CONFIRM_ACTIONS = {"apply_list", "apply_pick", "apply_pick_ready", "part_apply"
 
 
 def _is_approver(turn: Turn, config: dict) -> bool:
-    """되돌리기·삭제 확인을 할 수 있는 사람. 역할·권한(Phase 5) 전까지는 관리자만."""
-    return bool(config.get("admin_aad_id")) and config.get("admin_aad_id") == turn.aad_id
+    """승인·되돌리기·게이트 답·삭제 확인을 할 수 있는 사람(spec P2-1). 판정은 people.can_approve 하나로."""
+    if config.get("admin_aad_id") and config.get("admin_aad_id") == turn.aad_id:
+        return True
+    return people.can_approve(worklog_bridge.WORKLOG_STORE, turn.team_key, turn.aad_id)
 
 
 async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
@@ -1232,7 +1313,7 @@ async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
     elif action == "apply_pick_ready":  # 메인 카드의 확인 대기: 이미 정리돼 있으니 바로 미리보기
         await confirm_flow.show_preview(turn, team, page_id)
     elif action == "part_apply":
-        await confirm_flow.apply_page(turn, team, page_id)
+        await confirm_flow.apply_page(turn, team, page_id, _is_approver(turn, config))
     elif action == "part_edit":
         await confirm_flow.start_edit(turn, team, page_id)
     elif action == "part_cancel":
@@ -1242,7 +1323,7 @@ async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
     elif action == "edit_done":
         await confirm_flow.finish_edit(turn)
     elif action == "applied_list":
-        await confirm_flow.show_applied_list(turn, team)
+        await confirm_flow.show_applied_list(turn, team, _is_approver(turn, config))
     elif action == "revert":
         await confirm_flow.revert(turn, team, str(value.get("candidate_id") or ""), _is_approver(turn, config))
     elif action == "upload_notes":
@@ -1257,7 +1338,8 @@ async def _send_welcome(turn: Turn) -> None:
     config = _get_config(turn.team_key)
     if config is not None:
         try:
-            lines, buttons = await asyncio.to_thread(confirm_flow.main_card_alerts, turn.team_key)
+            lines, buttons = await asyncio.to_thread(confirm_flow.main_card_alerts, turn.team_key,
+                                                     _is_approver(turn, config))
             if not config.get("notes_found_noticed"):
                 notice = await asyncio.to_thread(confirm_flow.first_scan_notice, turn.team_key)
                 if notice is not None:

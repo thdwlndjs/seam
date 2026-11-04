@@ -129,7 +129,7 @@ class ConfirmFlowTests(unittest.TestCase):
     def test_only_the_approver_can_revert(self) -> None:
         self.post({"action": "part_apply", "page_id": "unit-1"})
         candidate_id = apply.recent_applied(self.store, SCOPE)[0]["id"]
-        self.assertIn("관리자만", self.post({"action": "revert", "candidate_id": candidate_id}))
+        self.assertIn("권한자", self.post({"action": "revert", "candidate_id": candidate_id}))
         before = self.titles()
         self.assertIn("되돌렸어요", self.post({"action": "revert", "candidate_id": candidate_id}, aad_id="admin"))
         live = {i["title"] for group in apply.live_items(self.store, SCOPE).values() for i in group}
