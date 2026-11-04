@@ -18,6 +18,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import llm_queue
+import meeting_inputs
 import worklog_bridge
 from worklog import apply, parts
 
@@ -55,6 +56,7 @@ SUBMENU = [
     {"title": "✅ 완료한 작업 공유", "data": {"action": "menu", "choice": "4-1"}},
     {"title": "📝 Notion 변경 반영", "data": {"action": "apply_list"}},
     {"title": "↩️ 최근 반영 내역", "data": {"action": "applied_list"}},
+    {"title": "📤 회의록 올리기", "data": {"action": "upload_notes"}},
 ]
 
 
@@ -309,3 +311,92 @@ def main_card_alerts(team_key: str) -> tuple[list[str], list[dict]]:
     if working:
         lines.append(f"⏳ 회의록 {working}건 정리 중")
     return lines[:5], buttons
+
+
+# ── 회의록 올리기 (Notion 밖 회의록, spec P1-7) ──────────────────
+
+UPLOAD_SESSION_SECONDS = 600
+UPLOAD_PROMPT = ("📤 회의록을 보내 주세요\n"
+                 "· 텍스트를 그대로 붙여넣거나\n"
+                 "· txt·docx 파일(클로바노트에서 내려받은 파일도 돼요)\n"
+                 "받으면 바로 정리해서 미리보기를 보여 드려요. (그만두려면 '취소')")
+# aad_id → {"team_key", "at"}
+upload_sessions: dict[str, dict[str, Any]] = {}
+
+
+async def start_upload(turn: Any, team_key: str) -> None:
+    edit_sessions.pop(turn.aad_id, None)
+    upload_sessions[turn.aad_id] = {"team_key": team_key, "at": time.monotonic()}
+    await turn.send(UPLOAD_PROMPT)
+
+
+def has_upload_session(aad_id: str) -> bool:
+    session = upload_sessions.get(aad_id)
+    if session and time.monotonic() - session["at"] > UPLOAD_SESSION_SECONDS:
+        upload_sessions.pop(aad_id, None)
+        return False
+    return session is not None
+
+
+async def download(url: str) -> bytes:
+    """첨부 파일 내려받기. Teams 개인 채팅의 downloadUrl은 미리 인증된 주소라 토큰이 필요 없다."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        if len(response.content) > meeting_inputs.MAX_FILE_BYTES:
+            raise ValueError("파일이 너무 커요(2MB까지)")
+        return response.content
+
+
+async def handle_upload(turn: Any, text: str, attachments: list[dict]) -> None:
+    """회의록 올리기 다음에 온 메시지(텍스트나 파일)를 회의록으로 받아 미리보기까지 간다."""
+    session = upload_sessions[turn.aad_id]
+    team_key = session["team_key"]
+    files = meeting_inputs.attachment_files(attachments)
+    name: str | None = None
+    if files:
+        name = files[0].get("name") or "회의록.txt"
+        try:
+            data = await download(files[0]["url"])
+            md = await asyncio.to_thread(meeting_inputs.file_to_md, name, data)
+        except Exception as error:
+            traceback.print_exc()
+            await turn.send(f"파일을 받지 못했어요({error}). 내용을 텍스트로 붙여넣어 주세요.")
+            return
+    elif attachments and not text.strip():
+        await turn.send("txt·docx 파일만 받을 수 있어요. 다른 형식이면 내용을 텍스트로 붙여넣어 주세요.")
+        return
+    elif meeting_inputs.has_clova_link(text) and len(meeting_inputs.CLOVA_LINK_RE.sub("", text).strip()) < meeting_inputs.MIN_CHARS:
+        await turn.send(meeting_inputs.CLOVA_LINK_REPLY)
+        return
+    else:
+        md = meeting_inputs.text_to_md(text)
+    if len(parts.md_to_text(md).strip()) < meeting_inputs.MIN_CHARS:
+        await turn.send("회의록으로 보기엔 너무 짧아요. 회의 내용을 붙여넣거나 파일을 보내 주세요.")
+        return
+    upload_sessions.pop(turn.aad_id, None)
+    origin = meeting_inputs.guess_origin(name, parts.md_to_text(md))
+    title = meeting_inputs.title_of(name, md)
+    page_id = await asyncio.to_thread(meeting_inputs.save_note, _store(), team_key, md, title, origin,
+                                      turn.user_name or turn.aad_id)
+    source = "클로바노트" if origin == "clova" else "Teams"
+    await turn.send(f"📥 '{title}' 회의록을 받았어요({source}). 정리할게요.")
+
+    async def nothing_to_sync() -> None:
+        return None
+
+    await pick_page(turn, team_key, page_id, nothing_to_sync)
+
+
+def first_scan_notice(team_key: str) -> tuple[str, list[dict]] | None:
+    """첫 수집이 끝났으면(판정 전 부분 없음) 찾은 회의록 수 안내. 아직이면 None. 메인 카드에 한 번만 띄운다."""
+    found = parts.list_parts(_store(), team_key)
+    if not found or any(p["kind"] is None and p["parent_part_id"] is None for p in found):
+        return None
+    pages = {p["page_id"] for p in found if p["kind"] == "meeting" and p["origin"] == "notion"}
+    if pages:
+        return f"📚 Notion에서 회의록 {len(pages)}건을 찾았어요. 확인할 것은 위 '확인 대기'나 4번 ②에 있어요.", []
+    return ("📚 Notion에서 회의록을 못 찾았어요. 회의록이 다른 곳에 있나요?",
+            [{"title": "📤 회의록 올리기", "data": {"action": "upload_notes"}}])

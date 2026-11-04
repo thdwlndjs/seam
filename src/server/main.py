@@ -52,6 +52,7 @@ from pydantic import BaseModel
 load_dotenv(os.environ.get("ENV_FILE"))
 
 import confirm_flow  # noqa: E402
+import meeting_inputs  # noqa: E402
 import llm_queue  # noqa: E402
 import metrics  # noqa: E402
 import notion_map  # noqa: E402
@@ -114,6 +115,12 @@ class TurnConversation(BaseModel):
     type: str | None = None  # "personal" | "channel" | "groupChat"
 
 
+class TurnAttachment(BaseModel):
+    name: str | None = None
+    content_type: str | None = None
+    url: str | None = None  # Teams 파일은 content.downloadUrl, 그 밖은 contentUrl
+
+
 class TurnRequest(BaseModel):
     kind: str = "message"  # "message" | "welcome"
     user: TurnUser
@@ -124,6 +131,7 @@ class TurnRequest(BaseModel):
     conversation: TurnConversation | None = None
     message_id: str | None = None
     sent_at: str | None = None
+    attachments: list[TurnAttachment] = []
 
 
 class Turn:
@@ -452,6 +460,14 @@ async def handle_turn(turn: Turn) -> None:
         await turn.send("취소했어요. 처음부터 다시 하려면 원하는 메뉴나 '설정'을 입력해주세요.")
         return
 
+    if confirm_flow.has_upload_session(aad_id):  # 4번 ④ 회의록 올리기 다음 메시지
+        await confirm_flow.handle_upload(turn, turn.req.text, [a.model_dump() for a in turn.req.attachments])
+        return
+
+    if meeting_inputs.has_clova_link(raw_text):
+        await turn.send(meeting_inputs.CLOVA_LINK_REPLY)
+        return
+
     if aad_id in setup_sessions:
         await _handle_setup_message(turn, raw_text)
         return
@@ -484,6 +500,8 @@ def _cancel_pending_sessions(aad_id: str) -> bool:
         del github_onboarding_sessions[aad_id]
         cancelled = True
     if confirm_flow.edit_sessions.pop(aad_id, None) is not None:
+        cancelled = True
+    if confirm_flow.upload_sessions.pop(aad_id, None) is not None:
         cancelled = True
     return cancelled
 
@@ -1188,7 +1206,8 @@ def _stored_items(team_key: str) -> dict:
 
 # ── 4번 반영 흐름·메인 카드 알림 (confirm_flow) ─────────────
 _CONFIRM_ACTIONS = {"apply_list", "apply_pick", "apply_pick_ready", "part_apply", "part_edit", "part_cancel",
-                    "edit_delete", "edit_done", "applied_list", "revert", "gone_remove", "gone_keep"}
+                    "edit_delete", "edit_done", "applied_list", "revert", "gone_remove", "gone_keep",
+                    "upload_notes"}
 
 
 def _is_approver(turn: Turn, config: dict) -> bool:
@@ -1226,6 +1245,8 @@ async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
         await confirm_flow.show_applied_list(turn, team)
     elif action == "revert":
         await confirm_flow.revert(turn, team, str(value.get("candidate_id") or ""), _is_approver(turn, config))
+    elif action == "upload_notes":
+        await confirm_flow.start_upload(turn, team)
     elif action in ("gone_remove", "gone_keep"):
         await confirm_flow.resolve_gone(turn, team, str(value.get("part_id") or ""), action == "gone_remove",
                                         _is_approver(turn, config))
@@ -1233,9 +1254,17 @@ async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
 
 async def _send_welcome(turn: Turn) -> None:
     """메인 카드: 알림(확인 대기·결정 대체·삭제 확인·정리 중)을 먼저, 그다음 메뉴."""
-    if _get_config(turn.team_key) is not None:
+    config = _get_config(turn.team_key)
+    if config is not None:
         try:
             lines, buttons = await asyncio.to_thread(confirm_flow.main_card_alerts, turn.team_key)
+            if not config.get("notes_found_noticed"):
+                notice = await asyncio.to_thread(confirm_flow.first_scan_notice, turn.team_key)
+                if notice is not None:
+                    lines, buttons = [*lines, notice[0]], [*buttons, *notice[1]]
+                    configs = _load_team_configs()
+                    configs.setdefault(turn.team_key, config)["notes_found_noticed"] = True
+                    _save_team_configs(configs)
         except Exception:
             traceback.print_exc()
             lines, buttons = [], []
