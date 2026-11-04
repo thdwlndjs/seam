@@ -140,6 +140,14 @@ class ConfirmFlowTests(unittest.TestCase):
         self.assertIn("📥 새 회의록 1건 확인 대기", lines)
         self.assertEqual(buttons[0]["data"], {"action": "apply_pick_ready", "page_id": "unit-1"})
 
+    def test_admin_is_reminded_once_about_notes_waiting_over_three_days(self) -> None:
+        lines, _ = confirm_flow.main_card_alerts(SCOPE, approver=True, admin=False)
+        self.assertFalse([line for line in lines if "3일" in line])  # 관리자에게만
+        lines, _ = confirm_flow.main_card_alerts(SCOPE, approver=True, admin=True)  # 2026-11-01 수정 → 3일 넘음
+        self.assertIn("⏰ 확인 대기가 3일 넘은 회의록 1건 — 팀원에게 확인을 부탁해 주세요", lines)
+        lines, _ = confirm_flow.main_card_alerts(SCOPE, approver=True, admin=True)
+        self.assertFalse([line for line in lines if "3일" in line])  # 한 번만
+
     def test_apply_over_deadline_answers_and_keeps_working(self) -> None:  # A32
         finished = []
 

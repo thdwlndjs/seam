@@ -317,7 +317,7 @@ def for_viewer(buttons: list[dict], approver: bool) -> list[dict]:
     return buttons if approver else [b for b in buttons if b["data"].get("action") not in APPROVER_ACTIONS]
 
 
-def main_card_alerts(team_key: str, approver: bool = True) -> tuple[list[str], list[dict]]:
+def main_card_alerts(team_key: str, approver: bool = True, admin: bool = False) -> tuple[list[str], list[dict]]:
     """메인 카드 위쪽 알림(최대 5개)과 버튼. Notion·LLM을 부르지 않는다. 권한 없는 사람에게는 답 버튼을 빼고
     "권한자가 답해요"를 붙인다."""
     store = _store()
@@ -328,6 +328,9 @@ def main_card_alerts(team_key: str, approver: bool = True) -> tuple[list[str], l
         lines.append(f"📥 새 회의록 {len(pending)}건 확인 대기")
         buttons += [{"title": f"확인하기: {p['title'][:20]}", "data": {"action": "apply_pick_ready", "page_id": p["page_id"]}}
                     for p in pending[:3]]
+        stale = apply.stale_pending_once(store, team_key) if admin else []
+        if stale:
+            lines.append(f"⏰ 확인 대기가 {apply.STALE_DAYS}일 넘은 회의록 {len(stale)}건 — 팀원에게 확인을 부탁해 주세요")
     edited = apply.auto_applied_count(store, team_key)
     if edited:
         lines.append(f"✍️ 확인된 회의록이 수정돼 {edited}건을 반영했어요 (최근 24시간)")

@@ -1512,8 +1512,10 @@ async def _send_welcome(turn: Turn) -> None:
     config = _get_config(turn.team_key)
     if config is not None:
         try:
+            admin = config.get("admin_aad_id") == turn.aad_id or people.is_admin(
+                worklog_bridge.WORKLOG_STORE, turn.team_key, turn.aad_id)
             lines, buttons = await asyncio.to_thread(confirm_flow.main_card_alerts, turn.team_key,
-                                                     _is_approver(turn, config))
+                                                     _is_approver(turn, config), admin)
             if not config.get("notes_found_noticed"):
                 notice = await asyncio.to_thread(confirm_flow.first_scan_notice, turn.team_key)
                 if notice is not None:

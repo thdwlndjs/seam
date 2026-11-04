@@ -416,3 +416,22 @@ def take_task(store: Path, scope: str, item_id: str, assignee: str, actor: str) 
         attributes["assignee"] = assignee
         core._write_item(c, item_id, {"attributes_json": attributes}, "내가 맡기", actor, db.now())
     return {"id": item_id, "title": row["title"], "assignee": assignee, "issue_refs": attributes.get("issue_refs") or []}
+
+
+STALE_DAYS = 3  # [가정] 확인 대기가 이보다 오래 쌓이면 관리자에게 한 번 더 알린다(spec P2-5)
+
+
+def stale_pending_once(store: Path, scope: str, now: datetime | None = None) -> list[dict[str, Any]]:
+    """3일 넘게 확인을 기다리는 회의록 중 아직 관리자에게 알리지 않은 것. 돌려준 것은 알린 것으로 남긴다."""
+    limit = (now or datetime.now().astimezone()) - timedelta(days=STALE_DAYS)
+    stale = [p for p in pending_pages(store, scope) if p["last_edited"] and _parse(p["last_edited"]) <= limit]
+    if not stale:
+        return []
+    with db.write(store) as c:
+        told = {r["key"] for r in c.execute(
+            "SELECT key FROM prompts_asked WHERE scope = ? AND kind = 'pending_reminder'", (scope,))}
+        fresh = [p for p in stale if p["page_id"] not in told]
+        for page in fresh:
+            c.execute("""INSERT INTO prompts_asked(scope, kind, key, answer, asked_at, answered_at)
+                         VALUES (?, 'pending_reminder', ?, 'shown', ?, ?)""", (scope, page["page_id"], db.now(), db.now()))
+    return fresh
