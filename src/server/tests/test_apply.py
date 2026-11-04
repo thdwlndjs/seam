@@ -15,6 +15,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from unittest.mock import patch  # noqa: E402
+
+import confirm_flow  # noqa: E402
+import worklog_bridge  # noqa: E402
 from test_extracts import FakeExtractor  # noqa: E402
 from test_parts import SAMPLE_BLOCKS, SAMPLE_MD, split_classifier  # noqa: E402
 from worklog import apply, core, parts  # noqa: E402
@@ -102,6 +106,13 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(new_titles, ["센서 단가 조사"])  # 원래 있던 항목은 다시 반영하지 않는다
         self.assertEqual(len(self.items()), count + 1)
         self.assertEqual(apply.apply_edits(self.store, SCOPE, V), [])  # 한 번 반영하면 끝
+        self.assertEqual(apply.auto_applied_count(self.store, SCOPE), 1)  # 메인 카드 "반영 n건"
+        later = datetime.now(timezone.utc) + timedelta(days=2)
+        self.assertEqual(apply.auto_applied_count(self.store, SCOPE, now=later), 0)
+        with patch.object(worklog_bridge, "WORKLOG_STORE", self.store):
+            lines, buttons = confirm_flow.main_card_alerts(SCOPE)
+        self.assertIn("✍️ 확인된 회의록이 수정돼 1건을 반영했어요 (최근 24시간)", lines)
+        self.assertIn({"action": "applied_list"}, [b["data"] for b in buttons])
 
     def test_a_deleted_confirmed_part_keeps_its_items_until_approved(self) -> None:  # A10
         apply.apply_page(self.store, SCOPE, "unit-1", "송지원", V)

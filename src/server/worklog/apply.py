@@ -163,6 +163,9 @@ def meeting_parts(store: Path, scope: str, page_id: str) -> list[dict[str, Any]]
     return [p for p in parts.list_parts(store, scope, page_id=page_id) if p["kind"] == "meeting"]
 
 
+AUTO_ACTOR = "자동(확인된 회의록 수정)"
+
+
 def apply_edits(store: Path, scope: str, prompt_version: str, judge: core.Judge | None = None) -> list[dict[str, Any]]:
     """이미 확인된 회의록이 수정됐을 때: 새로 추출한 결과에서 새로 생긴 항목만 자동으로 반영한다(알림용 결과)."""
     changed: list[dict[str, Any]] = []
@@ -179,7 +182,7 @@ def apply_edits(store: Path, scope: str, prompt_version: str, judge: core.Judge 
                             (part["applied_hash"] or "", prompt_version)).fetchone()
         seen = {(i["kind"], db.normalize_text(i["title"])) for i in json.loads(old["items_json"])} if old else set()
         fresh = [i for i in new_items if (i["kind"], db.normalize_text(i["title"])) not in seen]
-        summary = apply_part(store, scope, part["id"], "자동(확인된 회의록 수정)", prompt_version, fresh, judge)
+        summary = apply_part(store, scope, part["id"], AUTO_ACTOR, prompt_version, fresh, judge)
         if summary["results"]:
             changed.append({"part_id": part["id"], "path": part["path"], **summary})
     return changed
@@ -307,6 +310,16 @@ def recent_applied(store: Path, scope: str, limit: int = 10) -> list[dict[str, A
                WHERE cc.scope = ? AND cc.status = 'auto_applied' ORDER BY cc.decided_at DESC, cc.rowid DESC LIMIT ?""",
             (scope, limit)).fetchall()
     return [dict(r) for r in rows]
+
+
+def auto_applied_count(store: Path, scope: str, hours: int = 24, now: datetime | None = None) -> int:
+    """확인된 회의록이 수정돼 자동으로 반영된 항목 수(최근 hours시간). 메인 카드 "반영 n건" 알림."""
+    since = ((now or datetime.now().astimezone()) - timedelta(hours=hours)).astimezone()
+    db.initialize(store)
+    with closing(db.connect(store)) as c:
+        rows = c.execute("""SELECT decided_at FROM change_candidates WHERE scope = ? AND status = 'auto_applied'
+                            AND decided_by = ?""", (scope, AUTO_ACTOR)).fetchall()
+    return sum(1 for r in rows if r["decided_at"] and _parse(r["decided_at"]) >= since)
 
 
 def gone_confirmed_parts(store: Path, scope: str) -> list[dict[str, Any]]:

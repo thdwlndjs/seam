@@ -299,6 +299,10 @@ def main_card_alerts(team_key: str) -> tuple[list[str], list[dict]]:
         lines.append(f"📥 새 회의록 {len(pending)}건 확인 대기")
         buttons += [{"title": f"확인하기: {p['title'][:20]}", "data": {"action": "apply_pick_ready", "page_id": p["page_id"]}}
                     for p in pending[:3]]
+    edited = apply.auto_applied_count(store, team_key)
+    if edited:
+        lines.append(f"✍️ 확인된 회의록이 수정돼 {edited}건을 반영했어요 (최근 24시간)")
+        buttons.append({"title": "↩️ 최근 반영 내역", "data": {"action": "applied_list"}})
     for change in [r for r in apply.recent_applied(store, team_key, 5) if r["change_type"] == "superseding"][:2]:
         lines.append(f"🔁 결정이 바뀌었어요: {change['target_title']} → {change['title']}")
         buttons.append({"title": f"↩️ 되돌리기: {change['title'][:18]}", "data": {"action": "revert", "candidate_id": change["id"]}})
