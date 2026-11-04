@@ -400,3 +400,19 @@ def live_items(store: Path, scope: str) -> dict[str, list[dict[str, Any]]]:
             key = "needs_discussion" if item["status"] == "needs_discussion" else item["kind"]
             out.setdefault(key, []).append(item)
     return out
+
+
+def take_task(store: Path, scope: str, item_id: str, assignee: str, actor: str) -> dict[str, Any]:
+    """3번 [내가 맡기]: 할 일의 담당을 바꾸고 revisions에 남긴다(spec P2-7, A30). 바뀐 항목(이슈 번호 포함)."""
+    with db.write(store) as c:
+        row = c.execute("SELECT * FROM work_items WHERE id = ? AND scope = ?", (item_id, scope)).fetchone()
+        if row is None or row["kind"] != "task":
+            raise NotFoundError(f"할 일 {item_id} 없음")
+        if row["status"] in ("superseded", "reverted", "cancelled", "done"):
+            raise ConflictError("이미 끝났거나 되돌린 할 일이에요")
+        attributes = json.loads(row["attributes_json"])
+        if attributes.get("assignee") and attributes["assignee"] != assignee:
+            raise ConflictError(f"이미 {attributes['assignee']}님이 맡았어요")
+        attributes["assignee"] = assignee
+        core._write_item(c, item_id, {"attributes_json": attributes}, "내가 맡기", actor, db.now())
+    return {"id": item_id, "title": row["title"], "assignee": assignee, "issue_refs": attributes.get("issue_refs") or []}

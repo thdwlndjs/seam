@@ -57,6 +57,7 @@ SUBMENU = [
     {"title": "📝 Notion 변경 반영", "data": {"action": "apply_list"}},
     {"title": "↩️ 최근 반영 내역", "data": {"action": "applied_list"}},
     {"title": "📤 회의록 올리기", "data": {"action": "upload_notes"}},
+    {"title": "➕ 소스 추가", "data": {"action": "source_add"}},
 ]
 
 
@@ -308,7 +309,7 @@ async def resolve_gone(turn: Any, team_key: str, part_id: str, remove: bool, is_
 
 # ── 메인 카드 알림 ───────────────────────────────────────
 
-APPROVER_ACTIONS = {"revert", "gone_remove", "gone_keep", "stage_answer"}
+APPROVER_ACTIONS = {"revert", "gone_remove", "gone_keep", "stage_answer", "source_add"}
 
 
 def for_viewer(buttons: list[dict], approver: bool) -> list[dict]:
@@ -441,4 +442,5 @@ def first_scan_notice(team_key: str) -> tuple[str, list[dict]] | None:
     if pages:
         return f"📚 Notion에서 회의록 {len(pages)}건을 찾았어요. 확인할 것은 위 '확인 대기'나 4번 ②에 있어요.", []
     return ("📚 Notion에서 회의록을 못 찾았어요. 회의록이 다른 곳에 있나요?",
-            [{"title": "📤 회의록 올리기", "data": {"action": "upload_notes"}}])
+            [{"title": "➕ 소스 추가", "data": {"action": "source_add"}},
+             {"title": "📤 회의록 올리기", "data": {"action": "upload_notes"}}])
