@@ -34,6 +34,28 @@ KIND_ORDER = {"decision": 0, "open": 1, "task": 2, "insight": 3, "document": 4, 
 StageJudge = Callable[[dict], dict]
 
 
+PHASES = [("1", "문제 정의", ("1-1", "1-2", "1-3")), ("2", "VOC", ("2-1", "2-2", "2-3")),
+          ("3", "개발", ("3-1", "3-2", "3-3", "3-4"))]  # 상위 단계(카드 표시줄용). 세부 단계는 STAGES
+
+
+def phase_of(stage: str) -> str:
+    return next(no for no, _, members in PHASES if stage in members)
+
+
+def phases(stage: str) -> list[dict[str, str]]:
+    """상위 단계 표시줄: stage가 속한 상위 단계가 current, 앞은 done, 뒤는 todo."""
+    at = int(phase_of(stage))
+    return [{"no": no, "name": name, "state": "done" if int(no) < at else "current" if int(no) == at else "todo"}
+            for no, name, _ in PHASES]
+
+
+def stepper(highlight: str) -> list[dict[str, str]]:
+    """10단계 전체 목록(탭의 단계 상세 화면용): highlight 앞은 done, 그 단계는 current, 뒤는 todo."""
+    at = ORDER.index(highlight)
+    return [{"code": code, "name": name, "state": "done" if n < at else "current" if n == at else "todo"}
+            for n, (code, name) in enumerate(STAGES)]
+
+
 def label(stage: str | None) -> str:
     return f"{stage} {STAGE_NAMES.get(stage or '', '')}".strip() if stage else "시작 전"
 
@@ -223,18 +245,18 @@ def proposals(store: Path, scope: str) -> list[dict[str, Any]]:
     now = current(store, scope)
     target = first_open_stage(store, scope, found)
     out: list[dict[str, Any]] = []
+    answered = _answered(store, scope)
     if now is None:
-        missing = [g["text"] for g in gates(store, scope, target) if not _done(g, found)]
+        # 처음 단계 설정은 질문 하나: 회의록이 앞서 있으면 그 단계, 아니면 게이트 기준 단계가 맞는지 묻는다.
+        # [맞아요]는 그 단계로 저장하고 끝, [아니요]는 10단계 선택 카드로 이어진다(confirm_flow.answer_stage).
         ahead = found["discussing"].get("stage")
-        answers = [("start_here", "맞아요"), ("start_first", "1-1부터")]
-        note = ""
-        if ahead and ORDER.index(ahead) > ORDER.index(target):  # 게이트는 비었는데 논의는 더 앞서 있다
-            note = f" 회의록은 {label(ahead)} 내용까지 논의하고 있어요."
-            answers.insert(1, ("start_discussing", f"{ahead}로"))
-        out.append({"kind": "stage_init", "key": _key(target, ahead, *sorted(missing)), "stage": target, "ahead": ahead,
-                    "text": f"게이트로 보면 지금 {label(target)} 단계예요" + (f" (남은 것: {', '.join(missing)})" if missing else "")
-                            + f".{note} 어디서 시작할까요?",
-                    "answers": answers})
+        missing = [g["text"] for g in gates(store, scope, target) if not _done(g, found)]
+        follows_talk = bool(ahead and ORDER.index(ahead) > ORDER.index(target))
+        candidate = ahead if follows_talk else target
+        out.append({"kind": "stage_init", "key": _key("init", candidate, *sorted(missing)), "stage": candidate,
+                    "ahead": candidate if follows_talk else None,
+                    "text": f"회의록을 분석한 결과, 현재는 ‘{label(candidate)}’ 단계로 보여요. 맞나요?",
+                    "answers": [("start_discussing" if follows_talk else "start_here", "맞아요"), ("not_ahead", "아니요")]})
     else:
         stage_gates = gates(store, scope, now)
         open_gates = [g for g in stage_gates if not _done(g, found)]
@@ -266,7 +288,6 @@ def proposals(store: Path, scope: str) -> list[dict[str, Any]]:
             out.append({"kind": "pivot", "key": _key(now, assumption, *sorted(turned.get("evidence") or [])), "stage": now,
                         "text": f"'{assumption}'이 VOC에서 뒤집혔어요. 기획 단계(1-3)로 돌아갈까요?",
                         "answers": [("pivot", "돌아갈게요"), ("stay", "아니요")]})
-    answered = _answered(store, scope)
     return [p for p in out if (p["kind"], p["key"]) not in answered]
 
 
@@ -294,26 +315,38 @@ def _set_stage(c: Any, scope: str, stage: str, actor: str, reason: str) -> None:
               (scope, stage, actor, db.now(), json.dumps(history, ensure_ascii=False)))
 
 
-def answer(store: Path, scope: str, kind: str, key: str, reply: str, actor: str) -> str:
-    """권한자의 답을 반영한다(권한 확인은 부르는 쪽). 단계는 여기서만 바뀐다(A28). 사람에게 보일 결과 한 줄."""
+def with_ro(stage: str) -> str:
+    """'2-3 VOC 분석·반영'으로 / '2-1 VOC 설계'로 — 받침에 맞는 조사(ㄹ 받침·받침 없음은 "로")를 붙인다."""
+    name = label(stage)
+    code = ord(name[-1]) - 0xAC00
+    particle = "로" if 0 <= code < 11172 and code % 28 in (0, 8) else "으로"
+    return f"'{name}'{particle}"
+
+
+def answer(store: Path, scope: str, kind: str, key: str, reply: str, actor: str, stage_choice: str | None = None) -> str:
+    """권한자의 답을 반영한다(권한 확인은 부르는 쪽). 단계는 여기서만 바뀐다(A28). 사람에게 보일 결과 한 줄.
+    처음 단계 설정(stage_init): [맞아요]는 후보 단계를 저장, [아니요](not_ahead)는 저장 없이 선택 카드로 넘기고,
+    선택 카드의 [확인](choose)은 고른 단계(stage_choice)를 저장한다."""
     pending = {(p["kind"], p["key"]): p for p in proposals(store, scope)}
     prompt = pending.get((kind, key))
     if prompt is None:
         raise db.ConflictError("이미 답했거나 상황이 바뀐 질문이에요")
-    if reply not in {a for a, _ in prompt["answers"]}:
+    if reply not in {a for a, _ in prompt["answers"]} | ({"choose"} if kind == "stage_init" else set()):
         raise db.ValidationError(f"알 수 없는 답 {reply}")
     stage, gate_id = prompt["stage"], prompt.get("gate_id")
     message = "알겠어요."
+    if reply == "not_ahead":  # 아직 정한 것이 없다: 질문은 그대로 두어, 선택 카드를 놓쳐도 다시 물을 수 있다
+        return "알겠어요. 현재 진행 중인 단계를 선택해 주세요."
+    if reply == "choose" and stage_choice not in ORDER:
+        raise db.ValidationError("단계를 선택해 주세요.")
     with db.write(store) as c:
-        if reply == "start_here":
+        if reply in ("start_here", "start_discussing"):
             _set_stage(c, scope, stage, actor, "첫 제안")
-            message = f"현재 단계를 정했어요: {label(stage)}"
-        elif reply == "start_discussing" and prompt.get("ahead"):
-            _set_stage(c, scope, prompt["ahead"], actor, "첫 제안(논의 중인 단계)")
-            message = f"현재 단계를 정했어요: {label(prompt['ahead'])}. 앞 단계의 빈 게이트는 따로 물어볼게요."
-        elif reply == "start_first":
-            _set_stage(c, scope, ORDER[0], actor, "첫 제안")
-            message = f"현재 단계를 정했어요: {label(ORDER[0])}"
+            message = f"현재 단계를 {with_ro(stage)} 설정했어요."
+        elif reply == "choose":
+            _set_stage(c, scope, stage_choice, actor, "첫 제안(직접 선택)")
+            message = f"현재 단계를 {with_ro(stage_choice)} 설정했어요."
+            reply = f"choose:{stage_choice}"
         elif reply == "advance":
             nxt = ORDER[ORDER.index(stage) + 1]
             _set_stage(c, scope, nxt, actor, "게이트 충족")

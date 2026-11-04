@@ -71,7 +71,6 @@ class StageTests(unittest.TestCase):
         found = stages.proposals(self.store, SCOPE)
         self.assertEqual([p["kind"] for p in found], ["stage_init"])
         self.assertIn("1-2 방향 확정", found[0]["text"])
-        self.assertIn("주제 확정 결정이 있다", found[0]["text"])
         stages.answer(self.store, SCOPE, "stage_init", found[0]["key"], "start_here", "관리자")
         self.assertEqual(stages.current(self.store, SCOPE), "1-2")
         missing = [p["gate_id"] for p in stages.proposals(self.store, SCOPE) if p["kind"] == "gate_missing"]
@@ -132,7 +131,9 @@ class StageTests(unittest.TestCase):
         add_item(self.store, "i-voc-plan", "decision", "대학생 10명 인터뷰로 검증")
         judge = ScriptedJudge(self.judge.gates, discussing={"stage": "2-1", "evidence": ["i-voc-plan"]})
         stages.assess(self.store, SCOPE, {}, judge)
-        stages.answer(self.store, SCOPE, "stage_init", stages.proposals(self.store, SCOPE)[0]["key"], "start_here", "관리자")
+        key = stages.proposals(self.store, SCOPE)[0]["key"]
+        stages.answer(self.store, SCOPE, "stage_init", key, "not_ahead", "관리자")
+        stages.answer(self.store, SCOPE, "stage_init", key, "choose", "관리자", "1-2")  # 직접 선택: 1-2
         ahead = [p for p in stages.proposals(self.store, SCOPE) if p["kind"] == "skipped_ahead"]
         self.assertEqual({p["gate_id"] for p in ahead}, {"assumptions", "target_customer"})  # 1-3 단계의 빈 게이트
         target = next(p for p in ahead if p["gate_id"] == "target_customer")
@@ -147,8 +148,8 @@ class StageTests(unittest.TestCase):
         judge = ScriptedJudge(self.judge.gates, discussing={"stage": "2-2", "evidence": ["i-voc-run"]})
         stages.assess(self.store, SCOPE, {}, judge)
         init = stages.proposals(self.store, SCOPE)[0]
-        self.assertIn("2-2 VOC 수집 내용까지 논의하고 있어요", init["text"])
-        self.assertIn(("start_discussing", "2-2로"), init["answers"])
+        self.assertIn("회의록을 분석한 결과, 현재는 ‘2-2 VOC 수집’ 단계로 보여요. 맞나요?", init["text"])
+        self.assertEqual([a for a, _ in init["answers"]], ["start_discussing", "not_ahead"])  # 질문 하나, 답은 맞아요/아니요
         stages.answer(self.store, SCOPE, "stage_init", init["key"], "start_discussing", "관리자")
         self.assertEqual(stages.current(self.store, SCOPE), "2-2")
         behind = {p["gate_id"] for p in stages.proposals(self.store, SCOPE) if p["kind"] == "skipped_ahead"}
@@ -156,6 +157,37 @@ class StageTests(unittest.TestCase):
         self.assertEqual(behind, {"topic_decided", "core_problem", "assumptions", "target_customer", "voc_method"})
         missing = {p["gate_id"] for p in stages.proposals(self.store, SCOPE) if p["kind"] == "gate_missing"}
         self.assertEqual(missing, set())  # 2-2의 게이트(VOC 수집)는 insight로 충족
+
+    def test_no_opens_the_chooser_and_choosing_saves_once(self) -> None:
+        add_item(self.store, "i-voc-run", "insight", "커뮤니티 VOC에서 우산 분실 고민 반복")
+        stages.assess(self.store, SCOPE, {}, ScriptedJudge(self.judge.gates, discussing={"stage": "2-2", "evidence": ["i-voc-run"]}))
+        init = stages.proposals(self.store, SCOPE)[0]
+        self.assertIn("선택해 주세요", stages.answer(self.store, SCOPE, "stage_init", init["key"], "not_ahead", "관리자"))
+        self.assertIsNone(stages.current(self.store, SCOPE))  # 아직 저장하지 않는다
+        self.assertEqual(stages.proposals(self.store, SCOPE)[0]["key"], init["key"])  # 놓쳐도 다시 물을 수 있다
+        with self.assertRaises(db.ValidationError):  # 선택 없이 [확인]
+            stages.answer(self.store, SCOPE, "stage_init", init["key"], "choose", "관리자", None)
+        with self.assertRaises(db.ValidationError):  # 목록에 없는 단계
+            stages.answer(self.store, SCOPE, "stage_init", init["key"], "choose", "관리자", "9-9")
+        message = stages.answer(self.store, SCOPE, "stage_init", init["key"], "choose", "관리자", "1-3")
+        self.assertEqual(message, "현재 단계를 '1-3 구체화·타당성'으로 설정했어요.")
+        self.assertEqual(stages.current(self.store, SCOPE), "1-3")
+        with self.assertRaises(db.ConflictError):  # 이미 처리된 질문은 다시 저장하지 않는다
+            stages.answer(self.store, SCOPE, "stage_init", init["key"], "choose", "관리자", "2-1")
+        self.assertEqual(stages.current(self.store, SCOPE), "1-3")
+
+    def test_particle_follows_the_last_syllable(self) -> None:
+        self.assertEqual(stages.with_ro("2-3"), "'2-3 VOC 분석·반영'으로")  # ㅇ 받침
+        self.assertEqual(stages.with_ro("2-1"), "'2-1 VOC 설계'로")  # 받침 없음
+        self.assertEqual(stages.with_ro("3-2"), "'3-2 설계'로")
+        self.assertEqual(stages.with_ro("2-2"), "'2-2 VOC 수집'으로")  # ㅂ 받침
+
+    def test_yes_sets_the_suggested_stage_with_the_one_line_reply(self) -> None:
+        add_item(self.store, "i-voc-run", "insight", "커뮤니티 VOC에서 우산 분실 고민 반복")
+        stages.assess(self.store, SCOPE, {}, ScriptedJudge(self.judge.gates, discussing={"stage": "2-2", "evidence": ["i-voc-run"]}))
+        init = stages.proposals(self.store, SCOPE)[0]
+        self.assertEqual(stages.answer(self.store, SCOPE, "stage_init", init["key"], "start_discussing", "관리자"),
+                         "현재 단계를 '2-2 VOC 수집'으로 설정했어요.")
 
     def test_voc_overturning_an_assumption_offers_to_go_back(self) -> None:
         add_item(self.store, "i-voc-2", "insight", "아무도 대여소 위치 알림을 원하지 않음")
@@ -207,13 +239,47 @@ class StageCardTests(unittest.TestCase):
         self.assertNotIn("stage_answer", member)
         admin = self.post("admin", kind="welcome")
         self.assertIn("stage_answer", admin)
+        self.assertIn('"image"', admin)  # 상위 단계 표시줄 그림이 있는 카드로 보낸다
+        self.assertNotIn('"steps"', admin)  # 10단계 목록은 카드에 싣지 않는다
+        self.assertEqual([(p["name"], p["state"]) for p in stages.phases("2-3")],
+                         [("문제 정의", "done"), ("VOC", "current"), ("개발", "todo")])
+        self.assertEqual([p["state"] for p in stages.phases("1-1")], ["current", "todo", "todo"])
+        self.assertEqual(stages.phase_of("3-4"), "3")
         key = stages.proposals(self.store, SCOPE)[0]["key"]
-        answer = {"action": "stage_answer", "kind": "stage_init", "key": key, "reply": "start_here"}
+        answer = {"action": "stage_answer", "kind": "stage_init", "prompt_key": key, "reply": "start_here"}
         self.assertIn("권한자", self.post("plan1", answer))
         self.assertIsNone(stages.current(self.store, SCOPE))
-        self.assertIn("현재 단계를 정했어요: 1-2 방향 확정", self.post("admin", answer))
+        self.assertIn("현재 단계를 '1-2 방향 확정'으로 설정했어요.", self.post("admin", answer))
         self.assertEqual(stages.current(self.store, SCOPE), "1-2")
-        self.assertIn("이미 답했거나", self.post("admin", answer))
+        self.assertIn("현재 단계는 '1-2 방향 확정'으로 설정되어 있어요", self.post("admin", answer))  # 중복: 저장 없이 안내
+
+
+    def test_no_shows_a_ten_stage_chooser_card_and_confirm_saves_the_choice(self) -> None:
+        key = stages.proposals(self.store, SCOPE)[0]["key"]
+        no = {"action": "stage_answer", "kind": "stage_init", "prompt_key": key, "reply": "not_ahead"}
+        events = [json.loads(line) for line in self.post("admin", no).splitlines() if line.strip()]
+        self.assertIn("현재 진행 중인 단계를 선택해 주세요", events[0]["text"])
+        card = events[1]["card"]
+        self.assertEqual([c["value"] for c in card["choices"]], [code for code, _ in stages.STAGES])  # 실제 10단계
+        confirm = events[1]["buttons"][0]["data"]
+        self.assertNotIn("key", confirm)  # Playground는 data에 "key"가 있으면 클릭을 보내지 않는다
+        self.assertEqual(confirm["reply"], "choose")
+        self.assertIsNone(stages.current(self.store, SCOPE))
+        self.assertIn("선택해 주세요", self.post("admin", confirm))  # 선택 없이 [확인]
+        self.assertIsNone(stages.current(self.store, SCOPE))
+        self.assertIn("현재 단계를 '2-1 VOC 설계'로 설정했어요.", self.post("admin", dict(confirm, stage="2-1")))
+        self.assertEqual(stages.current(self.store, SCOPE), "2-1")
+        again = self.post("admin", dict(confirm, stage="3-1"))  # 같은 카드를 다시 누르면 저장하지 않고 안내
+        self.assertIn("현재 단계는 '2-1 VOC 설계'로 설정되어 있어요", again)
+        self.assertEqual(stages.current(self.store, SCOPE), "2-1")
+        self.assertIn("권한자", self.post("plan1", dict(confirm, stage="3-1")))
+
+    def test_stage_card_buttons_do_not_use_a_key_field(self) -> None:
+        card = confirm_flow.stage_card(SCOPE, True)
+        self.assertTrue(card and card[1])
+        for button in card[1]:
+            self.assertNotIn("key", button["data"])
+            self.assertIn("prompt_key", button["data"])
 
 
 if __name__ == "__main__":

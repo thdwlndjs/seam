@@ -19,8 +19,10 @@ from typing import Any
 
 import llm_queue
 import meeting_inputs
+import stage_image
 import worklog_bridge
 from worklog import apply, parts, stages
+from worklog.db import ConflictError, ValidationError
 
 READ_BUDGET_SECONDS = 70.0  # 이 안에 읽기·정리가 안 끝나면 안내하고 뒤에서 이어 한다(턴 시한 100초 안쪽)
 EDIT_SESSION_SECONDS = 600
@@ -288,14 +290,25 @@ async def answer_stage(turn: Any, team_key: str, value: dict, is_approver: bool)
     if not is_approver:
         await turn.send("단계·게이트 질문은 권한자(관리자·개발·권한을 받은 사람)가 답해요.")
         return
+    # 버튼 data에 "key"라는 이름의 칸을 두면 Playground가 클릭을 보내지 않는다(실측) → "prompt_key"를 쓴다
+    kind, key, reply = str(value.get("kind") or ""), str(value.get("prompt_key") or ""), str(value.get("reply") or "")
     try:
-        message = await asyncio.to_thread(stages.answer, _store(), team_key, str(value.get("kind") or ""),
-                                          str(value.get("key") or ""), str(value.get("reply") or ""),
-                                          turn.user_name or turn.aad_id)
+        message = await asyncio.to_thread(stages.answer, _store(), team_key, kind, key, reply,
+                                          turn.user_name or turn.aad_id, str(value.get("stage") or "") or None)
     except Exception as error:
-        await turn.send(f"반영하지 못했어요: {error}")
+        if isinstance(error, ConflictError):  # 이미 처리된 질문: 저장하지 않고 지금 설정된 단계를 알려 준다
+            now = await asyncio.to_thread(stages.current, _store(), team_key)
+            await turn.send(f"🧭 이미 처리된 질문이에요. 현재 단계는 {stages.with_ro(now)} 설정되어 있어요."
+                            if now else "🧭 질문이 바뀌었어요. 메인 카드를 다시 열어 주세요.")
+            return
+        await turn.send(f"🧭 {error}" if isinstance(error, ValidationError) else f"반영하지 못했어요: {error}")
         return
     await turn.send(f"🧭 {message}")
+    if reply == "not_ahead":  # [아니요]: 10단계 중 직접 고르는 카드
+        card = {"heading": "현재 단계 선택", "text": "진행 중인 단계를 고른 뒤 [확인]을 눌러 주세요.",
+                "choices": [{"title": f"{code} {name}", "value": code} for code, name in stages.STAGES]}
+        await turn.send_buttons(message, [{"title": "확인", "data": {"action": "stage_answer", "kind": kind, "prompt_key": key,
+                                                                    "reply": "choose"}}], card=card)
 
 
 async def resolve_gone(turn: Any, team_key: str, part_id: str, remove: bool, is_approver: bool) -> None:
@@ -331,6 +344,9 @@ def main_card_alerts(team_key: str, approver: bool = True, admin: bool = False) 
         stale = apply.stale_pending_once(store, team_key) if admin else []
         if stale:
             lines.append(f"⏰ 확인 대기가 {apply.STALE_DAYS}일 넘은 회의록 {len(stale)}건 — 팀원에게 확인을 부탁해 주세요")
+    fresh = apply.auto_applied_count(store, team_key, actor=apply.AUTO_NEW_ACTOR)
+    if fresh:
+        lines.append(f"✅ 새 회의록을 자동 반영했어요 (항목 {fresh}건, 최근 24시간) — 구조 보기·고치기에서 확인·수정할 수 있어요")
     edited = apply.auto_applied_count(store, team_key)
     if edited:
         lines.append(f"✍️ 확인된 회의록이 수정돼 {edited}건을 반영했어요 (최근 24시간)")
@@ -343,15 +359,6 @@ def main_card_alerts(team_key: str, approver: bool = True, admin: bool = False) 
         lines.append(f"🗑 회의록에서 사라진 부분: {title} — 거기서 나온 항목을 지울까요?")
         buttons += [{"title": f"지우기: {title[:16]}", "data": {"action": "gone_remove", "part_id": gone["id"]}},
                     {"title": f"그대로: {title[:16]}", "data": {"action": "gone_keep", "part_id": gone["id"]}}]
-    found = stages.proposals(store, team_key)[:2]  # 단계 제안·게이트 질문(spec P2-4)
-    fresh = apply.auto_applied_count(store, team_key, actor=apply.AUTO_NEW_ACTOR)
-    if fresh:
-        lines.append(f"✅ 새 회의록을 자동 반영했어요 (항목 {fresh}건, 최근 24시간) — 구조 보기·고치기에서 확인·수정할 수 있어요")
-    stages.mark_asked(store, team_key, found)
-    for prompt in found:
-        lines.append(f"🧭 {prompt['text']}" + ("" if approver else " (권한자 확인 대기 중)"))
-        buttons += [{"title": title, "data": {"action": "stage_answer", "kind": prompt["kind"], "key": prompt["key"],
-                                              "reply": reply}} for reply, title in prompt["answers"]]
     working = parts.pending_count(store, team_key, _version())
     if working:
         lines.append(f"⏳ 회의록 {working}건 정리 중")
@@ -360,6 +367,30 @@ def main_card_alerts(team_key: str, approver: bool = True, admin: bool = False) 
     if len(shown) < len(buttons):
         lines.append("(🔒 되돌리기·삭제 확인은 권한자가 답해요)")
     return lines, shown
+
+
+def stage_card(team_key: str, approver: bool = True) -> tuple[str, list[dict], dict | None] | None:
+    """단계 질문 카드: 알림과 따로, 질문 하나만(spec P2-4). (글, 버튼, 카드 그림). 권한 없는 사람에게는 버튼 없이
+    안내만 한다. 처음 단계를 묻는 질문(stage_init)은 상위 단계 표시줄 그림으로 전체 중 어디인지 보이고, 세부 단계는
+    질문 문장에만 쓴다. 전체 단계 상세는 탭에서 본다."""
+    store = _store()
+    found = stages.proposals(store, team_key)[:1]
+    if not found:
+        return None
+    stages.mark_asked(store, team_key, found)
+    prompt = found[0]
+    card = None
+    if prompt["kind"] == "stage_init":
+        card = {"heading": "현재 프로젝트 단계 확인", "text": prompt["text"] + ("" if approver else " (권한자 확인 대기 중)"),
+                "image": {"light": stage_image.url(prompt["stage"], "light"), "dark": stage_image.url(prompt["stage"], "dark"),
+                          "alt": "전체 프로젝트 단계: " + " → ".join(
+                              f"{p['name']}" + (" (현재)" if p["state"] == "current" else "")
+                              for p in stages.phases(prompt["stage"]))}}
+    if not approver:
+        return f"🧭 {prompt['text']} (권한자 확인 대기 중)", [], card
+    buttons = [{"title": title, "data": {"action": "stage_answer", "kind": prompt["kind"], "prompt_key": prompt["key"],
+                                         "reply": reply}} for reply, title in prompt["answers"]]
+    return f"🧭 {prompt['text']}", buttons, card
 
 
 # ── 회의록 올리기 (Notion 밖 회의록, spec P1-7) ──────────────────

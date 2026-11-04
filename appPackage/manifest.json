@@ -42,6 +42,14 @@
       ]
     }
   ],
+  "staticTabs": [
+    {
+      "entityId": "board",
+      "name": "구조 보기·고치기",
+      "contentUrl": "https://your-domain.example.com/tab/board",
+      "scopes": ["personal"]
+    }
+  ],
   "permissions": ["identity", "messageTeamMembers"],
-  "validDomains": []
+  "validDomains": ["your-domain.example.com"]
 }

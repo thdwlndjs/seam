@@ -51,6 +51,8 @@ from pydantic import BaseModel
 # NOTION_RATE 등)를 읽어 두기 때문에, 순서가 바뀌면 .env 값이 그쪽에 전달되지 않는다.
 load_dotenv(os.environ.get("ENV_FILE"))
 
+import board_tab  # noqa: E402
+import stage_image  # noqa: E402
 import confirm_flow  # noqa: E402
 import member_flow  # noqa: E402
 import meeting_inputs  # noqa: E402
@@ -168,8 +170,11 @@ class Turn:
     async def send(self, text: str) -> None:
         self._put({"type": "message", "text": text})
 
-    async def send_buttons(self, title: str, buttons: list[dict], emphasis: bool = False) -> None:
-        self._put({"type": "buttons", "title": title, "emphasis": emphasis, "buttons": buttons})
+    async def send_buttons(self, title: str, buttons: list[dict], emphasis: bool = False, card: dict | None = None) -> None:
+        event = {"type": "buttons", "title": title, "emphasis": emphasis, "buttons": buttons}
+        if card:  # 단계 표시줄이 있는 카드: 에코봇이 글 대신 이 모양으로 그린다
+            event["card"] = card
+        self._put(event)
 
     def finish(self) -> None:
         self.queue.put_nowait(None)
@@ -1463,6 +1468,22 @@ def _is_approver(turn: Turn, config: dict) -> bool:
     return people.can_approve(worklog_bridge.WORKLOG_STORE, turn.team_key, turn.aad_id)
 
 
+def _can_edit_board(team_key: str, user_id: str) -> bool:
+    """구조 탭 고치기 권한. 메신저의 승인 권한(_is_approver)과 같은 기준."""
+    config = _get_config(team_key) or {}
+    if config.get("admin_aad_id") and config.get("admin_aad_id") == user_id:
+        return True
+    return people.can_approve(worklog_bridge.WORKLOG_STORE, team_key, user_id)
+
+
+stage_image.register(app)
+board_tab.register(app, BOT_SERVER_SECRET, lambda: worklog_bridge.WORKLOG_STORE, _can_edit_board)
+
+
+def _board_button(turn: Turn) -> dict:
+    return {"title": "🗂 구조 보기·고치기", "url": board_tab.link(BOT_SERVER_SECRET, turn.aad_id, turn.user_name, turn.team_key)}
+
+
 async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
     config = _get_config(turn.team_key)
     if config is None:
@@ -1532,7 +1553,18 @@ async def _send_welcome(turn: Turn) -> None:
             await turn.send_buttons("\n".join(["🔔 알림", *lines]), buttons)
         elif lines:
             await turn.send("\n".join(["🔔 알림", *lines]))
-    await turn.send_buttons(WELCOME_TEXT, _MENU_BUTTONS)
+    if config is not None:
+        try:
+            card = await asyncio.to_thread(confirm_flow.stage_card, turn.team_key, _is_approver(turn, config))
+        except Exception:
+            traceback.print_exc()
+            card = None
+        if card is not None and (card[1] or card[2]):
+            await turn.send_buttons(card[0], card[1], card=card[2])
+        elif card is not None:
+            await turn.send(card[0])
+    menu = [*_MENU_BUTTONS, _board_button(turn)] if config is not None else _MENU_BUTTONS
+    await turn.send_buttons(WELCOME_TEXT, menu)
 
 
 # ── 3. 내 역할 조회 ─────────────────────────────

@@ -32,6 +32,9 @@ else
   apt-get install -y python3.12-venv
 fi
 
+# 단계 표시줄 그림(src/server/stage_image.py)이 쓰는 한글 글꼴. 없으면 이미지 경로가 503을 돌려주고 카드는 글로만 보인다.
+apt-get install -y fonts-noto-cjk
+
 echo "[3/6] Caddy 설치 (공식 apt 저장소)"
 if ! command -v caddy >/dev/null 2>&1; then
   apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl

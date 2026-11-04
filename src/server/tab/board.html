@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>구조 보기·고치기</title>
+<style>
+:root {
+  --bg: #f5f5f8; --panel: #ffffff; --line: #e3e3ea; --line-strong: #cfcfd8;
+  --text: #1f2328; --muted: #5f6670; --faint: #8a9099;
+  --brand: #5b5fc7; --brand-strong: #4a4fb5; --brand-soft: #eef0ff; --on-brand: #ffffff;
+  --amber: #b26a00; --amber-soft: #fff4e2; --green: #2f7d4f; --green-soft: #e8f5ec;
+  --violet: #6b4bc7; --violet-soft: #f1ecff; --blue: #2d6bcf; --blue-soft: #e9f1ff;
+  --red: #b4232c; --red-soft: #fdecee; --shadow: 0 1px 2px rgba(20, 20, 40, .06);
+}
+:root[data-theme="dark"] {
+  --bg: #1b1b22; --panel: #26262f; --line: #383844; --line-strong: #4a4a58;
+  --text: #ececf1; --muted: #b0b3bb; --faint: #8b8f99;
+  --brand: #8b8fe8; --brand-strong: #a3a6ef; --brand-soft: #30315a; --on-brand: #16162a;
+  --amber: #f0b45a; --amber-soft: #3d3020; --green: #6fcf97; --green-soft: #1f3529;
+  --violet: #b39cf5; --violet-soft: #2f2747; --blue: #84b2f5; --blue-soft: #1f2b40;
+  --red: #f2858c; --red-soft: #402226; --shadow: none;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: 14px/1.5 "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", system-ui, sans-serif; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 16px 20px 40px; }
+
+.banner { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--brand-soft); margin-bottom: 16px; }
+.banner .ico { width: 40px; height: 40px; border-radius: 10px; background: var(--panel); display: grid; place-items: center; flex-shrink: 0; color: var(--brand); }
+.banner b { display: block; }
+.banner small { color: var(--muted); }
+.banner .grow { flex: 1; min-width: 0; }
+.icon-btn { border: none; background: none; color: var(--muted); padding: 6px; border-radius: 6px; line-height: 0; }
+.icon-btn:hover { background: var(--line); }
+
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 10px; }
+.stage { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.stage .pill { font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); }
+.stage .pill.tentative { border-style: dashed; color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 4px 12px; display: inline-flex; gap: 6px; align-items: center; }
+.chip .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.chip[aria-pressed="true"] { background: var(--brand-soft); border-color: var(--brand); color: var(--brand-strong); font-weight: 600; }
+.chip[aria-pressed="true"] .n { background: var(--brand); color: var(--on-brand); border-radius: 999px; padding: 0 7px; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 16px; }
+.filters label { color: var(--muted); font-weight: 600; }
+.filters select, .filters input { height: 34px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 0 10px; }
+.filters input { flex: 1; min-width: 200px; }
+
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px; align-items: start; }
+.col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+.sec-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; }
+.sec-head .badge { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; flex-shrink: 0; }
+.sec-head h2 { font-size: 15px; margin: 0; }
+.sec-head .count { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.sec-desc { padding: 0 14px 6px; margin-top: -6px; color: var(--muted); font-size: 12.5px; }
+.t-amber .badge { background: var(--amber-soft); color: var(--amber); }
+.t-green .badge { background: var(--green-soft); color: var(--green); }
+.t-violet .badge { background: var(--violet-soft); color: var(--violet); }
+.t-blue .badge { background: var(--blue-soft); color: var(--blue); }
+.t-gray .badge { background: var(--bg); color: var(--muted); }
+.rows { list-style: none; margin: 0; padding: 0 8px 8px; }
+.row { display: flex; align-items: center; gap: 10px; padding: 9px 8px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+.row:hover { background: var(--bg); }
+.row[aria-selected="true"] { background: var(--brand-soft); border-color: var(--brand); }
+.row .title { flex: 1; min-width: 0; }
+.row .sub { display: block; color: var(--muted); font-size: 12.5px; }
+.row .doc { color: var(--faint); flex-shrink: 0; line-height: 0; }
+.tag { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--bg); color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+.answers { display: flex; gap: 4px; flex-shrink: 0; }
+.answers button { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 1px 10px; font-size: 12.5px; }
+.answers .a-confirm:hover { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+.answers .a-open:hover { background: var(--blue-soft); color: var(--blue); border-color: var(--blue); }
+.answers .a-ignore:hover { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+.change { padding: 10px 8px; border-radius: 8px; display: flex; flex-direction: column; gap: 6px; }
+.change + .change { border-top: 1px solid var(--line); }
+.flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.flow .old { color: var(--muted); text-decoration: line-through; }
+.flow .arrow { color: var(--violet); }
+.flow a { color: inherit; text-decoration: none; cursor: pointer; }
+.flow a:hover { text-decoration: underline; }
+.change .meta { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; }
+.change .meta button { margin-left: auto; }
+.empty-sec { padding: 4px 16px 14px; color: var(--muted); }
+
+.btn { height: 36px; padding: 0 16px; border-radius: 6px; border: 1px solid var(--line-strong); background: var(--panel); font-weight: 600; }
+.btn:hover:not(:disabled) { background: var(--bg); }
+.btn.primary { background: var(--brand); border-color: var(--brand); color: var(--on-brand); }
+.btn.primary:hover:not(:disabled) { background: var(--brand-strong); }
+.btn.small { height: 28px; padding: 0 10px; font-size: 12.5px; font-weight: 500; }
+.btn.danger { color: var(--red); }
+
+.panel { position: sticky; top: 12px; padding: 16px; max-height: calc(100vh - 24px); overflow: auto; }
+.panel h3 { margin: 0 0 14px; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+.panel h3 .close { margin-left: auto; display: none; }
+.field { margin-bottom: 14px; }
+.field > label, .field > .label { display: block; font-weight: 600; margin-bottom: 6px; }
+.field input, .field select, .field textarea { width: 100%; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--panel); padding: 7px 10px; }
+.field textarea { resize: vertical; min-height: 64px; }
+.field input:disabled, .field select:disabled, .field textarea:disabled { background: var(--bg); color: var(--muted); }
+.src { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+.src .head { display: flex; gap: 8px; align-items: center; font-weight: 600; }
+.src .date { color: var(--muted); font-weight: 400; }
+.src blockquote { margin: 8px 0 6px; padding: 6px 10px; border-left: 3px solid var(--brand); background: var(--bg); border-radius: 0 6px 6px 0; color: var(--muted); }
+.src a { color: var(--brand-strong); font-size: 12.5px; }
+.hist { list-style: none; padding: 0; margin: 0; }
+.hist li { position: relative; padding: 0 0 12px 18px; font-size: 13px; }
+.hist li::before { content: ""; position: absolute; left: 3px; top: 7px; width: 7px; height: 7px; border-radius: 50%; border: 2px solid var(--brand); background: var(--panel); }
+.hist li::after { content: ""; position: absolute; left: 7px; top: 18px; bottom: 0; width: 1px; background: var(--line); }
+.hist li:last-child::after { display: none; }
+.hist .when { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
+.hist .who { color: var(--faint); }
+.actions { display: flex; gap: 8px; margin-top: 6px; }
+.actions .btn { flex: 1; }
+.readonly { color: var(--muted); font-size: 12.5px; margin: -6px 0 12px; }
+.placeholder { color: var(--muted); padding: 32px 8px; text-align: center; }
+
+.state { max-width: 520px; margin: 80px auto; text-align: center; color: var(--muted); }
+.state b { display: block; color: var(--text); font-size: 16px; margin-bottom: 6px; }
+.toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.2); max-width: calc(100% - 32px); z-index: 20; }
+.toast[hidden] { display: none; }
+.scrim { display: none; }
+.stage button.pill { cursor: pointer; font: inherit; font-weight: 600; color: inherit; }
+.stage button.pill:hover { background: var(--brand-soft); }
+dialog.stages { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text); padding: 18px 20px; width: min(520px, calc(100% - 32px)); box-shadow: 0 8px 32px rgba(0,0,0,.25); }
+dialog.stages::backdrop { background: rgba(0,0,0,.35); }
+dialog.stages h3 { margin: 0 0 4px; font-size: 16px; }
+dialog.stages p { margin: 0 0 12px; color: var(--muted); font-size: 12.5px; }
+.steps { list-style: none; margin: 0 0 14px; padding: 0; }
+.steps li { padding: 8px 10px; border-radius: 8px; display: flex; gap: 10px; align-items: baseline; }
+.steps li.current { background: var(--brand-soft); font-weight: 600; }
+.steps li.done { color: var(--muted); }
+.steps .mark { width: 16px; text-align: center; color: var(--brand); flex-shrink: 0; }
+.steps .gates { display: block; color: var(--muted); font-weight: 400; font-size: 12.5px; }
+
+@media (max-width: 900px) {
+  .wrap { padding: 12px 16px 32px; }
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .panel { position: fixed; inset: auto 0 0 0; top: auto; max-height: 85vh; border-radius: 14px 14px 0 0; z-index: 10; transform: translateY(105%); transition: transform .2s; }
+  .panel.open { transform: none; }
+  .panel h3 .close { display: inline-flex; }
+  .scrim.open { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 9; }
+  .answers button { padding: 1px 8px; }
+}
+@media (prefers-reduced-motion: reduce) { .panel { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap" id="app"><div class="state"><b>불러오는 중…</b></div></div>
+<div class="scrim" id="scrim"></div>
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="https://cdn.jsdelivr.net/npm/@microsoft/teams-js@2.24.0/dist/MicrosoftTeams.min.js"></script>
+<script>
+"use strict";
+const ICON = {
+  bell: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21a2 2 0 0 0 4 0"/></svg>',
+  x: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  alert: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M12 8v5M12 16.5v.5"/><circle cx="12" cy="12" r="9"/></svg>',
+  check: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>',
+  history: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>',
+  question: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17v.5"/></svg>',
+  list: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg>',
+  doc: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg>',
+  chev: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>',
+};
+const S = { token: null, data: null, kind: "all", source: "", q: "", selected: null, saving: false };
+
+// ── 작은 DOM 도우미: 회의록 내용은 모두 textContent로 넣는다 ──
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "html") el.innerHTML = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "class") el.className = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : String(kid));
+  return el;
+}
+const day = (iso) => (iso || "").slice(0, 10).replaceAll("-", ".");
+let toastTimer;
+function toast(text) {
+  const t = document.getElementById("toast");
+  t.textContent = text; t.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 3200);
+}
+function store(key, value) {
+  try { if (value === undefined) return localStorage.getItem(key); localStorage.setItem(key, value); } catch (e) { return null; }
+}
+
+// ── 입장: 링크의 ?t= 또는 Teams 탭 딥 링크의 subPageId ──
+async function findToken() {
+  const fromUrl = new URLSearchParams(location.search).get("t");
+  if (fromUrl) {  // 주소창·방문 기록에 토큰이 남지 않게 지우고, 새로고침용으로 이 탭에만 둔다
+    try { sessionStorage.setItem("board-token", fromUrl); } catch (e) { /* 저장 못 해도 이번 화면은 연다 */ }
+    history.replaceState(null, "", location.pathname);
+    return fromUrl;
+  }
+  try { const kept = sessionStorage.getItem("board-token"); if (kept) return kept; } catch (e) { /* 없음 */ }
+  if (!window.microsoftTeams) return null;
+  try {
+    await Promise.race([microsoftTeams.app.initialize(), new Promise((_, no) => setTimeout(no, 2500))]);
+    const ctx = await microsoftTeams.app.getContext();
+    applyTheme(ctx.app && ctx.app.theme);
+    microsoftTeams.app.registerOnThemeChangeHandler(applyTheme);
+    return (ctx.page && ctx.page.subPageId) || null;
+  } catch (e) { return null; }
+}
+function applyTheme(theme) {
+  const dark = theme ? theme !== "default" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+}
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: { "Authorization": "Bearer " + S.token, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(payload.detail || "요청을 처리하지 못했어요 (" + res.status + ")");
+  return payload;
+}
+async function load() {
+  S.data = await api("/api/board");
+  if (S.selected && !S.data.items.some((i) => i.id === S.selected)) S.selected = null;
+  render();
+}
+async function act(fn, done) {
+  if (S.saving) return;
+  S.saving = true;
+  try { await fn(); toast(done); await load(); }
+  catch (e) { toast(e.message); }
+  finally { S.saving = false; }
+}
+
+// ── 화면 ──
+function visible() {
+  const q = S.q.trim().toLowerCase();
+  return S.data.items.filter((i) =>
+    (S.kind === "all" || i.kind === S.kind) &&
+    (!S.source || i.sources.some((s) => (s.page_id || s.part_id) === S.source)) &&
+    (!q || (i.title + " " + i.statement + " " + (i.assignee || "")).toLowerCase().includes(q)));
+}
+function render() {
+  const d = S.data, root = document.getElementById("app");
+  root.replaceChildren(banner(d), toolbar(d), filters(d), h("div", { class: "layout" }, sections(d), panel(d)));
+}
+function banner(d) {
+  const key = "board-banner-" + new Date().toISOString().slice(0, 10);
+  if (!d.recent_notes || store(key)) return "";
+  const el = h("div", { class: "banner", role: "status" },
+    h("div", { class: "ico", html: ICON.bell }),
+    h("div", { class: "grow" }, h("b", {}, `새 회의록 ${d.recent_notes}건 반영했어요`),
+      h("small", {}, "최신 회의록을 기준으로 결정 구조를 정리했어요. 바뀐 것은 ‘변경 이력’에서 볼 수 있어요.")),
+    h("button", { class: "icon-btn", "aria-label": "알림 닫기", html: ICON.x, onclick: () => { store(key, "1"); el.remove(); } }));
+  return el;
+}
+function toolbar(d) {
+  const counts = { all: d.items.length };
+  for (const i of d.items) counts[i.kind] = (counts[i.kind] || 0) + 1;
+  const chip = (kind, label) => h("button", { class: "chip", "aria-pressed": String(S.kind === kind),
+    onclick: () => { S.kind = kind; render(); } }, label, h("span", { class: "n" }, counts[kind] || 0));
+  const stage = d.stage && d.stage.label
+    ? h("button", { class: "pill" + (d.stage.approved ? "" : " tentative"), title: "전체 단계 보기",
+        onclick: openStages }, d.stage.label + (d.stage.approved ? "" : " (제안)"))
+    : h("span", { class: "pill tentative" }, "시작 전");
+  return h("div", { class: "toolbar" },
+    h("div", { class: "stage" }, "현재 단계", stage),
+    h("div", { class: "chips", role: "group", "aria-label": "종류 필터" },
+      chip("all", "전체"), ...Object.entries(d.kinds).map(([k, v]) => chip(k, v))));
+}
+function filters(d) {
+  const select = h("select", { id: "src", onchange: (e) => { S.source = e.target.value; render(); } },
+    h("option", { value: "" }, "전체 출처"),
+    ...d.sources.map((s) => h("option", { value: s.page_id, selected: S.source === s.page_id }, `${s.title}${s.date ? " (" + day(s.date) + ")" : ""}`)));
+  const search = h("input", { type: "search", placeholder: "키워드로 검색해요", value: S.q, "aria-label": "검색",
+    oninput: (e) => { S.q = e.target.value; const pos = e.target.selectionStart; render(); const el = document.querySelector('input[type="search"]'); el.focus(); el.setSelectionRange(pos, pos); } });
+  return h("div", { class: "filters" }, h("label", { for: "src" }, "출처 필터"), select, search);
+}
+function sourceTag(i) {
+  const s = i.sources[i.sources.length - 1];
+  return s ? h("span", { class: "tag", title: s.path }, s.title.length > 14 ? s.title.slice(0, 13) + "…" : s.title) : "";
+}
+function row(i, extra) {
+  return h("li", { class: "row", role: "option", "aria-selected": String(S.selected === i.id), tabindex: "0",
+      onclick: () => select(i.id), onkeydown: (e) => { if (e.key === "Enter") select(i.id); } },
+    h("span", { class: "doc", html: ICON.doc }),
+    h("span", { class: "title" }, i.title, i.kind === "task" ? h("span", { class: "sub" }, i.assignee ? "담당 " + i.assignee : "담당 미정") : ""),
+    extra || sourceTag(i),
+    h("span", { class: "doc", html: ICON.chev }));
+}
+function section(tone, icon, title, list, desc, body) {
+  const count = body ? body.count : list.length;
+  return h("section", { class: "card t-" + tone, "aria-label": title },
+    h("div", { class: "sec-head" }, h("span", { class: "badge", html: icon }), h("h2", {}, title), h("span", { class: "count" }, count)),
+    desc ? h("div", { class: "sec-desc" }, desc) : "",
+    body ? body.el : list.length ? h("ul", { class: "rows", role: "listbox", "aria-label": title }, list) : h("div", { class: "empty-sec" }, "없어요"));
+}
+function answers(i) {
+  if (!S.data.viewer.can_edit) return h("span", { class: "tag" }, "확인 필요");
+  const b = (cls, label, answer, done) => h("button", { class: cls, onclick: (e) => { e.stopPropagation();
+    act(() => api(`/api/board/items/${i.id}/answer`, { answer }), done); } }, label);
+  return h("span", { class: "answers" }, b("a-confirm", "확정", "confirm", "확정했어요"), b("a-open", "미정", "open", "미정으로 뒀어요"),
+    b("a-ignore", "무시", "ignore", "무시했어요"));
+}
+function sections(d) {
+  const items = visible(), by = (pred) => items.filter(pred);
+  const col = h("div", { class: "col" });
+  const pending = by((i) => i.status === "needs_discussion");
+  const live = (k) => by((i) => i.kind === k && i.status !== "needs_discussion");
+  if (pending.length) col.append(section("amber", ICON.alert, "확인 필요", pending.map((i) => row(i, answers(i))),
+    "회의록끼리 판단이 갈렸거나 확신이 낮은 것이에요. 확정·미정·무시 중 하나를 골라 주세요."));
+  if (S.kind === "all" || S.kind === "decision") col.append(section("green", ICON.check, "최종 결정", live("decision").map((i) => row(i))));
+  if (S.kind === "all" || S.kind === "decision") col.append(changes(d));
+  if (S.kind === "all" || S.kind === "open") col.append(section("blue", ICON.question, "남은 쟁점·미정", live("open").map((i) => row(i))));
+  for (const k of ["task", "insight", "feedback"]) {
+    if (S.kind === "all" || S.kind === k) {
+      const list = live(k);
+      if (list.length || S.kind === k) col.append(section("gray", ICON.list, d.kinds[k], list.map((i) => row(i))));
+    }
+  }
+  if (!col.children.length) col.append(h("div", { class: "card empty-sec" }, "조건에 맞는 항목이 없어요."));
+  return col;
+}
+function changes(d) {
+  const ids = new Set(visible().map((i) => i.id));
+  const list = d.changes.filter((c) => !S.q && !S.source ? true : ids.has(c.new.id));
+  const el = list.length ? h("div", { class: "rows" }, list.map((c) => h("div", { class: "change" },
+    h("div", { class: "flow" }, h("span", { class: "old" }, c.old.title), h("span", { class: "arrow", "aria-label": "에서" }, "→"),
+      h("a", { onclick: () => select(c.new.id), tabindex: "0", onkeydown: (e) => { if (e.key === "Enter") select(c.new.id); } }, c.new.title)),
+    h("div", { class: "meta" }, day(c.at) + " 반영",
+      S.data.viewer.can_edit ? h("button", { class: "btn small", onclick: () => {
+        if (confirm(`“${c.new.title}”을(를) 되돌리고 “${c.old.title}”로 돌아갈까요?`))
+          act(() => api(`/api/board/changes/${c.candidate_id}/revert`, {}), "되돌렸어요"); } }, "↩ 되돌리기") : ""))))
+    : h("div", { class: "empty-sec" }, "바뀐 결정이 없어요");
+  return section("violet", ICON.history, "변경 이력", [], "나중 회의록이 앞선 결정을 바꾼 기록이에요.", { el, count: list.length });
+}
+function select(id) {
+  S.selected = id; render();
+  document.getElementById("panel").classList.add("open"); document.getElementById("scrim").classList.add("open");
+  const first = document.querySelector("#panel input, #panel select"); if (first && matchMedia("(min-width: 901px)").matches) first.focus({ preventScroll: true });
+}
+function closePanel() {
+  S.selected = null; render(); document.getElementById("scrim").classList.remove("open");
+}
+const REASONS = [[/확인 반영|confirmed|approve/i, "회의록에서 반영"], [/^구조 화면에서 고침$/, "고침"], [/되돌림/, "되돌림"]];
+function reasonText(r) { for (const [re, text] of REASONS) if (re.test(r)) return text; return r; }
+function panel(d) {
+  const i = d.items.find((x) => x.id === S.selected);
+  const el = h("aside", { class: "card panel" + (i ? " open" : ""), id: "panel", "aria-label": "항목 수정" });
+  if (!i) {
+    el.append(h("h3", {}, "항목 수정"), h("div", { class: "placeholder" }, "왼쪽에서 항목을 고르면 출처와 이력을 보고 고칠 수 있어요."));
+    return el;
+  }
+  const can = d.viewer.can_edit;
+  const kind = h("select", { id: "f-kind", disabled: !can }, Object.entries(d.kinds).map(([k, v]) => h("option", { value: k, selected: i.kind === k }, v)));
+  const title = h("input", { id: "f-title", value: i.title, disabled: !can, maxlength: "200" });
+  const assignee = h("input", { id: "f-assignee", value: i.assignee || "", disabled: !can, list: "members", placeholder: "담당 미정" });
+  const statement = h("textarea", { id: "f-statement", disabled: !can, rows: "3" }, i.statement === i.title ? "" : i.statement);
+  const save = () => act(() => api(`/api/board/items/${i.id}`, { kind: kind.value, title: title.value, assignee: assignee.value,
+    statement: statement.value || undefined }), "저장했어요");
+  el.append(
+    h("h3", {}, "항목 수정", h("button", { class: "icon-btn close", "aria-label": "닫기", html: ICON.x, onclick: closePanel })),
+    can ? "" : h("p", { class: "readonly" }, "보기 전용이에요. 고치기는 권한자(관리자·개발·권한을 받은 사람)가 해요."),
+    h("div", { class: "field" }, h("label", { for: "f-kind" }, "종류"), kind),
+    h("div", { class: "field" }, h("label", { for: "f-title" }, "제목"), title),
+    h("div", { class: "field" }, h("label", { for: "f-assignee" }, "담당"), assignee,
+      h("datalist", { id: "members" }, d.members.map((m) => h("option", { value: m })))),
+    h("div", { class: "field" }, h("label", { for: "f-statement" }, "내용"), statement),
+    h("div", { class: "field" }, h("span", { class: "label" }, "출처"),
+      i.sources.length ? i.sources.map((s, n) => h("div", { class: "src" },
+        h("div", { class: "head" }, h("span", { html: ICON.doc }), s.title, s.date ? h("span", { class: "date" }, "(" + day(s.date) + ")") : ""),
+        (i.quotes[n] || (n === i.sources.length - 1 && i.quotes[0])) ? h("blockquote", {}, "“" + (i.quotes[n] || i.quotes[0]) + "”") : "",
+        s.url ? h("a", { href: s.url, target: "_blank", rel: "noopener" }, "Notion 원문 열기 ↗") : h("span", { class: "date" }, s.path)))
+        : h("div", { class: "date" }, "출처 기록이 없어요")),
+    h("div", { class: "field" }, h("span", { class: "label" }, "이력"),
+      h("ol", { class: "hist" }, i.history.map((r) => h("li", {}, h("span", { class: "when" }, day(r.at)),
+        reasonText(r.reason), r.title && r.title !== i.title ? ` · “${r.title}”` : "", " ", h("span", { class: "who" }, r.actor))))),
+    can ? h("div", { class: "actions" },
+      h("button", { class: "btn primary", onclick: save }, "저장"),
+      h("button", { class: "btn danger", onclick: () => { if (confirm(`“${i.title}” 반영을 취소할까요? 목록에서 사라지고 이력은 남아요.`))
+        act(() => api(`/api/board/items/${i.id}/cancel`, {}), "반영을 취소했어요"); } }, "반영 취소")) : "");
+  return el;
+}
+function openStages() {
+  const stage = S.data.stage;
+  if (!stage || !stage.steps || !stage.steps.length) return;
+  const mark = { done: "✓", current: "▶", todo: "○" };
+  const dlg = h("dialog", { class: "stages", "aria-label": "전체 단계" },
+    h("h3", {}, "전체 단계"),
+    h("p", {}, stage.approved ? "권한자가 확인한 현재 단계예요." : "회의록 분석으로 본 후보 단계예요(아직 확인 전)."),
+    h("ol", { class: "steps" }, stage.steps.map((st) => h("li", { class: st.state },
+      h("span", { class: "mark" }, mark[st.state]),
+      h("span", {}, `${st.code} ${st.name}`, st.gates.length ? h("span", { class: "gates" }, "정할 사안: " + st.gates.join(" · ")) : "")))),
+    h("button", { class: "btn", onclick: () => dlg.close() }, "닫기"));
+  dlg.addEventListener("close", () => dlg.remove());
+  document.body.append(dlg); dlg.showModal();
+}
+function fail(title, text) {
+  document.getElementById("app").replaceChildren(h("div", { class: "state" }, h("b", {}, title), text));
+}
+
+document.getElementById("scrim").addEventListener("click", closePanel);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && S.selected) closePanel(); });
+(async () => {
+  applyTheme(null);
+  S.token = await findToken();
+  if (!S.token) return fail("봇 카드에서 열어 주세요", "PM봇 메인 카드의 [🗂 구조 보기·고치기] 버튼을 누르면 내 팀 화면이 열려요.");
+  try { await load(); if (S.data.viewer.view === "stages") openStages(); } catch (e) { fail("화면을 열지 못했어요", e.message); }
+})();
+</script>
+</body>
+</html>

@@ -16,7 +16,8 @@ import time
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
 from microsoft_teams.api import ConversationUpdateActivity, MessageActivity, TypingActivityInput
 from microsoft_teams.api.activities.invoke.adaptive_card.action import AdaptiveCardInvokeActivity
@@ -24,7 +25,8 @@ from microsoft_teams.api.models.adaptive_card.adaptive_card_action_response impo
     AdaptiveCardActionMessageResponse,
 )
 from microsoft_teams.apps import ActivityContext, App, FastAPIAdapter
-from microsoft_teams.cards import AdaptiveCard, SubmitAction, TextBlock
+from microsoft_teams.cards import (AdaptiveCard, Choice, ChoiceSetInput, Image, OpenUrlAction, SubmitAction, TextBlock,
+                                   ThemedUrl)
 
 # ── 설정 ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -108,14 +110,75 @@ def _turn_payload(ctx: ActivityContext, kind: str = "message", text: str = "", v
     }
 
 
+def _stepper_card(event: dict) -> AdaptiveCard:
+    """제목·질문 글·상위 단계 표시줄 그림·버튼으로 된 카드. 그림은 서버가 그려 주는 PNG이고 글과 버튼은 카드 요소다.
+    그림이 안 떠도 질문 문장에 세부 단계가 있고 대체 텍스트도 있다."""
+    card = event["card"]
+    body = [TextBlock(text=card["heading"], weight="Bolder", size="Large", wrap=True),
+            TextBlock(text=card["text"], wrap=True, spacing="Small")]
+    image = card.get("image")
+    if image:
+        body.append(Image(url=image["light"], themed_urls=[ThemedUrl(theme="Dark", url=image["dark"])],
+                          alt_text=image["alt"], size="Stretch", spacing="Medium"))
+    # 첫 버튼([맞아요])만 강조 스타일. 카드에는 제목·질문·그림·버튼만 둔다.
+    actions = [SubmitAction(title=b["title"][:40], data=b["data"], **({"style": "positive"} if n == 0 else {}))
+               for n, b in enumerate(event["buttons"])]
+    return AdaptiveCard(body=body, actions=actions)
+
+
+def _choice_card(event: dict) -> AdaptiveCard:
+    """선택 카드: 질문 글, 드롭다운(고른 값은 "stage"로 value에 실려 온다), [확인]. 처음 단계 설정의 [아니요] 뒤에 쓴다."""
+    card = event["card"]
+    return AdaptiveCard(
+        body=[TextBlock(text=card["heading"], weight="Bolder", size="Large", wrap=True),
+              TextBlock(text=card["text"], wrap=True, spacing="Small"),
+              ChoiceSetInput(id="stage", style="compact", is_required=True, error_message="단계를 선택해 주세요.",
+                             placeholder="단계 선택", choices=[Choice(title=c["title"], value=c["value"]) for c in card["choices"]])],
+        actions=[SubmitAction(title=b["title"][:40], data=b["data"], style="positive") for b in event["buttons"]])
+
+
 def _build_buttons_card(event: dict) -> AdaptiveCard:
+    if event.get("card") and event["card"].get("choices"):
+        return _choice_card(event)
+    if event.get("card"):
+        return _stepper_card(event)
     title_kwargs = {"weight": "Bolder"} if event.get("emphasis") else {}
     return AdaptiveCard(
         body=[TextBlock(text=event["title"], wrap=True, **title_kwargs)],
         # Playground에서 Action.Execute 클릭이 안 나가는 문제 때문에 Action.Submit을 쓴다.
         # Submit 클릭은 message 활동으로 오고 data는 activity.value에 실린다 → handle_message가 서버로 전달.
-        actions=[SubmitAction(title=b["title"][:40], data=b["data"]) for b in event["buttons"]],
+        # "url"이 있는 버튼은 링크를 연다(구조 보기·고치기 탭).
+        actions=[OpenUrlAction(title=b["title"][:40], url=b["url"]) if b.get("url")
+                 else SubmitAction(title=b["title"][:40], data=b["data"]) for b in event["buttons"]],
     )
+
+
+# ── 구조 보기·고치기 탭: 화면과 API를 서버로 넘긴다(서버는 바깥에 직접 열지 않는다) ──
+_PASS_HEADERS = ("authorization", "content-type")
+
+
+async def _forward(request: Request, path: str) -> Response:
+    headers = {k: v for k, v in request.headers.items() if k.lower() in _PASS_HEADERS}
+    upstream = await _get_server_client().request(
+        request.method, f"{BOT_SERVER_URL}{path}", params=dict(request.query_params), content=await request.body(),
+        headers=headers, timeout=30)
+    keep = {k: v for k, v in upstream.headers.items() if k.lower() in ("content-type", "cache-control")}
+    return Response(content=upstream.content, status_code=upstream.status_code, headers=keep)
+
+
+@fastapi_app.get("/img/stage.png")
+async def img_stage(request: Request) -> Response:
+    return await _forward(request, "/img/stage.png")
+
+
+@fastapi_app.get("/tab/board")
+async def tab_board(request: Request) -> Response:
+    return await _forward(request, "/tab/board")
+
+
+@fastapi_app.api_route("/api/board{rest:path}", methods=["GET", "POST"])
+async def api_board(request: Request, rest: str) -> Response:
+    return await _forward(request, f"/api/board{rest}")
 
 
 async def relay(ctx: ActivityContext, payload: dict) -> None:
