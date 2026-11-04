@@ -68,8 +68,7 @@ async def _ask(turn: Any, step: str) -> None:
     if step == "github":
         await turn.send_buttons("GitHub 아이디를 알려 주세요. `thdwlndjs`처럼 아이디만 보내면 돼요.", [SKIP])
     else:
-        hint = f" (예: {turn.user_name}, {turn.user_name[1:] if turn.user_name and len(turn.user_name) > 2 else '별명'})" \
-            if turn.user_name else ""
+        hint = f" (예: {turn.user_name}, 줄인 이름이나 영어 이름)" if turn.user_name else ""
         await turn.send_buttons(f"회의록에 이름이 어떻게 적히나요? 여러 개면 쉼표로{hint}", [SKIP])
 
 
