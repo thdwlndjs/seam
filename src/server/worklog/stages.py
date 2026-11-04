@@ -16,7 +16,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from . import apply, db
+from . import apply, db, parts
 
 log = logging.getLogger("stage_judge")
 
@@ -26,6 +26,11 @@ STAGE_NAMES = dict(STAGES)
 ORDER = [s for s, _ in STAGES]
 CODE_GATES = {"voc_collected", "backlog", "milestones"}  # 코드로 판정(LLM 안 씀)
 MAX_ITEMS = 80  # 판정에 보내는 최근 항목 수
+MAX_DOCS = 10  # 함께 보내는 문서 부분 수(기획서 등). 한 줄 설명 + 앞부분
+DOC_HEAD_CHARS = 200
+STATEMENT_CHARS = 120
+BUDGET_TOKENS = 5000  # [가정] 판정 한 번 입력 상한(추정). Groq 무료 요청 한도(413)를 넘지 않게
+KIND_ORDER = {"decision": 0, "open": 1, "task": 2, "insight": 3, "document": 4, "needs_discussion": 5, "feedback": 6}
 StageJudge = Callable[[dict], dict]
 
 
@@ -93,11 +98,28 @@ def edit_gate(store: Path, scope: str, stage: str, gate_id: str, text: str | Non
 # ── 판정 ────────────────────────────────────────────────
 
 def snapshot(store: Path, scope: str) -> tuple[list[dict[str, Any]], str]:
-    """판정 입력: 반영된 항목(최근 것부터 MAX_ITEMS개)과 그 지문."""
+    """판정 입력: 반영된 항목(MAX_ITEMS개)과 문서 부분(기획서 등, 한 줄 설명과 앞부분)과 그 지문.
+    문서는 회의록이 아니라 추출·반영하지 않지만, 주제 후보·현재 상태처럼 단계를 가르는 내용이 문서에 있다.
+    문서 근거 ID는 'doc:<부분 ID>'."""
     live = apply.live_items(store, scope)
-    items = [{"id": i["id"], "kind": i["kind"], "title": i["title"], "statement": i.get("statement_md") or ""}
+    items = [{"id": i["id"], "kind": i["kind"], "title": i["title"],
+              "statement": (i.get("statement_md") or "")[:STATEMENT_CHARS]}
              for group in live.values() for i in group]
-    items = sorted(items, key=lambda i: i["id"])[:MAX_ITEMS]
+    with closing(db.connect(store)) as c:
+        docs = [dict(r) for r in c.execute(
+            """SELECT id, path, summary, md FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'document'
+               ORDER BY chars DESC LIMIT ?""", (scope, MAX_DOCS))]
+    items += [{"id": f"doc:{d['id']}", "kind": "document", "title": d["path"].rsplit(" > ", 1)[-1],
+               "statement": " / ".join(filter(None, [d["summary"], parts.md_to_text(d["md"])[:DOC_HEAD_CHARS]]))}
+              for d in docs]
+    # 예산 안에서 단계를 가르는 종류부터(결정·미정·할 일·VOC·문서), 멘토 피드백은 남는 만큼
+    items.sort(key=lambda i: (KIND_ORDER.get(i["kind"], 9), i["id"]))
+    kept: list[dict] = []
+    for item in items:
+        if len(kept) >= MAX_ITEMS or parts.estimate_tokens(kept + [item]) > BUDGET_TOKENS:
+            break
+        kept.append(item)
+    items = sorted(kept, key=lambda i: i["id"])
     return items, db.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True))
 
 
@@ -203,10 +225,16 @@ def proposals(store: Path, scope: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if now is None:
         missing = [g["text"] for g in gates(store, scope, target) if not _done(g, found)]
-        out.append({"kind": "stage_init", "key": _key(target, *sorted(missing)), "stage": target,
-                    "text": f"지금 {label(target)} 단계로 보여요" + (f" (남은 것: {', '.join(missing)})" if missing else "")
-                            + f". {label(target)}에서 시작할까요?",
-                    "answers": [("start_here", "맞아요"), ("start_first", "1-1부터")]})
+        ahead = found["discussing"].get("stage")
+        answers = [("start_here", "맞아요"), ("start_first", "1-1부터")]
+        note = ""
+        if ahead and ORDER.index(ahead) > ORDER.index(target):  # 게이트는 비었는데 논의는 더 앞서 있다
+            note = f" 회의록은 {label(ahead)} 내용까지 논의하고 있어요."
+            answers.insert(1, ("start_discussing", f"{ahead}로"))
+        out.append({"kind": "stage_init", "key": _key(target, ahead, *sorted(missing)), "stage": target, "ahead": ahead,
+                    "text": f"게이트로 보면 지금 {label(target)} 단계예요" + (f" (남은 것: {', '.join(missing)})" if missing else "")
+                            + f".{note} 어디서 시작할까요?",
+                    "answers": answers})
     else:
         stage_gates = gates(store, scope, now)
         open_gates = [g for g in stage_gates if not _done(g, found)]
@@ -220,14 +248,17 @@ def proposals(store: Path, scope: str) -> list[dict[str, Any]]:
                         "text": f"현재 {label(now)} 단계예요. '{gate['text']}'만 확정하고 넘어갈까요?",
                         "answers": [("decide", "정할게요"), ("later", "나중에")]})
         ahead = found["discussing"].get("stage")
-        if ahead and ORDER.index(ahead) > ORDER.index(now):
-            for stage in ORDER[ORDER.index(now) + 1:ORDER.index(ahead)]:
+        reach = ahead if ahead and ORDER.index(ahead) > ORDER.index(now) else now
+        behind = [st for st in ORDER[:ORDER.index(now)]]  # 이미 지나온 단계(첫 제안에서 앞 단계로 건너뛴 경우 등)
+        between = ORDER[ORDER.index(now) + 1:ORDER.index(reach)]  # 논의가 앞서 있어 건너뛴 단계
+        if behind or between:
+            for stage in behind + between:
                 for gate in gates(store, scope, stage):
                     if not _done(gate, found):
-                        out.append({"kind": "skipped_ahead", "key": _key(stage, gate["gate_id"], ahead,
+                        out.append({"kind": "skipped_ahead", "key": _key(stage, gate["gate_id"], reach,
                                                                          _evidence_key(found, gate["gate_id"])),
                                     "stage": stage, "gate_id": gate["gate_id"],
-                                    "text": f"이미 {label(ahead)} 내용을 논의하고 있는데 '{gate['text']}'({label(stage)})가 없어요.",
+                                    "text": f"이미 {label(reach)} 내용을 진행하고 있는데 '{gate['text']}'({label(stage)})가 없어요.",
                                     "answers": [("decide", "정할게요"), ("later", "나중에 할게요"), ("skip", "건너뛰기")]})
         turned = found.get("overturned")
         if turned and ORDER.index(now) >= ORDER.index("2-1"):
@@ -277,6 +308,9 @@ def answer(store: Path, scope: str, kind: str, key: str, reply: str, actor: str)
         if reply == "start_here":
             _set_stage(c, scope, stage, actor, "첫 제안")
             message = f"현재 단계를 정했어요: {label(stage)}"
+        elif reply == "start_discussing" and prompt.get("ahead"):
+            _set_stage(c, scope, prompt["ahead"], actor, "첫 제안(논의 중인 단계)")
+            message = f"현재 단계를 정했어요: {label(prompt['ahead'])}. 앞 단계의 빈 게이트는 따로 물어볼게요."
         elif reply == "start_first":
             _set_stage(c, scope, ORDER[0], actor, "첫 제안")
             message = f"현재 단계를 정했어요: {label(ORDER[0])}"

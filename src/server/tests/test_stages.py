@@ -142,6 +142,21 @@ class StageTests(unittest.TestCase):
         stages.answer(self.store, SCOPE, "skipped_ahead", later["key"], "later", "관리자")
         self.assertEqual([g["gate_id"] for g in stages.board(self.store, SCOPE)["earlier"]], [])  # 1-3은 현재(1-2)보다 뒤
 
+    def test_first_proposal_offers_the_discussed_stage_when_it_is_ahead(self) -> None:
+        add_item(self.store, "i-voc-run", "insight", "맘카페 VOC에서 세탁 고민 반복")
+        judge = ScriptedJudge(self.judge.gates, discussing={"stage": "2-2", "evidence": ["i-voc-run"]})
+        stages.assess(self.store, SCOPE, {}, judge)
+        init = stages.proposals(self.store, SCOPE)[0]
+        self.assertIn("2-2 VOC 수집 내용까지 논의하고 있어요", init["text"])
+        self.assertIn(("start_discussing", "2-2로"), init["answers"])
+        stages.answer(self.store, SCOPE, "stage_init", init["key"], "start_discussing", "관리자")
+        self.assertEqual(stages.current(self.store, SCOPE), "2-2")
+        behind = {p["gate_id"] for p in stages.proposals(self.store, SCOPE) if p["kind"] == "skipped_ahead"}
+        # 건너뛴 앞 단계의 빈 게이트를 묻는다(후보 주제는 충족이라 빠진다)
+        self.assertEqual(behind, {"topic_decided", "core_problem", "assumptions", "target_customer", "voc_method"})
+        missing = {p["gate_id"] for p in stages.proposals(self.store, SCOPE) if p["kind"] == "gate_missing"}
+        self.assertEqual(missing, set())  # 2-2의 게이트(VOC 수집)는 insight로 충족
+
     def test_voc_overturning_an_assumption_offers_to_go_back(self) -> None:
         add_item(self.store, "i-voc-2", "insight", "아무도 옷장에 카메라를 원하지 않음")
         judge = ScriptedJudge(self.judge.gates, overturned={"assumption": "카메라 옷장이 필요하다", "evidence": ["i-voc-2"]})

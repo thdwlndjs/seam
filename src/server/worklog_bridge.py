@@ -240,7 +240,8 @@ def groq_extract(records: list[dict]) -> list[dict]:
 
 STAGE_PROMPT = """너는 팀 프로젝트의 진행 단계를 판정하는 분석기야. 입력: stages(단계 목록), gates(단계별로 끝났다고 볼 조건),
 items(회의록에서 사람이 확인해 반영한 항목: id, kind(decision 정한 것 | task 할 일 | open 미정 | feedback 멘토 의견 |
-insight VOC 발견), title, statement).
+insight VOC 발견 | document 팀 문서(기획서 등)의 요약과 앞부분), title, statement).
+document는 팀이 쓴 기획 문서다. "현재 상태", "후보" 같은 표현을 그대로 믿어라(후보면 아직 확정이 아니다).
 할 일:
 1. gates마다 items만 보고 조건이 충족됐는지 판정해. 충족이면 근거 항목 id를 evidence에 꼭 넣어. 근거가 없으면 met은 false다.
    후보·아이디어를 나열한 것은 "확정"이 아니다. decision이어야 확정이다. feedback(멘토 의견)은 팀이 정한 것이 아니다.
