@@ -20,7 +20,7 @@ from typing import Any
 import llm_queue
 import meeting_inputs
 import worklog_bridge
-from worklog import apply, parts
+from worklog import apply, parts, stages
 
 READ_BUDGET_SECONDS = 70.0  # 이 안에 읽기·정리가 안 끝나면 안내하고 뒤에서 이어 한다(턴 시한 100초 안쪽)
 EDIT_SESSION_SECONDS = 600
@@ -283,6 +283,20 @@ async def revert(turn: Any, team_key: str, candidate_id: str, is_approver: bool)
     await turn.send("↩️ 되돌렸어요.")
 
 
+async def answer_stage(turn: Any, team_key: str, value: dict, is_approver: bool) -> None:
+    if not is_approver:
+        await turn.send("단계·게이트 질문은 권한자(관리자·개발·권한을 받은 사람)가 답해요.")
+        return
+    try:
+        message = await asyncio.to_thread(stages.answer, _store(), team_key, str(value.get("kind") or ""),
+                                          str(value.get("key") or ""), str(value.get("reply") or ""),
+                                          turn.user_name or turn.aad_id)
+    except Exception as error:
+        await turn.send(f"반영하지 못했어요: {error}")
+        return
+    await turn.send(f"🧭 {message}")
+
+
 async def resolve_gone(turn: Any, team_key: str, part_id: str, remove: bool, is_approver: bool) -> None:
     if not is_approver:
         await turn.send("삭제 확인은 권한자(관리자·개발·권한을 받은 사람)만 할 수 있어요.")
@@ -325,6 +339,12 @@ def main_card_alerts(team_key: str, approver: bool = True) -> tuple[list[str], l
         lines.append(f"🗑 회의록에서 사라진 부분: {title} — 거기서 나온 항목을 지울까요?")
         buttons += [{"title": f"지우기: {title[:16]}", "data": {"action": "gone_remove", "part_id": gone["id"]}},
                     {"title": f"그대로: {title[:16]}", "data": {"action": "gone_keep", "part_id": gone["id"]}}]
+    found = stages.proposals(store, team_key)[:2]  # 단계 제안·게이트 질문(spec P2-4)
+    stages.mark_asked(store, team_key, found)
+    for prompt in found:
+        lines.append(f"🧭 {prompt['text']}" + ("" if approver else " (권한자 확인 대기 중)"))
+        buttons += [{"title": title, "data": {"action": "stage_answer", "kind": prompt["kind"], "key": prompt["key"],
+                                              "reply": reply}} for reply, title in prompt["answers"]]
     working = parts.pending_count(store, team_key, _version())
     if working:
         lines.append(f"⏳ 회의록 {working}건 정리 중")

@@ -293,7 +293,9 @@ MIGRATIONS: list[list[str]] = [
             stage TEXT NOT NULL,             -- '1-1' … '3-4'
             approved_by TEXT,
             approved_at TEXT,
-            history_json TEXT NOT NULL DEFAULT '[]'
+            history_json TEXT NOT NULL DEFAULT '[]',
+            assessment_json TEXT,            -- 마지막 판정(게이트별 참/거짓·근거, 논의 중 단계)
+            assessed_hash TEXT               -- 그때의 반영 항목 지문(같으면 다시 판정하지 않는다)
         )""",
         """CREATE TABLE stage_gates (
             scope TEXT NOT NULL,             -- '*' = 공통 기본값

@@ -61,6 +61,7 @@ import worklog_bridge  # noqa: E402
 from worklog import apply as wapply  # noqa: E402
 from worklog import parts as wparts  # noqa: E402
 from worklog import people  # noqa: E402
+from worklog import stages as wstages  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
 # ── 설정 ────────────────────────────────────────────────
@@ -1183,9 +1184,39 @@ async def _worklog_loop() -> None:
                     await asyncio.to_thread(_sync_notion_maps)
                 # 주기마다(기본 5분) 부분 판정·추출을 조금씩 이어 한다. 메뉴는 그 결과만 읽는다.
                 await asyncio.to_thread(_organize_parts)
+                # 반영된 항목이 바뀐 팀만 단계·게이트를 다시 판정한다(순위 3, spec P2-3).
+                await _assess_stages()
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(worklog_bridge.ANALYZE_TICK_SECONDS)
+
+
+async def _github_stage_facts(config: dict) -> dict:
+    """코드로 보는 게이트(백로그·마일스톤)에 쓰는 GitHub 사실. 못 읽으면 빈 값."""
+    try:
+        issues = await _github_get_cached(config["github_repo"], "/issues", config["github_token"],
+                                          {"state": "all", "per_page": 100})
+    except Exception:
+        return {}
+    issues = [i for i in issues if isinstance(i, dict) and "pull_request" not in i]
+    with_milestone = [i for i in issues if i.get("milestone")]
+    return {"open_issues": sum(1 for i in issues if i.get("state") == "open"),
+            "milestones": len({i["milestone"]["number"] for i in with_milestone}),
+            "closed_issues": sum(1 for i in with_milestone if i.get("state") == "closed")}
+
+
+async def _assess_stages() -> None:
+    if not worklog_bridge.llm_ready():
+        return
+    for team_key, config in _load_team_configs().items():
+        try:
+            github = await _github_stage_facts(config)
+            await asyncio.to_thread(wstages.assess, worklog_bridge.WORKLOG_STORE, team_key, github,
+                                    worklog_bridge.groq_stage_judge)
+        except llm_queue.Busy:
+            return  # 한도: 다음 주기에
+        except Exception:
+            traceback.print_exc()
 
 
 @app.on_event("startup")
@@ -1286,7 +1317,7 @@ def _stored_items(team_key: str) -> dict:
 # ── 4번 반영 흐름·메인 카드 알림 (confirm_flow) ─────────────
 _CONFIRM_ACTIONS = {"apply_list", "apply_pick", "apply_pick_ready", "part_apply", "part_edit", "part_cancel",
                     "edit_delete", "edit_done", "applied_list", "revert", "gone_remove", "gone_keep",
-                    "upload_notes"}
+                    "upload_notes", "stage_answer"}
 
 
 def _is_approver(turn: Turn, config: dict) -> bool:
@@ -1326,6 +1357,8 @@ async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
         await confirm_flow.show_applied_list(turn, team, _is_approver(turn, config))
     elif action == "revert":
         await confirm_flow.revert(turn, team, str(value.get("candidate_id") or ""), _is_approver(turn, config))
+    elif action == "stage_answer":
+        await confirm_flow.answer_stage(turn, team, value, _is_approver(turn, config))
     elif action == "upload_notes":
         await confirm_flow.start_upload(turn, team)
     elif action in ("gone_remove", "gone_keep"):
