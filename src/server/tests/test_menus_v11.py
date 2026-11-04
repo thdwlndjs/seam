@@ -48,7 +48,7 @@ class MenuTests(unittest.TestCase):
                         patch.object(main, "_get_commit_touched_issues", new=AsyncMock(return_value=set()))]
         for p in self.patches:
             p.start()
-        add_item(self.store, "i-cand", "open", "후보 주제: 스마트 옷장")
+        add_item(self.store, "i-cand", "open", "후보 주제: 공유 우산 대여")
         add_item(self.store, "i-dec", "decision", "주간 회의는 화요일")
         add_item(self.store, "i-task-dev", "task", "로그인 API 만들기")
         set_attributes(self.store, "i-task-dev", {"role_hint": "dev", "issue_refs": []})
@@ -83,7 +83,7 @@ class MenuTests(unittest.TestCase):
         self.assertIn("📌 확정된 흐름\n- 주간 회의는 화요일", text)
         self.assertIn("- 정할 것: 주제 확정 결정이 있다", text)
         self.assertIn("🐢 천천히 정해도 되는 것", text)
-        self.assertIn("후보 주제: 스마트 옷장", text)
+        self.assertIn("후보 주제: 공유 우산 대여", text)
         self.assertIn("💬 멘토링 피드백", text)
 
     def test_menu3_lists_my_tasks_and_offers_unowned_tasks_for_my_role(self) -> None:

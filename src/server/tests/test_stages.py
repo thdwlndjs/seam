@@ -49,8 +49,8 @@ class ScriptedJudge:
 
 def this_team(store: Path) -> None:
     """이 팀의 실제 상황을 줄인 것: 후보 주제와 문제는 있고, 주제는 아직 확정 전(기획서 '현재 상태: 팀 주제 후보')."""
-    add_item(store, "i-cand-1", "open", "후보 주제: 스마트 옷장", "아침마다 옷 고르기가 어렵다는 문제를 푼다")
-    add_item(store, "i-cand-2", "open", "후보 주제: 식기세척기 자동 정렬", "식기를 제대로 놓지 않아 세척이 덜 된다는 문제")
+    add_item(store, "i-cand-1", "open", "후보 주제: 공유 우산 대여", "갑자기 비가 올 때 우산이 없다는 문제를 푼다")
+    add_item(store, "i-cand-2", "open", "후보 주제: 강의실 빈자리 알림", "빈 강의실을 찾느라 시간을 쓴다는 문제")
     add_item(store, "i-fb-1", "feedback", "식상한 주제는 피하라")
 
 
@@ -97,7 +97,7 @@ class StageTests(unittest.TestCase):
     def test_same_items_are_not_judged_twice(self) -> None:
         stages.assess(self.store, SCOPE, {}, self.judge)
         self.assertIsNone(stages.assess(self.store, SCOPE, {}, self.judge))
-        add_item(self.store, "i-new", "decision", "주제는 스마트 옷장으로 확정")
+        add_item(self.store, "i-new", "decision", "주제는 공유 우산 대여로 확정")
         self.assertIsNotNone(stages.assess(self.store, SCOPE, {}, self.judge))
         self.assertEqual(len(self.judge.calls), 2)
 
@@ -143,7 +143,7 @@ class StageTests(unittest.TestCase):
         self.assertEqual([g["gate_id"] for g in stages.board(self.store, SCOPE)["earlier"]], [])  # 1-3은 현재(1-2)보다 뒤
 
     def test_first_proposal_offers_the_discussed_stage_when_it_is_ahead(self) -> None:
-        add_item(self.store, "i-voc-run", "insight", "맘카페 VOC에서 세탁 고민 반복")
+        add_item(self.store, "i-voc-run", "insight", "커뮤니티 VOC에서 우산 분실 고민 반복")
         judge = ScriptedJudge(self.judge.gates, discussing={"stage": "2-2", "evidence": ["i-voc-run"]})
         stages.assess(self.store, SCOPE, {}, judge)
         init = stages.proposals(self.store, SCOPE)[0]
@@ -158,8 +158,8 @@ class StageTests(unittest.TestCase):
         self.assertEqual(missing, set())  # 2-2의 게이트(VOC 수집)는 insight로 충족
 
     def test_voc_overturning_an_assumption_offers_to_go_back(self) -> None:
-        add_item(self.store, "i-voc-2", "insight", "아무도 옷장에 카메라를 원하지 않음")
-        judge = ScriptedJudge(self.judge.gates, overturned={"assumption": "카메라 옷장이 필요하다", "evidence": ["i-voc-2"]})
+        add_item(self.store, "i-voc-2", "insight", "아무도 대여소 위치 알림을 원하지 않음")
+        judge = ScriptedJudge(self.judge.gates, overturned={"assumption": "대여소 위치 알림이 필요하다", "evidence": ["i-voc-2"]})
         stages.assess(self.store, SCOPE, {}, judge)
         with db.write(self.store) as c:
             stages._set_stage(c, SCOPE, "2-3", "관리자", "테스트")
