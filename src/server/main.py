@@ -67,6 +67,7 @@ from worklog import leading as wleading  # noqa: E402
 from worklog import lineage as wlineage  # noqa: E402
 from worklog import parts as wparts  # noqa: E402
 from worklog import people  # noqa: E402
+from worklog import qa as wqa  # noqa: E402
 from worklog import runs as wruns  # noqa: E402
 from worklog import stages as wstages  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
@@ -462,7 +463,10 @@ async def handle_turn(turn: Turn) -> None:
     config = _get_config(turn.team_key)
     if config is not None:
         await asyncio.to_thread(_sync_member, turn, config)
-        _check_on_open(turn.team_key, config)
+        action = turn.req.value.get("action") if isinstance(turn.req.value, dict) else None
+        in_qa = has_qa_session(turn.aad_id) and qa_sessions[turn.aad_id]["team_key"] == turn.team_key
+        if action != "qa_start" and not (in_qa and not action):
+            _check_on_open(turn.team_key, config)
 
     # 카드 버튼(Action.Submit / Action.Execute) — 에코봇이 data를 value에 그대로 실어 보낸다.
     value = turn.req.value
@@ -509,6 +513,7 @@ async def _dispatch_value(turn: "Turn", value: dict) -> bool:
     """카드 버튼 하나를 처리한다. 처리했으면 True."""
     action = value.get("action")
     if action == "menu" and "choice" in value:
+        qa_sessions.pop(turn.aad_id, None)
         await _run_action(turn, str(value["choice"]))
     elif action == "claim_issue" and "issue_number" in value:
         await _handle_claim_click(turn, int(value["issue_number"]))
@@ -516,6 +521,10 @@ async def _dispatch_value(turn: "Turn", value: dict) -> bool:
         await turn.send("알겠어요, 넘어갈게요.")
     elif action == "take_task" and value.get("item_id"):
         await _handle_take_task(turn, str(value["item_id"]))
+    elif action == "qa_start":
+        await _start_qa(turn)
+    elif action == "qa_agenda":
+        await _handle_qa_agenda(turn, value)
     elif action in _CONFIRM_ACTIONS:
         await _handle_confirm_action(turn, action, value)
     else:
@@ -545,6 +554,13 @@ async def _handle_text(turn: "Turn", config: dict | None, raw_text: str, aad_id:
     if confirm_flow.has_upload_session(aad_id):  # 4번 ④ 회의록 올리기 다음 메시지
         await confirm_flow.handle_upload(turn, turn.req.text, [a.model_dump() for a in turn.req.attachments])
         return
+
+    if has_qa_session(aad_id):  # 💬 질문하기: 다음 메시지를 질문으로 받는다(10분). 메뉴 번호·설정은 질문이 아니라 그대로 처리한다
+        if qa_sessions[aad_id]["team_key"] != turn.team_key or raw_text in ("1", "2", "3", "4", "0", "설정") or config is None:
+            qa_sessions.pop(aad_id, None)
+        else:
+            await _handle_qa(turn, config, raw_text)
+            return
 
     if meeting_inputs.has_clova_link(raw_text):
         await turn.send(meeting_inputs.CLOVA_LINK_REPLY)
@@ -599,6 +615,8 @@ def _cancel_pending_sessions(aad_id: str) -> bool:
     if member_flow.sessions.pop(aad_id, None) is not None:
         cancelled = True
     if source_add_sessions.pop(aad_id, None) is not None:
+        cancelled = True
+    if qa_sessions.pop(aad_id, None) is not None:
         cancelled = True
     return cancelled
 
@@ -720,7 +738,7 @@ async def _run_menu(turn: Turn, raw_text: str) -> None:
             reply_text, unassigned_issues = await fetch_team_status(config, turn.team_key, on_stage=turn.status)
             await turn.send(reply_text)
             if "📎 근거" in reply_text:  # 새 브리핑: 줄마다 근거가 있다. 출처·이력과 고치기는 탭에서
-                await turn.send_buttons("출처·이력을 보고 고치려면 구조 보기를 열어 주세요.", [_board_button(turn)])
+                await turn.send_buttons("더 궁금한 것은 물어보거나, 출처·이력을 구조 보기에서 확인해 주세요.", [_QA_BUTTON, _board_button(turn)])
             if unassigned_issues:
                 await turn.send_buttons(*_claim_buttons(unassigned_issues), emphasis=True)
             return
@@ -1238,6 +1256,121 @@ async def _lead_status(team_key: str, issue_states: dict[int, str], commit_touch
         return None
 
 
+# ── 질문하기 (docs/implementation/v2.1/plan.md Phase 5) ───────────────
+QA_SESSION_SECONDS = 600
+# key: aad_object_id, value: {"team_key", "at"}
+qa_sessions: dict[str, dict] = {}
+_QA_INTRO = ("💬 무엇이 궁금한가요? 저장된 회의·문서 지식으로 찾아 답해요. 구현·작업 상태를 물으면 GitHub 이슈·PR도 같이 봐요.\n"
+             "(10분 동안 이어서 물어볼 수 있어요. 끝내려면 '취소')")
+
+
+def has_qa_session(aad_id: str) -> bool:
+    session = qa_sessions.get(aad_id)
+    if session and time.monotonic() - session["at"] > QA_SESSION_SECONDS:
+        qa_sessions.pop(aad_id, None)
+        return False
+    return session is not None
+
+
+async def _start_qa(turn: Turn) -> None:
+    if _get_config(turn.team_key) is None:
+        await turn.send(_NO_CONFIG_TEXT)
+        return
+    for other in (setup_sessions, github_onboarding_sessions, source_add_sessions, confirm_flow.upload_sessions, confirm_flow.edit_sessions):
+        other.pop(turn.aad_id, None)
+    qa_sessions[turn.aad_id] = {"team_key": turn.team_key, "at": time.monotonic()}
+    await turn.send(_QA_INTRO)
+
+
+async def _github_prs(repo: str, token: str) -> list[dict]:
+    """PR 목록(최근 30건): 번호·제목·본문 앞부분·상태·병합 여부만. 기존 _github_get_cached를 쓴다."""
+    data = await _github_get_cached(repo, "/pulls", token, {"state": "all", "per_page": 30})
+    return [{"number": pr["number"], "title": pr.get("title"), "body": (pr.get("body") or "")[:600], "state": pr.get("state"),
+             "merged_at": pr.get("merged_at")} for pr in data]
+
+
+async def _github_pr_files(repo: str, token: str, number: int) -> list[str]:
+    """PR의 변경 파일 경로만(파일 본문·diff는 가져오지 않는다)."""
+    data = await _github_get_cached(repo, f"/pulls/{number}/files", token, {"per_page": 30})
+    return [f["filename"] for f in data]
+
+
+async def _github_commit_info(repo: str, token: str) -> tuple[set[int], int]:
+    """최근 커밋(30건)이 가리키는 이슈 번호들과 본 커밋 수. 기존 _get_commit_touched_issues와 같은 규칙."""
+    commits = await _github_get_cached(repo, "/commits", token, {"per_page": 30})
+    touched: set[int] = set()
+    for commit in commits:
+        touched |= {int(m.group(1)) for m in _ISSUE_REF_RE.finditer(commit.get("commit", {}).get("message", ""))}
+    return touched, len(commits)
+
+
+async def _qa_github(config: dict, ctx: dict, question: str) -> dict:
+    """질문이 구현·작업 상태에 관한 것일 때만 GitHub를 본다. 실제로 본 범위를 pack에 담아 돌려준다(답의 조회 범위가 이 값으로 채워진다)."""
+    if not wqa.wants_github(question):
+        return {"status": "skipped"}
+    token, repo = config.get("github_token"), config.get("github_repo")
+    if not token or not repo:
+        return {"status": "no_repo"}
+    try:
+        issues = await _github_get_cached(repo, "/issues", token, {"state": "all", "per_page": 30})
+        prs = await _github_prs(repo, token)
+        touched, commits = await _github_commit_info(repo, token)
+        files: dict[int, list[str]] = {}
+        for number in wqa.linked_prs(ctx, prs):
+            try:
+                files[number] = await _github_pr_files(repo, token, number)
+            except Exception:
+                traceback.print_exc()  # 이 PR의 파일 경로만 못 본 것이다(조회 범위에 올라가지 않는다)
+        return {"status": "ok", "repo": repo, "pack": wqa.github_pack(ctx, repo, issues, prs, touched, files, commits)}
+    except Exception:
+        traceback.print_exc()
+        return {"status": "failed"}
+
+
+async def _handle_qa(turn: Turn, config: dict, question: str) -> None:
+    """질문 한 건: 저장된 지식 검색 → (필요하면) GitHub → 모델 1~2회 → 답 카드. Notion은 부르지 않는다."""
+    qa_sessions[turn.aad_id] = {"team_key": turn.team_key, "at": time.monotonic()}
+    started = time.monotonic()
+    turn.status("🔎 저장된 지식에서 찾는 중...")
+    ctx = await asyncio.to_thread(wqa.gather, worklog_bridge.WORKLOG_STORE, turn.team_key, question)
+    github = await _qa_github(config, ctx, question)
+    turn.status("🧠 답을 정리하는 중...")
+
+    def call(name: str, payload: dict):
+        return worklog_bridge.lead_call(name, payload)
+
+    try:
+        outcome = await asyncio.to_thread(wqa.ask, ctx, github, call)
+    except wqa.CallLimit as error:  # 코드 오류 방어선: 질문당 2회를 넘기려 했다
+        traceback.print_exc()
+        outcome = wqa._failure(ctx, github, [], error)
+    usage = outcome["usage"]
+    _lead_usage[(turn.team_key, "qa")] = {"input": sum(int(u.get("prompt_tokens") or 0) for u in usage),
+                                          "output": sum(int(u.get("completion_tokens") or 0) for u in usage),
+                                          "calls": outcome["calls"], "seconds": round(time.monotonic() - started, 1)}
+    logging.getLogger("worklog").info("qa team=%s calls=%s tokens=%s seconds=%.1f", turn.team_key, outcome["calls"],
+                                      _lead_usage[(turn.team_key, "qa")], time.monotonic() - started)
+    await turn.send(outcome["text"])
+    if outcome["buttons"]:
+        view = f"item:{outcome['view_item']}" if outcome["view_item"] else ""
+        await turn.send_buttons("다음에 할 수 있는 것", [*outcome["buttons"], _board_button(turn, view)])
+
+
+async def _handle_qa_agenda(turn: Turn, value: dict) -> None:
+    """[담당자에게 확인 요청 안건으로] / [다음 회의 안건으로]: 사람이 누를 때만 안건(미정) 항목을 만든다."""
+    try:
+        made = await asyncio.to_thread(wqa.create_agenda, worklog_bridge.WORKLOG_STORE, turn.team_key, str(value.get("text") or ""),
+                                       str(value.get("mode") or ""), turn.user_name or turn.aad_id)
+    except ConflictError:
+        await turn.send("같은 이름의 미정·안건이 이미 있어요. 구조 보기에서 확인해 주세요.")
+        return
+    except ValidationError as error:
+        await turn.send(f"안건으로 올리지 못했어요: {error}")
+        return
+    where = "담당자에게 확인 요청할 안건" if made["mode"] == "ask" else "다음 회의 안건"
+    await turn.send(f"📅 '{made['title']}'을(를) {where}으로 올렸어요. 구조 보기에서 확인·수정할 수 있어요.")
+
+
 def _document_lines(docs: list[dict]) -> list[str]:
     """1번 메뉴의 주요 문서: 제목 — 한 줄 설명 (Notion 링크). 문서: docs/v1.1/spec.md P1-9."""
     if not docs:
@@ -1574,8 +1707,11 @@ stage_image.register(app)
 board_tab.register(app, BOT_SERVER_SECRET, lambda: worklog_bridge.WORKLOG_STORE, _can_edit_board)
 
 
-def _board_button(turn: Turn) -> dict:
-    return {"title": "🗂 구조 보기·고치기", "url": board_tab.link(BOT_SERVER_SECRET, turn.aad_id, turn.user_name, turn.team_key)}
+_QA_BUTTON = {"title": "💬 질문하기", "data": {"action": "qa_start"}}
+
+
+def _board_button(turn: Turn, view: str = "") -> dict:
+    return {"title": "🗂 구조 보기·고치기", "url": board_tab.link(BOT_SERVER_SECRET, turn.aad_id, turn.user_name, turn.team_key, view)}
 
 
 async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
@@ -1659,7 +1795,7 @@ async def _send_welcome(turn: Turn) -> None:
             await turn.send_buttons(card[0], card[1], card=card[2])
         elif card is not None:
             await turn.send(card[0])
-    menu = [*_MENU_BUTTONS, _board_button(turn)] if config is not None else _MENU_BUTTONS
+    menu = [*_MENU_BUTTONS, _QA_BUTTON, _board_button(turn)] if config is not None else _MENU_BUTTONS
     await turn.send_buttons(WELCOME_TEXT, menu)
 
 

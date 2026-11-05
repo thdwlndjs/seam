@@ -37,11 +37,22 @@ def _notion_url(page_id: str | None, origin: str) -> str | None:
     return f"https://www.notion.so/{page_id.replace('-', '')}" if page_id and origin == "notion" else None
 
 
+def _section_url(page_id: str | None, origin: str, block_ids_json: str | None) -> str | None:
+    """부분이 시작하는 블록으로 바로 가는 Notion 링크(페이지 주소 + #블록ID). 블록 ID를 모르면 페이지 링크."""
+    base = _notion_url(page_id, origin)
+    try:
+        blocks = json.loads(block_ids_json or "[]")
+    except (TypeError, ValueError):
+        blocks = []
+    block = blocks[0] if isinstance(blocks, list) and blocks and isinstance(blocks[0], str) else ""
+    return f"{base}#{block.replace('-', '')}" if base and block else base
+
+
 def _sources(c: Any, scope: str) -> dict[str, dict[str, Any]]:
     """부분 ID → 출처(페이지 경로·날짜·링크)."""
     contents = {r["locator"]: r["content"] for r in c.execute(
         "SELECT locator, content FROM sources ORDER BY captured_at, rowid")}
-    rows = c.execute("""SELECT id, origin, page_id, path, kind, last_edited, parent_part_id FROM source_parts
+    rows = c.execute("""SELECT id, origin, page_id, path, kind, last_edited, parent_part_id, block_ids_json FROM source_parts
                         WHERE scope = ?""", (scope,)).fetchall()
     # 부분 경로는 "페이지 경로 > 부분 제목"이다. 페이지 제목은 그 페이지의 가장 짧은 최상위 부분 경로에서 뗀다.
     page_paths: dict[str, str] = {}
@@ -57,7 +68,9 @@ def _sources(c: Any, scope: str) -> dict[str, dict[str, Any]]:
         out[row["id"]] = {"part_id": row["id"], "page_id": row["page_id"], "origin": row["origin"], "path": row["path"],
                           "page_path": page_path, "title": page_path.split(" > ")[-1], "part_kind": row["kind"],
                           "date": _page_date(contents.get(locator), row["last_edited"]),
-                          "url": _notion_url(row["page_id"], row["origin"])}
+                          "url": _notion_url(row["page_id"], row["origin"]),
+                          "section_url": _section_url(row["page_id"], row["origin"], row["block_ids_json"]),
+                          "section": row["path"].rsplit(" > ", 1)[-1]}
     return out
 
 

@@ -179,7 +179,7 @@ class BriefingTests(Base):
     def test_sections_and_maturity_are_decided_by_code_not_by_the_model(self) -> None:
         sections_ = self.by_title(self.built())
         self.assertEqual(sections_["이메일 로그인 확정"], "decided")
-        self.assertEqual(sections_["예전에 반영한 결정"], "decided")  # 성숙도 기록 전 결정은 사람이 확인해 반영한 것
+        self.assertEqual(sections_["예전에 반영한 결정"], "unclear")  # 성숙도 누락으로 사람 합의를 추론하지 않는다
         self.assertEqual(sections_["알림 기능"], "in_progress")  # 합의 + GitHub 연결
         self.assertEqual(sections_["로그인 API 만들기"], "in_progress")
         for title in ("소셜 로그인 가안", "소셜 로그인 안", "결제 수단 미정", "인터뷰 질문지"):
@@ -206,6 +206,8 @@ class BriefingTests(Base):
         self.assertIn("[합의] 이메일 로그인 확정", decided)
         self.assertNotIn("가안", decided)  # 가안은 결정됨에 섞이지 않는다
         unclear = text.split("❓ 불명확")[1]
+        self.assertIn("[합의 여부 미확인] 예전에 반영한 결정", unclear)
+        self.assertNotIn("확정, 성숙도 미기록", text)
         self.assertIn("[가안] 소셜 로그인 가안", unclear)
         self.assertIn("[논의] 결제 수단 미정", unclear)
 

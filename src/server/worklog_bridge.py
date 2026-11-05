@@ -58,7 +58,7 @@ def record(*, scope: str, kind: str, conversation_key: str, locator: str, text: 
 
 
 # ── LLM 호출 (동기 — 분석은 별도 스레드에서 돈다) ─────────────────
-def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGROUND) -> tuple[Any, dict, str]:
+def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGROUND, *, retry_invalid_json: bool = True) -> tuple[Any, dict, str]:
     """JSON 응답 한 번. (응답 JSON, usage, "공급자:모델")을 돌려준다.
 
     백그라운드(순위 2·3)는 공급자를 차례로 시도한다(Groq → Cerebras, 키가 있는 것만). 대기열 한도에 막히거나
@@ -70,7 +70,7 @@ def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGR
     broken: str | None = None
     for provider in candidates:
         content = body
-        for attempt in range(2):  # 답이 JSON이 아니면 한 번 더 부탁하고, 그래도 아니면 다음 공급자
+        for attempt in range(2 if retry_invalid_json else 1):
             try:
                 llm_queue.check(provider, priority, estimated, WORKLOG_STORE)
             except llm_queue.Busy as error:
@@ -95,7 +95,7 @@ def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGR
             metrics.count_groq(usage)
             llm_queue.record(WORKLOG_STORE, provider.name, priority, getattr(resp, "headers", None), status,
                              int(usage.get("total_tokens") or 0))
-            if status == 429 and priority > llm_queue.USER:
+            if status == 429:
                 busy = llm_queue.Busy("minute", 60, provider.name)
                 log.info("%s 한도 초과 → 다음 공급자", provider.name)
                 break
@@ -105,6 +105,8 @@ def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGR
             except (ValueError, KeyError, IndexError, TypeError) as error:
                 broken = f"{provider.name}: 답이 JSON이 아님 ({type(error).__name__})"
                 log.info("%s", broken)
+                if not retry_invalid_json:
+                    raise worklog.ContractError(broken) from error
                 content = body + "\n\n[이전 답이 JSON 객체 하나가 아니었다. 설명 없이 JSON 객체 하나만 출력해라.]"
     if broken and busy is None:
         raise worklog.ContractError(broken)
@@ -214,7 +216,7 @@ def lead_call(prompt_name: str, payload: dict) -> tuple[dict, dict, str]:
     답이 JSON 객체가 아니면 ContractError. LLM 키가 없으면 llm_queue.Busy가 아니라 RuntimeError(호출부가 대체 표시로 넘어간다)."""
     if not (GROQ_API_KEY or llm_ready()):
         raise RuntimeError("LLM 키가 없어요")
-    data, usage, label = _llm_call(prompts.load(prompt_name).text, payload, llm_queue.USER)
+    data, usage, label = _llm_call(prompts.load(prompt_name).text, payload, llm_queue.USER, retry_invalid_json=prompt_name != "qa")
     if not isinstance(data, dict):
         raise worklog.ContractError(f"{prompt_name} 답이 JSON 객체가 아님")
     return data, usage, label

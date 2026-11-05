@@ -18,7 +18,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from . import board, core, db, sections
+from . import board, core, db, decision_state, sections
 from .db import ContractError
 
 DOC_SUMMARY_CHARS = 500  # 문서 하나의 요약 상한(최근 문서가 예산 밖으로 밀리지 않게 문서마다 자른다)
@@ -30,7 +30,7 @@ RECENT_MEETINGS = 3  # "최근 회의" 판단에 쓰는 회의 페이지 수
 NOTE_CHARS = 120
 EVIDENCE_PER_LINE = 2  # 한 줄에 풀어 쓰는 근거 수(나머지는 "외 n건")
 FORBIDDEN = re.compile(r"검증\s*(완료|됨|했|된)|동작\s*(확인|검증)|테스트\s*통과")  # GitHub 완료·이슈 종료는 기능 검증이 아니다
-MATURITY_LABEL = {"draft": "가안", "recommended": "조언", "discussed": "논의", "agreed": "합의"}
+MATURITY_LABEL = decision_state.MATURITY_LABELS
 GITHUB_LABEL = {"done": "✅ 이슈 종료", "in_progress": "🔨 진행 중(커밋 있음)", "not_started": "📋 이슈만 등록", "unlinked": "🆕 이슈 미등록"}
 SECTIONS = (("decided", "📌 결정됨"), ("in_progress", "🔨 진행 중"), ("unclear", "❓ 불명확"))
 ITEM_KINDS = ("decision", "requirement", "open", "hypothesis", "task")
@@ -64,9 +64,19 @@ def label_pages(pages: list[dict[str, Any]]) -> dict[str, str]:
     return labels
 
 
-def _ref(source: dict[str, Any], label: str) -> dict[str, Any]:
-    return {"page_id": source["page_id"], "label": label, "date": source["date"], "url": source["url"],
+def _ref(source: dict[str, Any], label: str, section: bool = False) -> dict[str, Any]:
+    """출처 하나. section=True면 근거가 있는 부분(블록)으로 바로 가는 링크와 부분 제목을 쓴다(항목의 근거). 아니면 페이지 링크."""
+    anchored = section and source.get("section_url") and "#" in source["section_url"]
+    return {"page_id": source["page_id"], "label": label, "date": source["date"],
+            "url": source["section_url"] if anchored else source["url"], "section": source.get("section") if anchored else None,
             "part_kind": source["part_kind"]}
+
+
+def ref_text(ref: dict[str, Any]) -> str:
+    """근거 한 줄: 이름(› 부분 제목)(날짜) — 링크."""
+    name = ref["label"] + (f" › {ref['section']}" if ref.get("section") else "")
+    when = f"({_day(ref['date'])})" if ref["date"] else ""
+    return f"{name}{when}" + (f" — {ref['url']}" if ref["url"] else "")
 
 
 # ── 메뉴 1: 산출물 문서 + 팀 정보 ──────────────────────────────
@@ -186,9 +196,7 @@ def _section_of(item: dict[str, Any]) -> str:
         return "in_progress" if item["assignee"] else "unclear"
     if item["status"] == "needs_discussion" or item["kind"] in ("open", "hypothesis"):
         return "unclear"
-    maturity = item["maturity"]
-    decided = maturity == "agreed" or (maturity is None and item["kind"] == "decision")  # 성숙도 기록 전(v1.1) 결정은 사람이 확인해 반영한 것
-    if not decided:
+    if decision_state.resolve(item.get("maturity"))["value"] != "agreed":
         return "unclear"
     return "in_progress" if item.get("github") else "decided"
 
@@ -219,11 +227,11 @@ def briefing_items(store: Path, scope: str, issue_states: dict[int, str], commit
                 key = (task_states or {}).get(row["id"]) or (state["key"] if state else "unlinked")
                 state = {"key": key, "label": GITHUB_LABEL[key], "number": state["number"] if state else None,
                          "linked": state["linked"] if state else "explicit"}
-            maturity = attributes.get("maturity")
+            maturity = decision_state.resolve(attributes.get("maturity"))["value"]
             items.append({
                 "id": row["id"], "kind": row["kind"], "status": row["status"], "title": row["title"],
                 "statement": row["statement_md"], "assignee": attributes.get("assignee"),
-                "maturity": maturity if maturity in MATURITY_LABEL else None, "github": state,
+                "maturity": None if maturity == "unknown" else maturity, "github": state,
                 "alternatives": sum(1 for link in mine if link["type"] == core.LINK_ALTERNATIVE_TO and link["direction"] == "in"
                                     and link["other"]["status"] not in board.HIDDEN),
                 "sources": sorted(found, key=lambda s: s["date"] or "", reverse=True)})
@@ -258,7 +266,8 @@ def _item_refs(found: list[dict[str, Any]], names: dict[str, str]) -> list[dict[
     seen: dict[str, dict[str, Any]] = {}
     for source in found:
         key = source["page_id"] or source["part_id"]
-        seen.setdefault(key, _ref(source, names.get(key, source["title"])))
+        ref = _ref(source, names.get(key, source["title"]), section=True)
+        seen.setdefault(ref["url"] or key, ref)  # 같은 페이지라도 부분이 다르면 따로 센다(링크가 다르다)
     return list(seen.values())
 
 
@@ -268,6 +277,7 @@ def briefing_payload(built: dict[str, Any], docs: list[dict[str, Any]]) -> dict[
     items = []
     for alias, item in built["aliased"].items():
         entry = {"id": alias, "kind": item["kind"], "maturity": item["maturity"], "title": item["title"],
+                 "decision_state": decision_state.resolve(item["maturity"]),
                  "statement": _summary_of(item["statement"], 160), "alternatives": item["alternatives"], "recent": item["recent"]}
         if item["status"] == "needs_discussion":
             entry["needs_discussion"] = True
@@ -318,11 +328,10 @@ def render_briefing(answer: Any, built: dict[str, Any], tab_url: str | None = No
     footer: list[str] = []
 
     def cite(ref: dict[str, Any]) -> int:
-        key = ref["page_id"] or ref["label"]
+        key = ref["url"] or ref["page_id"] or ref["label"]
         if key not in numbering:
             numbering[key] = len(numbering) + 1
-            when = f"({_day(ref['date'])})" if ref["date"] else ""
-            footer.append(f"[{numbering[key]}] {ref['label']}{when}" + (f" — {ref['url']}" if ref["url"] else ""))
+            footer.append(f"[{numbering[key]}] {ref_text(ref)}")
         return numbering[key]
 
     out: list[str] = []
@@ -342,7 +351,7 @@ def render_briefing(answer: Any, built: dict[str, Any], tab_url: str | None = No
             refs = []
             for e in evidence:
                 refs += built["aliased"][e]["refs"][:1] if e in built["aliased"] else [built["meetings"][e]]
-            marks = "".join(f"[{cite(r)}]" for r in {r["page_id"] or r["label"]: r for r in refs}.values())
+            marks = "".join(f"[{cite(r)}]" for r in {r["url"] or r["page_id"] or r["label"]: r for r in refs}.values())
             head = [f"{str(overview['text']).strip()} {marks}"]
     if not out and not head:
         raise ContractError("nothing to show")
@@ -358,11 +367,9 @@ def render_briefing(answer: Any, built: dict[str, Any], tab_url: str | None = No
 
 def _line(item: dict[str, Any], note: str | None, cite: Callable[[dict[str, Any]], int]) -> str:
     parts = []
-    maturity = MATURITY_LABEL.get(item["maturity"])
-    if maturity:
-        parts.append(f"[{maturity}]")
-    elif item["kind"] == "decision":
-        parts.append("[확정, 성숙도 미기록]")
+    state = decision_state.resolve(item.get("maturity"))
+    if state["value"] != "unknown" or item["kind"] in ("decision", "requirement"):
+        parts.append(f"[{state['label']}]")
     if item["status"] == "needs_discussion":
         parts.append("[확인 필요]")
     text = f"- {' '.join(parts)} {item['title']}".replace("-  ", "- ")

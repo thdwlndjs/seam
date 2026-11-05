@@ -100,7 +100,7 @@ class ShippedPromptTests(unittest.TestCase):
         self.assertEqual(prompts.load("explore").version, "explore-1")
         self.assertEqual(prompts.load("project-info-raw").version, "project-info-1")  # 예전 요약(산출물 문서가 없을 때)은 그대로
         self.assertEqual(prompts.load("project-info").version, "project-info-2")
-        self.assertEqual(prompts.load("project-leading").version, "project-leading-1")
+        self.assertEqual(prompts.load("project-leading").version, "project-leading-2")
         self.assertEqual(worklog_bridge.EXTRACT_PROMPT_VERSION, prompts.load("interpret").version)
 
     def test_moved_prompts_say_what_they_said_before(self) -> None:

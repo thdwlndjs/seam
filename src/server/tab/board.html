@@ -587,7 +587,12 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && S.select
   applyTheme(null);
   S.token = await findToken();
   if (!S.token) return fail("봇 카드에서 열어 주세요", "PM봇 메인 카드의 [🗂 구조 보기·고치기] 버튼을 누르면 내 팀 화면이 열려요.");
-  try { await load(); if (S.data.viewer.view === "stages") openStages(); } catch (e) { fail("화면을 열지 못했어요", e.message); }
+  try {
+    await load();
+    const view = S.data.viewer.view || "";
+    if (view === "stages") openStages();
+    else if (view.startsWith("item:") && findItem(view.slice(5))) select(view.slice(5));  // 답·브리핑의 근거 항목으로 바로 연다
+  } catch (e) { fail("화면을 열지 못했어요", e.message); }
 })();
 </script>
 </body>
