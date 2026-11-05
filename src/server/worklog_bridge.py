@@ -67,37 +67,47 @@ def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGR
     estimated = len(body) * 3 // 4 + len(system_prompt) // 2
     candidates = llm_queue.available(priority) or llm_queue.PROVIDERS[:1]
     busy: llm_queue.Busy | None = None
+    broken: str | None = None
     for provider in candidates:
-        try:
-            llm_queue.check(provider, priority, estimated, WORKLOG_STORE)
-        except llm_queue.Busy as error:
-            busy = error
-            continue
-        with httpx.Client(timeout=60) as client:
-            resp = client.post(
-                provider.url,
-                headers={"Authorization": f"Bearer {provider.key}"},
-                json={
-                    "model": provider.model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": body},
-                    ],
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-        usage = usage_of(resp) or {}
-        status = getattr(resp, "status_code", 200)
-        metrics.count_groq(usage)
-        llm_queue.record(WORKLOG_STORE, provider.name, priority, getattr(resp, "headers", None), status,
-                         int(usage.get("total_tokens") or 0))
-        if status == 429 and priority > llm_queue.USER:
-            busy = llm_queue.Busy("minute", 60, provider.name)
-            log.info("%s 한도 초과 → 다음 공급자", provider.name)
-            continue
-        resp.raise_for_status()
-        return json.loads(resp.json()["choices"][0]["message"]["content"]), usage, f"{provider.name}:{provider.model}"
+        content = body
+        for attempt in range(2):  # 답이 JSON이 아니면 한 번 더 부탁하고, 그래도 아니면 다음 공급자
+            try:
+                llm_queue.check(provider, priority, estimated, WORKLOG_STORE)
+            except llm_queue.Busy as error:
+                busy = error
+                break
+            with httpx.Client(timeout=60) as client:
+                resp = client.post(
+                    provider.url,
+                    headers={"Authorization": f"Bearer {provider.key}"},
+                    json={
+                        "model": provider.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": content},
+                        ],
+                        "temperature": 0,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+            usage = usage_of(resp) or {}
+            status = getattr(resp, "status_code", 200)
+            metrics.count_groq(usage)
+            llm_queue.record(WORKLOG_STORE, provider.name, priority, getattr(resp, "headers", None), status,
+                             int(usage.get("total_tokens") or 0))
+            if status == 429 and priority > llm_queue.USER:
+                busy = llm_queue.Busy("minute", 60, provider.name)
+                log.info("%s 한도 초과 → 다음 공급자", provider.name)
+                break
+            resp.raise_for_status()
+            try:
+                return json.loads(resp.json()["choices"][0]["message"]["content"]), usage, f"{provider.name}:{provider.model}"
+            except (ValueError, KeyError, IndexError, TypeError) as error:
+                broken = f"{provider.name}: 답이 JSON이 아님 ({type(error).__name__})"
+                log.info("%s", broken)
+                content = body + "\n\n[이전 답이 JSON 객체 하나가 아니었다. 설명 없이 JSON 객체 하나만 출력해라.]"
+    if broken and busy is None:
+        raise worklog.ContractError(broken)
     raise busy or llm_queue.Busy("minute", 60)
 
 
@@ -191,8 +201,23 @@ def groq_extract_part(payload: dict, priority: int = llm_queue.BACKGROUND) -> di
     if not (GROQ_API_KEY or llm_ready()):
         return {}
     data, usage, label = _llm_call(prompts.load("interpret").text, payload, priority)
-    items = data.get("items") if isinstance(data, dict) else None
-    return {"items": items if isinstance(items, list) else [], "usage": usage, "model": label}
+    if not isinstance(data, dict):
+        raise worklog.ContractError("해석 답이 JSON 객체가 아님")
+    items = data.get("items")
+    if not isinstance(items, list):
+        raise worklog.ContractError("해석 답에 items 목록이 없음")
+    return {"items": items, "artifact": data.get("artifact"), "usage": usage, "model": label}
+
+
+def groq_explore(payload: dict, priority: int = llm_queue.BACKGROUND) -> dict:
+    """해석할 문서 영역을 고른다(v2.1 Phase 2). {"read": [{"area_id", "reason"}], "usage", "model"}. LLM 키가 없으면 빈 dict."""
+    if not (GROQ_API_KEY or llm_ready()):
+        return {}
+    data, usage, label = _llm_call(prompts.load("explore").text, payload, priority)
+    read = data.get("read") if isinstance(data, dict) else None
+    if not isinstance(read, list):
+        raise worklog.ContractError("탐색 답에 read 목록이 없음")
+    return {"read": read, "usage": usage, "model": label}
 
 
 def groq_extract(records: list[dict]) -> list[dict]:

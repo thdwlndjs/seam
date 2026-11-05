@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import db
+from . import db, runs
+from .db import ContractError
 
 KINDS = {"meeting", "document", "link"}
 LOW_CONFIDENCE = 0.6  # [가정] 이보다 낮으면 문서로 두고 추출하지 않는다
@@ -440,9 +441,12 @@ def list_parts(store: Path, scope: str, page_id: str | None = None, include_gone
 
 # ── 5. 추출 (docs/v1.1/spec.md P1-4) ────────────────────────
 
-ITEM_KINDS = {"decision", "task", "open", "feedback", "insight"}
+ITEM_KINDS = {"decision", "task", "open", "feedback", "insight", "requirement", "hypothesis"}
 ROLE_HINTS = {"plan", "design", "dev"}
+MATURITY = ("draft", "recommended", "discussed", "agreed")  # 가안 / 조언 / 논의 / 합의 (core.MATURITY와 같다)
+ARTIFACT_TYPES = ("회의록", "기획", "조사", "디자인", "개발", "발표", "피드백", "기타")
 EXTRACT_BUDGET_TOKENS = 4000  # [가정] 한 번에 보내는 추출 입력(추정)의 상한. 넘는 부분은 줄 단위로 나눠 보낸다
+MAX_ITEMS_PER_PART = 20  # 한 조각에서 받아 주는 항목 수(넘는 것은 버리고 dropped에 센다)
 
 PartExtractor = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -456,27 +460,106 @@ def _squash(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def clean_items(items: list[Any], text: str) -> tuple[list[dict[str, Any]], int]:
-    """형식이 맞고 원문 인용(quote)이 실제 text 안에 있는 항목만 남긴다. (남긴 것, 버린 수)."""
+def _loosen(text: str) -> tuple[str, list[int]]:
+    """인용 비교용: 마크다운 강조 표시(* ` ~)와 문장부호 앞의 역슬래시 이스케이프를 뺀 글과, 각 글자의 원래 위치."""
+    out: list[str] = []
+    index: list[int] = []
+    for i, ch in enumerate(text):
+        if ch in "*`~":
+            continue
+        if ch == "\\" and i + 1 < len(text) and not text[i + 1].isalnum() and not text[i + 1].isspace():
+            continue
+        if ch.isspace() and out and out[-1] == " ":
+            continue
+        out.append(ch)
+        index.append(i)
+    return "".join(out), index
+
+
+def find_quote(quote: str, haystack: str) -> str | None:
+    """인용이 원문에 있으면 원문에 적힌 그대로의 구절을, 없으면 None. 공백 차이는 무시하고, 모델이 보이는 글만 옮길 때
+    빠지는 마크다운 강조 표시·이스케이프(굵게 표시, 역슬래시)는 같은 글로 본다. 그 밖의 글자가 다르면 같은 글이 아니다(요약·바꿔 쓰기 거부).
+    haystack은 _squash한 원문이다."""
+    squashed = _squash(quote)
+    if not squashed:
+        return None
+    if squashed in haystack:
+        return squashed
+    needle, _ = _loosen(squashed)
+    needle = needle.strip()
+    if not needle:
+        return None
+    loose, index = _loosen(haystack)
+    at = loose.find(needle)
+    if at < 0:
+        return None
+    return haystack[index[at]: index[at + len(needle) - 1] + 1]
+
+
+def decode_extract(raw: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """part_extracts.items_json → (항목 목록, 산출물 정보). 예전 저장 형식(목록)과 새 형식({"items", "artifact"}) 둘 다 읽는다."""
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        return list(data.get("items") or []), data.get("artifact") or None
+    return list(data), None
+
+
+def clean_artifact(raw: Any) -> dict[str, Any] | None:
+    """산출물 정보({"type", "summary", "maturity"})를 검증한다. 요약이 없으면 None."""
+    if not isinstance(raw, dict):
+        return None
+    summary = _squash(str(raw.get("summary") or ""))
+    if not summary:
+        return None
+    kind = str(raw.get("type") or "").strip()
+    maturity = raw.get("maturity") if raw.get("maturity") in MATURITY else None
+    return {"type": kind if kind in ARTIFACT_TYPES else "기타", "summary": summary[:600], "maturity": maturity}
+
+
+def check_items(items: list[Any], text: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """형식이 맞고 원문 인용(quote)이 실제 text 안에 있는 항목만 남기고, 버린 것은 이유와 함께 돌려준다.
+    (남긴 것, 버린 것[{"reason": "quote_mismatch|contract", "kind", "title", "quote"}]).
+    합의(agreed)는 팀이 정했다는 근거 인용(agreement_quote)이 원문에 있을 때만 둔다. 없으면 논의(discussed)로 내린다."""
     haystack = _squash(text)
     kept: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
     for raw in items:
-        if not isinstance(raw, dict) or raw.get("kind") not in ITEM_KINDS or not str(raw.get("title") or "").strip():
+        if not isinstance(raw, dict):
+            rejected.append({"reason": "contract", "kind": None, "title": None, "quote": None})
             continue
-        quote = _squash(str(raw.get("quote") or ""))
-        if not quote or quote not in haystack:
+        base = {"kind": raw.get("kind"), "title": str(raw.get("title") or "")[:80], "quote": str(raw.get("quote") or "")[:160]}
+        if raw.get("kind") not in ITEM_KINDS or not str(raw.get("title") or "").strip():
+            rejected.append({"reason": "contract", **base})
+            continue
+        quote = find_quote(str(raw.get("quote") or ""), haystack)
+        if not quote:
+            rejected.append({"reason": "quote_mismatch", **base})
             continue
         try:
             confidence = float(raw.get("confidence") if raw.get("confidence") is not None else 1)
         except (TypeError, ValueError):
             confidence = 0.0
         due = raw.get("due") if isinstance(raw.get("due"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw["due"]) else None
+        agreement = find_quote(str(raw.get("agreement_quote") or ""), haystack) or ""
+        agreed_ok = bool(agreement)
+        maturity = raw.get("maturity") if raw.get("maturity") in MATURITY else None
+        if maturity == "agreed" and not agreed_ok:
+            maturity = "discussed"  # "최종" 같은 말만으로는 합의가 아니다: 합의 근거 인용이 있어야 한다
+        if maturity is None:
+            maturity = ("agreed" if agreed_ok else "discussed") if raw["kind"] == "decision" else (
+                "recommended" if raw["kind"] == "feedback" else None)
         kept.append({"kind": raw["kind"], "title": _squash(str(raw["title"])), "detail": raw.get("detail") or None,
                      "owner": raw.get("owner") or None, "due": due,
                      "role_hint": raw.get("role_hint") if raw.get("role_hint") in ROLE_HINTS else None,
-                     "quote": quote, "confidence": confidence})
-    valid = sum(1 for raw in items if isinstance(raw, dict))
-    return kept, valid - len(kept)
+                     "quote": quote, "confidence": confidence, "maturity": maturity,
+                     "agreement_quote": agreement if agreed_ok else None})
+    return kept, rejected
+
+
+def clean_items(items: list[Any], text: str) -> tuple[list[dict[str, Any]], int]:
+    """check_items의 예전 모양: (남긴 것, 버린 수). 딕셔너리가 아닌 것은 세지 않는다(예전 동작)."""
+    kept, rejected = check_items(items, text)
+    return kept, sum(1 for r in rejected if not (r["reason"] == "contract" and r["kind"] is None and r["title"] is None))
 
 
 def _chunks(text: str, limit_tokens: int) -> list[str]:
@@ -496,16 +579,59 @@ def _chunks(text: str, limit_tokens: int) -> list[str]:
     return out
 
 
-def pending_extracts(store: Path, scope: str, prompt_version: str, page_id: str | None = None) -> list[dict[str, Any]]:
-    """추출할 회의 메모 부분(종류 meeting, 이 판의 추출이 아직 없음). 최근 수정된 것부터."""
+# ── 해석 대상 (탐색 선택, v2.1 Phase 2) ─────────────────────
+# 회의 메모는 항상 해석한다(최근 회의가 출발점). 그 밖의 문서 부분은 `explore`가 고른 것만 해석한다. 고른 결과는 runs
+# (stage = 'explore')에 남고, 부분 ID로 이어진다(내용이 바뀌어도 부분 ID가 같으면 계속 해석 대상이다).
+
+def explore_key(scope: str, page_id: str, fingerprint: str) -> str:
+    return runs.key_for("explore", scope, f"{page_id}:{fingerprint}")
+
+
+def selected_ids(store: Path, scope: str) -> set[str]:
+    """탐색(또는 사람)이 해석 대상으로 고른 부분 ID."""
     db.initialize(store)
+    out: set[str] = set()
     with closing(db.connect(store)) as c:
-        rows = [dict(r) for r in c.execute(
-            "SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting' AND (? IS NULL OR page_id = ?)",
-            (scope, page_id, page_id))]
+        for row in c.execute("SELECT result_json FROM runs WHERE stage = 'explore' AND status = 'succeeded' AND idempotency_key LIKE ?",
+                             (f"explore:{scope}:%",)):
+            try:
+                out |= set(json.loads(row["result_json"] or "{}").get("area_ids") or [])
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def interpretable(store: Path, scope: str, page_id: str | None = None) -> list[dict[str, Any]]:
+    """해석하는 부분: 활성 회의 메모 + 탐색이 고른 문서 부분. 링크·고르지 않은 문서는 해석하지 않는다(원문만 보관)."""
+    chosen = selected_ids(store, scope)
+    return [p for p in list_parts(store, scope, page_id=page_id) if p["kind"] == "meeting" or p["id"] in chosen]
+
+
+def structure_fingerprint(rows: list[dict[str, Any]]) -> str:
+    """페이지의 구조 지문: 부분 ID·경로·종류(내용은 빼서, 내용만 바뀌면 다시 탐색하지 않는다)."""
+    return db.sha256(sorted((r["id"], r["path"], r["kind"]) for r in rows if r["parent_part_id"] is None))[:16]
+
+
+def interpret_key(scope: str, part: dict, prompt_version: str) -> str:
+    return runs.key_for("interpret", scope, f"{part['id']}:{extract_hash(part)[:12]}:{prompt_version}")
+
+
+def pending_extracts(store: Path, scope: str, prompt_version: str, page_id: str | None = None) -> list[dict[str, Any]]:
+    """추출할 부분(해석 대상, 이 판의 추출이 아직 없음)과, 오류 기록이 있어 다시 시도할 부분. 최근 수정된 것부터.
+    3번 실패해서 멈춘 부분은 `reprocess`로 다시 열기 전까지 뺀다."""
+    db.initialize(store)
+    rows = interpretable(store, scope, page_id)
+    with closing(db.connect(store)) as c:
         done = {r["content_hash"] for r in c.execute(
             "SELECT content_hash FROM part_extracts WHERE prompt_version = ?", (prompt_version,))}
-    pending = [r for r in rows if extract_hash(r) not in done]
+    pending = []
+    for row in rows:
+        failed = runs.get(store, interpret_key(scope, row, prompt_version))
+        stopped = bool(failed and failed["status"] == "failed" and failed["attempts"] >= runs.MAX_ATTEMPTS)
+        if stopped:
+            continue
+        if extract_hash(row) not in done or (failed and failed["status"] == "failed"):
+            pending.append(row)
     return sorted(pending, key=lambda r: (r["last_edited"] or "", r["page_id"] or "", -r["position"]), reverse=True)
 
 
@@ -519,12 +645,14 @@ def pending_count(store: Path, scope: str, prompt_version: str) -> int:
 
 
 def save_extract(store: Path, content_hash: str, prompt_version: str, model: str, items: list[dict], dropped: int,
-                 usage: dict | None) -> None:
+                 usage: dict | None, artifact: dict | None = None) -> None:
+    """추출 결과 저장. 산출물 정보가 있으면 {"items", "artifact"}로, 없으면 예전처럼 항목 목록으로 저장한다."""
     usage = usage or {}
+    payload: Any = {"items": items, "artifact": artifact} if artifact else items
     with db.write(store) as c:
         c.execute("""INSERT OR REPLACE INTO part_extracts(content_hash, prompt_version, model, items_json, dropped,
                          input_tokens, output_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                  (content_hash, prompt_version, model, json.dumps(items, ensure_ascii=False), dropped,
+                  (content_hash, prompt_version, model, json.dumps(payload, ensure_ascii=False), dropped,
                    usage.get("prompt_tokens"), usage.get("completion_tokens"), db.now()))
 
 
@@ -532,21 +660,38 @@ def _mark_cached_extracted(store: Path, scope: str, prompt_version: str) -> None
     """이 판의 추출이 이미 있는(같은 글이 전에 추출된) 수집 상태 부분을 추출됨으로 올린다.
     Phase 2에서 상태 없이 추출해 둔 부분도 여기서 확인 대기 흐름에 들어온다."""
     db.initialize(store)
+    chosen = selected_ids(store, scope)  # 쓰기 잠금 밖에서(안에서 저장소를 다시 열면 잠긴다)
     with db.write(store) as c:
         done = {r["content_hash"] for r in c.execute(
             "SELECT content_hash FROM part_extracts WHERE prompt_version = ?", (prompt_version,))}
         rows = [dict(r) for r in c.execute(
-            """SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting'
-               AND state = 'collected'""", (scope,))]
+            """SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND state = 'collected'""", (scope,))]
         for row in rows:
-            if extract_hash(row) in done:
+            if (row["kind"] == "meeting" or row["id"] in chosen) and extract_hash(row) in done:
                 c.execute("UPDATE source_parts SET state = 'extracted' WHERE id = ?", (row["id"],))
+
+
+def _is_busy(error: BaseException) -> bool:
+    """한도(429)·대기열 Busy: 내용 때문이 아니라 지금 못 부르는 것(횟수에 넣지 않는다)."""
+    name = type(error).__name__
+    return name == "Busy" or "429" in str(error)
+
+
+def _halves(piece: str) -> list[str] | None:
+    """조각을 줄 경계에서 반으로 나눈다. 더 나눌 수 없으면(한 줄) None."""
+    lines = piece.split(chr(10))
+    if len(lines) < 2:
+        return None
+    mid = len(lines) // 2
+    return [chr(10).join(lines[:mid]), chr(10).join(lines[mid:])]
 
 
 def extract_pending(store: Path, scope: str, extract: PartExtractor | None, prompt_version: str,
                     budget_tokens: int | None = EXTRACT_BUDGET_TOKENS, page_id: str | None = None) -> int:
-    """추출 전인 회의 메모 부분을 최근 것부터 추출해 저장한다. 추출한 부분 수.
-    LLM이 없거나 실패하면(한도 초과 포함) 멈추고 다음 주기에 이어 한다. 문서(document)는 추출하지 않는다."""
+    """추출 전인 해석 대상 부분(회의 메모 + 탐색이 고른 문서)을 최근 것부터 추출해 저장한다. 추출한 부분 수.
+    LLM이 없거나 한도에 걸리면 멈추고 다음 주기에 이어 한다.
+    오류는 항목이 아니라 runs에 남는다: 인용 불일치(원문에 없는 인용)·계약 위반(형식)은 횟수를 세어 다음 주기에 다시
+    시도하고(상한 3회, 인용 불일치는 무엇이 틀렸는지 알려 줌), 맞게 나오면 성공으로 닫는다. 맞는 항목은 바로 저장한다."""
     _mark_cached_extracted(store, scope, prompt_version)
     if extract is None:
         return 0
@@ -557,22 +702,81 @@ def extract_pending(store: Path, scope: str, extract: PartExtractor | None, prom
         cost = sum(estimate_tokens(piece) for piece in pieces)
         if budget_tokens is not None and spent and spent + cost > budget_tokens:
             break
+        key = interpret_key(scope, part, prompt_version)
+        previous = runs.get(store, key)
+        feedback = None
+        if previous and previous["status"] == "failed" and previous["error_kind"] == "quote_mismatch":
+            wrong = (json.loads(previous["result_json"] or "{}").get("rejected") or [])[:5]
+            feedback = ("지난 답에서 quote가 text에 글자 그대로 없어 버려진 항목: " + "; ".join(
+                f"{r.get('title')} ({r.get('quote')})" for r in wrong) + ". quote는 text에서 그대로 복사해라.")
         items: list[Any] = []
+        truncated = 0
+        artifacts: list[dict[str, Any]] = []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         model = ""
         try:
-            for piece in pieces:
-                answer = extract({"path": part["path"], "text": piece}) or {}
-                if "items" not in answer:
-                    return done  # LLM 없음: 이번에는 멈춘다
+            work = list(pieces)
+            while work:  # 조각 하나씩(항목이 상한을 넘으면 그 조각을 반으로 나눠 이어서 처리한다)
+                piece = work.pop(0)
+                # 인용 불일치로 다시 묻는 중이면 시도 차수마다 따로 남긴다: 한 차수 안에서는 한도에 걸려도 이어서 하고,
+                # 다음 차수에서는 지적을 붙여 다시 묻는다
+                round_tag = f"f{previous['attempts']}" if feedback else ""
+                piece_key = f"{key}:p{round_tag}{db.sha256(piece)[:10]}"
+                saved = runs.get(store, piece_key)
+                if saved and saved["status"] == "split":
+                    work[:0] = _halves(piece) or [piece]
+                    continue
+                if saved and saved["status"] == "succeeded":
+                    answer = json.loads(saved["result_json"])  # 긴 부분은 조각마다 답을 남겨, 한도에 걸려도 이어서 한다
+                else:
+                    payload = {"path": part["path"], "source_kind": part["kind"], "text": piece}
+                    if feedback:
+                        payload["feedback"] = feedback
+                    answer = extract(payload) or {}
+                    if "items" not in answer:
+                        return done  # LLM 없음: 이번에는 멈춘다
+                    if not isinstance(answer["items"], list):
+                        raise ContractError("items must be a list")
+                    if len(answer["items"]) > MAX_ITEMS_PER_PART:
+                        halves = _halves(piece)
+                        if halves:  # 한 조각에 항목이 너무 많다: 반으로 나눠 각각 다시 뽑는다(버리지 않는다)
+                            runs.put(store, piece_key, "piece", "split")
+                            work[:0] = halves
+                            continue
+                        truncated += len(answer["items"]) - MAX_ITEMS_PER_PART  # 더 나눌 수 없을 때만 버리고 센다
+                        answer = dict(answer, items=answer["items"][:MAX_ITEMS_PER_PART])
+                    if len(pieces) > 1 or piece not in pieces:  # 나눈 조각·여러 조각 부분만 남긴다
+                        runs.put(store, piece_key, "piece", "succeeded", result={k: answer.get(k) for k in ("items", "artifact", "usage", "model")})
                 items += answer["items"]
+                if answer.get("artifact") is not None:
+                    found = clean_artifact(answer["artifact"])
+                    if found is None:
+                        raise ContractError("artifact needs a non-empty summary")
+                    artifacts.append(found)
                 model = answer.get("model") or model
-                for key in usage:
-                    usage[key] += int((answer.get("usage") or {}).get(key) or 0)
-        except Exception:
-            return done  # 한도 초과(429·대기열 Busy) 등: 남은 것은 다음 주기에
-        kept, dropped = clean_items(items, text)
-        save_extract(store, extract_hash(part), prompt_version, model, kept, dropped, usage)
+                for field_name in usage:
+                    usage[field_name] += int((answer.get("usage") or {}).get(field_name) or 0)
+        except ContractError as error:
+            runs.report(store, key, "interpret", "contract", str(error))
+            continue  # 이 부분만 건너뛴다(항목·상태 그대로). 다음 주기에 다시
+        except Exception as error:
+            if _is_busy(error):
+                return done  # 한도 초과·대기열 Busy: 남은 것은 다음 주기에(횟수에 넣지 않는다)
+            runs.report(store, key, "interpret", "llm_failed", str(error), count=False)
+            return done
+        kept, rejected = check_items(items, text)
+        artifact = None
+        if artifacts:
+            artifact = {"type": artifacts[0]["type"], "summary": " ".join(a["summary"] for a in artifacts)[:600],
+                        "maturity": artifacts[0]["maturity"]}
+        save_extract(store, extract_hash(part), prompt_version, model, kept, sum(
+            1 for r in rejected if r["kind"] is not None or r["title"] is not None) + truncated, usage, artifact)
+        mismatched = [r for r in rejected if r["reason"] == "quote_mismatch"]
+        if mismatched:
+            runs.report(store, key, "interpret", "quote_mismatch", f"원문에 없는 인용 {len(mismatched)}건",
+                        result={"rejected": rejected[:10]})
+        elif previous and previous["status"] == "failed":
+            runs.succeed(store, key, result={"kept": len(kept)})
         with db.write(store) as c:  # 상태: 수집 → 추출됨(확인 대기로 올라가기 전 단계, spec P1-5)
             c.execute("UPDATE source_parts SET state = 'extracted' WHERE id = ? AND state = 'collected'", (part["id"],))
         spent += cost
@@ -587,7 +791,7 @@ def meeting_items(store: Path, scope: str, prompt_version: str) -> list[dict[str
     with closing(db.connect(store)) as c:
         rows = [dict(r) for r in c.execute(
             "SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting'", (scope,))]
-        extracts = {r["content_hash"]: json.loads(r["items_json"]) for r in c.execute(
+        extracts = {r["content_hash"]: decode_extract(r["items_json"])[0] for r in c.execute(
             "SELECT content_hash, items_json FROM part_extracts WHERE prompt_version = ?", (prompt_version,))}
     rows.sort(key=lambda r: (r["last_edited"] or "", r["page_id"] or "", -r["position"]), reverse=True)
     merged: dict[tuple[str, str], dict[str, Any]] = {}

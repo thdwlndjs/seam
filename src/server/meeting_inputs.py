@@ -136,8 +136,11 @@ def title_of(name: str | None, md: str) -> str:
     return "회의록"
 
 
-def save_note(store: Path, scope: str, md: str, title: str, origin: str, actor: str) -> str:
-    """회의록 하나를 원문·부분으로 저장한다(종류는 회의 메모로 정함). 페이지 ID(같은 내용이면 같은 ID)."""
+def save_note(store: Path, scope: str, md: str, title: str, origin: str, actor: str, artifact_type: str = "회의록") -> str:
+    """올린 자료 하나를 원문·부분으로 저장한다. 자료 종류가 "회의록"이면 회의 메모, 그 밖(기획·조사·디자인·개발·발표·피드백·기타)이면
+    문서로 정하고(kind_note에 종류를 남김) 탐색을 거치지 않고 바로 해석 대상으로 둔다(사람이 골랐다). 페이지 ID(같은 내용이면 같은 ID)."""
+    if artifact_type not in parts.ARTIFACT_TYPES:
+        raise db.ValidationError(f"자료 종류는 {', '.join(parts.ARTIFACT_TYPES)} 중 하나")
     page_id = f"{origin}-{db.sha256(md)[:16]}"
     locator = f"{origin}:{page_id}"
     core.record(store, scope=scope, kind="teams_message", conversation_key=locator, locator=locator,
@@ -145,9 +148,18 @@ def save_note(store: Path, scope: str, md: str, title: str, origin: str, actor: 
                 metadata={"title": title, "origin": origin})
     built = parts.build_unit_parts(page_id, f"회의록 올리기 > {title}", md, None)
     parts.save_unit_parts(store, scope, origin, page_id, None, built, last_edited=db.now())
+    kind = "meeting" if artifact_type == "회의록" else "document"
     for part in parts.list_parts(store, scope, page_id=page_id):
-        if part["kind"] != "meeting":
-            parts.set_part_kind(store, part["id"], "meeting", actor)
+        if part["kind"] != kind:
+            parts.set_part_kind(store, part["id"], kind, actor)
+        if kind == "document":
+            with db.write(store) as c:
+                c.execute("UPDATE source_parts SET kind_note = ?, summary = COALESCE(summary, ?) WHERE id = ?",
+                          (artifact_type, f"{artifact_type} · {title}", part["id"]))
+    if kind == "document":
+        from worklog import explore  # 사람이 올린 자료는 탐색을 거치지 않고 모두 해석 대상이다
+
+        explore.select_all(store, scope, page_id, explore.HUMAN)
     return page_id
 
 

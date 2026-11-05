@@ -21,7 +21,7 @@ import llm_queue
 import meeting_inputs
 import stage_image
 import worklog_bridge
-from worklog import apply, parts, stages
+from worklog import apply, parts, runs, stages
 from worklog.db import ConflictError, ValidationError
 
 READ_BUDGET_SECONDS = 70.0  # 이 안에 읽기·정리가 안 끝나면 안내하고 뒤에서 이어 한다(턴 시한 100초 안쪽)
@@ -362,6 +362,9 @@ def main_card_alerts(team_key: str, approver: bool = True, admin: bool = False) 
     working = parts.pending_count(store, team_key, _version())
     if working:
         lines.append(f"⏳ 회의록 {working}건 정리 중")
+    stuck = runs.stuck(store, team_key) if admin else []
+    if stuck:  # 3번 실패해서 멈춘 처리(내용이 아니라 처리 오류): 관리자만 본다
+        lines.append(f"⚠️ 처리가 멈춘 항목 {len(stuck)}건 — 서버에서 reprocess로 다시 열 수 있어요")
     shown = for_viewer(buttons, approver)
     lines = lines[:5]
     if len(shown) < len(buttons):
@@ -400,14 +403,32 @@ UPLOAD_PROMPT = ("📤 회의록을 보내 주세요\n"
                  "· 텍스트를 그대로 붙여넣거나\n"
                  "· txt·docx 파일(클로바노트에서 내려받은 파일도 돼요)\n"
                  "받으면 바로 정리해서 미리보기를 보여 드려요. (그만두려면 '취소')")
-# aad_id → {"team_key", "at"}
+# aad_id → {"team_key", "at", "type"}
 upload_sessions: dict[str, dict[str, Any]] = {}
 
 
 async def start_upload(turn: Any, team_key: str) -> None:
+    """자료 종류를 먼저 고르게 한다(드롭다운). 고르지 않고 바로 보내면 회의록으로 받는다."""
     edit_sessions.pop(turn.aad_id, None)
-    upload_sessions[turn.aad_id] = {"team_key": team_key, "at": time.monotonic()}
-    await turn.send(UPLOAD_PROMPT)
+    upload_sessions[turn.aad_id] = {"team_key": team_key, "at": time.monotonic(), "type": None}
+    card = {"heading": "자료 종류", "text": "올릴 자료가 어떤 종류인지 고른 뒤 [확인]을 눌러 주세요. (고르지 않고 바로 보내면 회의록으로 받아요)",
+            "input_id": "artifact_type", "placeholder": "자료 종류 선택", "error": "종류를 선택해 주세요.",
+            "choices": [{"title": name, "value": name} for name in parts.ARTIFACT_TYPES]}
+    await turn.send_buttons(UPLOAD_PROMPT, [{"title": "확인", "data": {"action": "upload_type"}}], card=card)
+
+
+async def set_upload_type(turn: Any, value: dict) -> None:
+    session = upload_sessions.get(turn.aad_id)
+    if session is None:
+        await turn.send("올리기 시간이 지났어요. 4번 ④에서 다시 시작해 주세요.")
+        return
+    chosen = str(value.get("artifact_type") or "")
+    if chosen not in parts.ARTIFACT_TYPES:
+        await turn.send("자료 종류를 다시 골라 주세요.")
+        return
+    session["type"] = chosen
+    session["at"] = time.monotonic()
+    await turn.send(f"📤 '{chosen}'으로 받을게요. 텍스트를 붙여넣거나 txt·docx 파일을 보내 주세요.")
 
 
 def has_upload_session(aad_id: str) -> bool:
@@ -459,9 +480,13 @@ async def handle_upload(turn: Any, text: str, attachments: list[dict]) -> None:
     upload_sessions.pop(turn.aad_id, None)
     origin = meeting_inputs.guess_origin(name, parts.md_to_text(md))
     title = meeting_inputs.title_of(name, md)
+    artifact_type = session.get("type") or "회의록"
     page_id = await asyncio.to_thread(meeting_inputs.save_note, _store(), team_key, md, title, origin,
-                                      turn.user_name or turn.aad_id)
+                                      turn.user_name or turn.aad_id, artifact_type)
     source = "클로바노트" if origin == "clova" else "Teams"
+    if artifact_type != "회의록":  # 문서로 받은 자료: 미리보기 없이 바로 해석 대상이 된다(백그라운드가 정리해서 반영)
+        await turn.send(f"📥 '{title}' 자료를 {artifact_type}(으)로 받았어요. 백그라운드에서 정리해 반영할게요.")
+        return
     await turn.send(f"📥 '{title}' 회의록을 받았어요({source}). 정리할게요.")
 
     async def nothing_to_sync() -> None:

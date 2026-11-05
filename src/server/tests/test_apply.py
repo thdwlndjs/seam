@@ -151,7 +151,7 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual({r["title"]: r["status"] for r in self.items()}["AI를 어디에 쓸지"], "active")  # 남은 부분의 항목은 그대로
         self.assertEqual(apply.gone_confirmed_parts(self.store, SCOPE), [])
 
-    def test_low_confidence_items_need_discussion(self) -> None:
+    def test_low_confidence_no_longer_asks_the_user(self) -> None:  # v2.1: 확신 0.7 미만 규칙은 없어졌다(충돌+판단 불가만 확인 필요)
         class Unsure(FakeExtractor):
             def __call__(self, payload: dict) -> dict:
                 answer = super().__call__(payload)
@@ -164,7 +164,7 @@ class ApplyTests(unittest.TestCase):
         self.collect(SAMPLE_MD, extractor=Unsure())
         apply.apply_page(self.store, SCOPE, "unit-1", "송지원", V)
         self.assertTrue(self.items())
-        self.assertEqual({r["status"] for r in self.items()}, {"needs_discussion"})
+        self.assertNotIn("needs_discussion", {r["status"] for r in self.items()})  # 그냥 반영된다
 
 
     def test_parts_extracted_before_states_existed_join_the_confirm_flow(self) -> None:
@@ -193,7 +193,8 @@ class SupersedeTests(unittest.TestCase):
         parts.judge_pending(self.store, SCOPE, lambda page: {"parts": [
             {"part_id": p["part_id"], "kind": "meeting", "confidence": 0.9, "split": []} for p in page["parts"]]})
         parts.extract_pending(self.store, SCOPE, lambda payload: {"items": [
-            {"kind": "decision", "title": decision, "quote": decision, "confidence": 0.9}], "usage": {}, "model": "fake"}, V)
+            {"kind": "decision", "title": decision, "quote": decision, "confidence": 0.9, "maturity": "agreed",
+             "agreement_quote": decision}], "usage": {}, "model": "fake"}, V)
 
     def test_a_superseding_decision_is_applied_and_can_be_reverted(self) -> None:  # A11
         self.meeting("m1", "주제는 스마트 책장", "2026-10-01T00:00:00Z")

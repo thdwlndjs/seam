@@ -127,13 +127,15 @@ def _stepper_card(event: dict) -> AdaptiveCard:
 
 
 def _choice_card(event: dict) -> AdaptiveCard:
-    """선택 카드: 질문 글, 드롭다운(고른 값은 "stage"로 value에 실려 온다), [확인]. 처음 단계 설정의 [아니요] 뒤에 쓴다."""
+    """선택 카드: 질문 글, 드롭다운(고른 값은 card["input_id"](기본 "stage")로 value에 실려 온다), [확인].
+    처음 단계 설정의 [아니요] 뒤와 자료 올리기의 종류 고르기에 쓴다."""
     card = event["card"]
     return AdaptiveCard(
         body=[TextBlock(text=card["heading"], weight="Bolder", size="Large", wrap=True),
               TextBlock(text=card["text"], wrap=True, spacing="Small"),
-              ChoiceSetInput(id="stage", style="compact", is_required=True, error_message="단계를 선택해 주세요.",
-                             placeholder="단계 선택", choices=[Choice(title=c["title"], value=c["value"]) for c in card["choices"]])],
+              ChoiceSetInput(id=card.get("input_id") or "stage", style="compact", is_required=True,
+                             error_message=card.get("error") or "단계를 선택해 주세요.",
+                             placeholder=card.get("placeholder") or "단계 선택", choices=[Choice(title=c["title"], value=c["value"]) for c in card["choices"]])],
         actions=[SubmitAction(title=b["title"][:40], data=b["data"], style="positive") for b in event["buttons"]])
 
 

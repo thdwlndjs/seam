@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db, runs
-from .db import ConflictError, NotFoundError, ValidationError, normalize_text, to_json
+from .db import ConflictError, ContractError, NotFoundError, ValidationError, normalize_text, to_json
 from .terms import query_terms
 
 RECORD_KINDS = {"teams_message", "notion_record"}
@@ -34,7 +34,9 @@ ITEM_KINDS = {"task", "decision"}
 EXTRACT_KINDS = {"task", "decision", "progress", "opinion", "question"}
 TASK_STATUSES = {"open", "in_progress", "done", "cancelled"}
 DECISION_STATUSES = {"active", "superseded"}
-CHANGE_TYPES = ("unchanged", "supplementary", "proposed", "conflicting", "superseding")
+CHANGE_TYPES = ("unchanged", "supplementary", "proposed", "conflicting", "superseding", "alternative", "resolving")
+# v2.1 Phase 2: alternative = 기존 결정과 다른 가안·조언(기존 결정은 그대로, 새 항목을 ALTERNATIVE_TO로 둔다),
+# resolving = 미정에 답하는 항목(미정은 resolved, RESOLVES). superseding은 결정끼리·요구사항끼리 같은 종류만.
 CANDIDATE_STATUSES = {"pending", "approved", "rejected", "recorded"}
 # A decision is a key decision when it touches one of these, or affects two or more tasks.
 KEY_DECISION_AREAS = {"goal", "scope", "architecture", "budget", "schedule"}
@@ -50,6 +52,15 @@ OPTIONAL_ATTRIBUTES = ("maturity", "artifact_type", "summary", "github_refs")  #
 GITHUB_REF_TYPES = ("issue", "pr")
 GITHUB_REF_BASIS = ("explicit", "inferred")  # 명시적(본문·커밋의 #번호) / 의미상 추정
 RELATED_LIMIT = 5
+# 어떤 종류끼리 비교할지(종류를 넘어 비교하되 의미 있는 짝만). 피드백이 결정을 밀어내지 않게 종류로 먼저 거른다.
+COMPARABLE = {
+    "decision": ("decision", "requirement", "open"), "requirement": ("requirement", "decision", "open"),
+    "open": ("open", "decision", "requirement", "insight"), "task": ("task", "decision"),
+    "hypothesis": ("hypothesis", "insight", "decision", "open"), "insight": ("insight", "hypothesis", "open", "decision"),
+    "feedback": ("feedback", "decision"),
+}
+SUPERSEDING_KINDS = ("decision", "requirement")
+HUMAN_EDIT_PREFIX = "구조 화면에서"  # board.py가 사람이 탭에서 고친 revisions에 쓰는 사유의 앞부분
 
 # Ends like a question or an open suggestion: "…할까요?", "…어때요", "…인가요".
 _QUESTION_RE = re.compile(r"(\?|？|할까요?|될까요?|을까요?|일까요?|어떨까요?|어때요?|인가요|나요|건가요?|는지)\s*[.!~…]*\s*$")
@@ -285,41 +296,100 @@ def _public(related: dict[str, Any]) -> dict[str, Any]:
     return {k: related[k] for k in ("id", "kind", "title", "statement_md", "status", "attributes")}
 
 
-def _judge(item: dict[str, Any], related: list[dict[str, Any]], judge: Judge) -> dict[str, Any] | None:
-    """Decide the change type. Rules first; the judge only for real comparisons; its answer is validated."""
+def candidates_for(c: sqlite3.Connection, scope: str, item: dict[str, Any], extra_ids: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    """비교할 기존 항목(prior_check): 종류가 호환되는 것을 단어 겹침 순으로 RELATED_LIMIT개 + 그 밖에 점수 높은 몇 개
+    + 호출부가 검색(search.query)으로 찾은 항목(extra_ids)."""
+    pool = find_related(c, scope, item, limit=40)
+    compatible = COMPARABLE.get(item["kind"], (item["kind"],))
+    chosen = [r for r in pool if r["kind"] in compatible][:RELATED_LIMIT]
+    chosen += [r for r in pool if r not in chosen][:2]
+    have = {r["id"] for r in chosen}
+    for item_id in extra_ids:
+        if item_id in have:
+            continue
+        row = c.execute(f"SELECT * FROM work_items WHERE id = ? AND status NOT IN ({','.join('?' * len(INACTIVE_STATUSES))})",
+                        (item_id, *INACTIVE_STATUSES)).fetchone()
+        if row is not None and row["scope"] == scope and row["kind"] in compatible:
+            chosen.append(dict(_item_dict(row), score=0.0))
+            have.add(item_id)
+    return chosen
+
+
+def is_human_edited(c: sqlite3.Connection, item_id: str) -> bool:
+    """사람이 탭에서 고친 항목인가(자동 처리의 revisions는 actor가 "자동(…"로 시작한다). 사람 수정은 재해석이 덮어쓰지 않는다."""
+    return c.execute("""SELECT 1 FROM revisions WHERE object_type = 'work_item' AND object_id = ? AND version > 1
+                        AND reason LIKE ? AND actor NOT LIKE '자동(%' LIMIT 1""", (item_id, HUMAN_EDIT_PREFIX + "%")).fetchone() is not None
+
+
+def is_important(c: sqlite3.Connection, target: dict[str, Any]) -> bool:
+    """충돌했을 때 사람에게 물을 만큼 중요한 대상인가: 결정·요구사항이고, 할 일이나 다른 결정·요구사항과 이어져 있다."""
+    if target["kind"] not in SUPERSEDING_KINDS:
+        return False
+    return c.execute("""SELECT 1 FROM work_links l JOIN work_items o
+                        ON o.id = CASE WHEN l.source_id = ? THEN l.target_id ELSE l.source_id END
+                        WHERE (l.source_id = ? OR l.target_id = ?) AND l.type IN ('AFFECTS', 'SUPERSEDES')
+                        AND o.kind IN ('task', 'decision', 'requirement') LIMIT 1""",
+                     (target["id"], target["id"], target["id"])).fetchone() is not None
+
+
+def _target_allowed(change_type: str, item_kind: str, target_kind: str) -> bool:
+    if change_type in ("unchanged", "supplementary", "conflicting"):
+        return target_kind == item_kind
+    if change_type == "superseding":
+        return item_kind in SUPERSEDING_KINDS and target_kind == item_kind
+    if change_type == "alternative":
+        return item_kind in ("decision", "requirement", "hypothesis") and target_kind in SUPERSEDING_KINDS
+    if change_type == "resolving":
+        return target_kind == "open" and item_kind != "open"
+    return False
+
+
+def _judge(item: dict[str, Any], related: list[dict[str, Any]], judge: Judge, strict: bool = False) -> dict[str, Any] | None:
+    """Decide the change type. Rules first; the judge only for real comparisons; its answer is validated.
+    strict=False(예전 분석 경로): 판정에 실패하면 사람이 비교하도록 conflicting으로 돌려준다.
+    strict=True(v2.1 해석 경로): 실패는 예외로 올린다. 호출부가 오류로 기록하고 다시 시도한다(의사결정 충돌이 아니다)."""
     same_kind = [r for r in related if r["kind"] == item["kind"]]
     tasks = {r["id"] for r in related if r["kind"] == "task"}
     for r in same_kind:
         if r["normalized_title"] == normalize_text(item["title"]) and normalize_text(r["statement_md"]) == normalize_text(item["statement"]):
             return {"change_type": "unchanged", "target": r, "affected": [], "judged_by": "rule",
-                    "rationale": "제목과 내용이 기존 기록과 같다."}
+                    "rationale": "제목과 내용이 기존 기록과 같다.", "decidable": True}
     if not related:
         if item["extracted_kind"] == "progress":
             return None
         return {"change_type": "proposed", "target": None, "affected": [], "judged_by": "rule",
-                "rationale": "관련된 기존 Task·Decision이 없다."}
+                "rationale": "관련된 기존 항목이 없다.", "decidable": True}
     try:
         answer = judge(item, [_public(r) for r in related])
         if not isinstance(answer, dict):
-            raise ValidationError("judge must return an object")
+            raise ContractError("judge must return an object")
         change_type = answer.get("change_type")
         if change_type not in CHANGE_TYPES:
-            raise ValidationError(f"unknown change_type {change_type!r}")
+            raise ContractError(f"unknown change_type {change_type!r}")
         target_id = answer.get("target_id")
-        target = next((r for r in same_kind if r["id"] == target_id), None)
+        target = next((r for r in related if r["id"] == target_id), None)
         if change_type == "proposed":
             target = None
         elif target is None:
-            raise ValidationError(f"{change_type} needs a target_id among the compared {item['kind']} items")
-        if change_type == "superseding" and item["kind"] != "decision":
-            raise ValidationError("only a decision can supersede")
+            raise ContractError(f"{change_type} needs a target_id among the compared items")
+        elif not _target_allowed(change_type, item["kind"], target["kind"]):
+            raise ContractError(f"{change_type} cannot link a {item['kind']} to a {target['kind']}")
         affected = [t for t in answer.get("affected_task_ids") or [] if t in tasks]
+        decidable = answer.get("decidable")
+        decidable = bool(decidable) if isinstance(decidable, bool) else change_type != "conflicting"
+        maturity = item.get("maturity")
+        rationale = str(answer.get("rationale") or "").strip() or "(판정 근거 없음)"
+        if change_type == "superseding" and maturity not in (None, "agreed"):
+            # 합의 근거가 없는 새 내용은 기존 결정을 바꾸지 못한다: 대안으로 남긴다
+            change_type, rationale = "alternative", rationale + f" (새 항목의 성숙도가 {maturity}라 대체하지 않고 대안으로 둔다.)"
         result = {"change_type": change_type, "target": target, "affected": sorted(set(affected)), "judged_by": "judge",
-                  "rationale": str(answer.get("rationale") or "").strip() or "(판정 근거 없음)"}
+                  "rationale": rationale, "decidable": decidable}
     except Exception as error:  # a bad or failed judgment must still reach a human, never pass silently
+        if strict:
+            raise
         top = same_kind[0] if same_kind else None
         result = {"change_type": "conflicting" if top else "proposed", "target": top, "affected": [], "judged_by": "fallback",
-                  "rationale": f"자동 판정을 쓸 수 없어 사람이 비교해야 한다: {error}"}
+                  "rationale": f"자동 판정을 쓸 수 없어 사람이 비교해야 한다: {error}", "decidable": False}
     if item["extracted_kind"] == "progress" and result["change_type"] in {"proposed", "superseding"}:
         return None  # a progress report never creates or replaces anything on its own
     if result["change_type"] == "proposed":
@@ -628,11 +698,22 @@ def approve(store: Path, candidate_id: str, actor: str, note: str = "") -> dict[
                     _link(c, item_id, task_id, LINK_AFFECTS, candidate_id, ts)
             if kind == "decision":
                 impacted = _tasks_of(c, item_id)
+        elif change_type == "alternative":  # 기존 결정은 그대로 두고, 다른 가안·조언을 대안으로 남긴다
+            item_id = _create_item(c, scope, kind, proposal, reason, actor, ts)
+            _link(c, item_id, target["id"], LINK_ALTERNATIVE_TO, candidate_id, ts)
+            for task_id in affected:
+                _link(c, item_id, task_id, LINK_AFFECTS, candidate_id, ts)
+        elif change_type == "resolving":  # 미정에 답하는 항목: 미정은 resolved, 새 항목이 RESOLVES로 잇는다
+            item_id = _create_item(c, scope, kind, proposal, reason, actor, ts)
+            _write_item(c, target["id"], {"status": "resolved"}, reason, actor, ts)
+            _link(c, item_id, target["id"], LINK_RESOLVES, candidate_id, ts)
+            for task_id in affected:
+                _link(c, item_id, task_id, LINK_AFFECTS, candidate_id, ts)
         else:  # superseding, or an approved conflict on a decision: decisions are replaced, never rewritten (ADR)
             old_id = target["id"]
             impacted_ids = {t["id"] for t in _tasks_of(c, old_id)} | set(affected)
             _write_item(c, old_id, {"status": "superseded"}, reason, actor, ts)
-            item_id = _create_item(c, scope, "decision", proposal, reason, actor, ts)
+            item_id = _create_item(c, scope, kind if kind in SUPERSEDING_KINDS else "decision", proposal, reason, actor, ts)
             _link(c, item_id, old_id, LINK_SUPERSEDES, candidate_id, ts)
             for task_id in sorted(impacted_ids):
                 _link(c, item_id, task_id, LINK_AFFECTS, candidate_id, ts)

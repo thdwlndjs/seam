@@ -24,6 +24,10 @@ class ConflictError(WorklogError):
     pass
 
 
+class ContractError(WorklogError):
+    """LLM이 JSON 계약을 어긴 답을 냈다(필드 누락·열거형 밖의 값·JSON이 아님). 의사결정 충돌이 아니라 기술 오류다."""
+
+
 class NotFoundError(WorklogError):
     pass
 

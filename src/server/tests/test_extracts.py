@@ -30,10 +30,12 @@ V1, V2 = "test-v1", "test-v2"
 
 
 class FakeExtractor:
-    """부분 글에 있는 구절로 항목을 만든다. 원문에 없는 인용 하나를 일부러 섞는다."""
+    """부분 글에 있는 구절로 항목을 만든다. junk=True면 원문에 없는 인용 하나를 일부러 섞는다(버려지고, runs에 오류로 남아
+    다음 주기에 다시 시도된다)."""
 
-    def __init__(self) -> None:
+    def __init__(self, junk: bool = False) -> None:
         self.calls: list[dict] = []
+        self.junk = junk
 
     def __call__(self, payload: dict) -> dict:
         self.calls.append(payload)
@@ -46,7 +48,8 @@ class FakeExtractor:
         if "책 등록은 어떻게?" in text:
             items.append({"kind": "task", "title": "책 등록 방법 정리", "owner": "김팀원", "due": "2026-11-10",
                           "role_hint": "dev", "quote": "책 등록은 어떻게?"})
-        items.append({"kind": "decision", "title": "없는 말", "quote": "회의록에 없는 문장"})  # 버려져야 한다
+        if self.junk:
+            items.append({"kind": "decision", "title": "없는 말", "quote": "회의록에 없는 문장"})  # 버려져야 한다
         return {"items": items, "usage": {"prompt_tokens": 100, "completion_tokens": 20}, "model": "fake"}
 
 
@@ -63,7 +66,7 @@ class ExtractTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_only_meeting_parts_are_extracted_and_bad_quotes_are_dropped(self) -> None:  # A12, A22
-        extractor = FakeExtractor()
+        extractor = FakeExtractor(junk=True)
         done = parts.extract_pending(self.store, SCOPE, extractor, V1, budget_tokens=None)
         self.assertEqual(done, 6)  # 회의 메모 6개. 떼어 낸 '구체화' 문서는 보내지 않는다
         self.assertFalse(any("꽂힌 책을 찾지 않고" in c["text"] for c in extractor.calls))
@@ -127,9 +130,10 @@ class DraftTests(unittest.TestCase):
         built = parts.build_unit_parts("unit-1", "멘토링 > 1차 멘토링", SAMPLE_MD, SAMPLE_BLOCKS)
         parts.save_unit_parts(store, SCOPE, "notion", "unit-1", "sec-1", built)
         with patch.object(worklog_bridge, "groq_classify_parts", split_classifier()), \
-                patch.object(worklog_bridge, "groq_extract_part", FakeExtractor()):
+                patch.object(worklog_bridge, "groq_extract_part", FakeExtractor(junk=True)):
             stats = extract_draft.organize(store, SCOPE, sleep=lambda s: None)
-        self.assertEqual(stats["pending"], 0)
+        # 원문에 없는 인용이 섞인 부분은 오류로 기록돼 다시 시도 대상이다(저장은 이미 됐다)
+        self.assertEqual(stats["pending"], 6)
         text = extract_draft.draft(store, SCOPE, "차 멘토링")
         self.assertIn("## 멘토링 > 1차 멘토링 > 화분 관리기", text)
         self.assertIn("- 미정: AI를 어디에 쓸지", text)

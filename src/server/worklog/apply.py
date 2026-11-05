@@ -20,12 +20,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import core, db, parts
-from .db import ConflictError, NotFoundError, ValidationError
+from . import core, db, parts, runs, search
+from .db import ConflictError, ContractError, NotFoundError, ValidationError
 
-CONFIDENCE = 0.7  # [가정] 이 아래면 반영하지 않고 "추가 논의 필요"
 SETTLE = timedelta(hours=2)  # 자동 감지된 새 회의록은 마지막 수정 후 이만큼 지나야 확인 대기로 올린다(작성 중 초안 방지)
-LLM_JUDGED_KINDS = {"task", "decision"}  # 관련 항목과 비교할 때 LLM 판정을 쓰는 종류. 나머지는 규칙만
+RULE_ONLY_KINDS = {"feedback"}  # 관련 항목과 비교할 때 규칙(같은 제목)만 쓰는 종류. 나머지는 모두 LLM 판정(비교할 후보가 있을 때만)
 APPLIED = ("approved", "auto_applied")
 AUTO_NEW_ACTOR = "자동(새 회의록 반영)"
 _DATE_RE = re.compile(r"(?m)^[^:\n]*(?:날짜|일자|date)[^:\n]*:\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
@@ -55,7 +54,15 @@ def extracted_items(store: Path, part: dict, prompt_version: str) -> list[dict[s
     with closing(db.connect(store)) as c:
         row = c.execute("SELECT items_json FROM part_extracts WHERE content_hash = ? AND prompt_version = ?",
                         (parts.extract_hash(part), prompt_version)).fetchone()
-    return json.loads(row["items_json"]) if row else None
+    return parts.decode_extract(row["items_json"])[0] if row else None
+
+
+def extracted_artifact(store: Path, part: dict, prompt_version: str) -> dict[str, Any] | None:
+    """부분의 산출물 정보(유형·요약). 예전 형식의 추출에는 없다."""
+    with closing(db.connect(store)) as c:
+        row = c.execute("SELECT items_json FROM part_extracts WHERE content_hash = ? AND prompt_version = ?",
+                        (parts.extract_hash(part), prompt_version)).fetchone()
+    return parts.decode_extract(row["items_json"])[1] if row else None
 
 
 def _as_core_item(raw: dict, source_id: str) -> dict[str, Any]:
@@ -64,40 +71,84 @@ def _as_core_item(raw: dict, source_id: str) -> dict[str, Any]:
     return {"extracted_kind": kind, "kind": kind, "title": title, "statement": raw.get("detail") or title,
             "status": "open" if kind == "task" else "active", "areas": [], "assignee": raw.get("owner"),
             "due": raw.get("due"), "issue_refs": sorted({int(n) for n in core._ISSUE_RE.findall(title)}),
-            "source_ids": [source_id], "quote": raw.get("quote") or ""}
+            "source_ids": [source_id], "quote": raw.get("quote") or "", "maturity": raw.get("maturity")}
 
 
 def _judgment(store: Path, scope: str, item: dict, judge: core.Judge | None) -> dict[str, Any]:
-    """관련 항목과 비교한 판정. 할 일·결정만 LLM 판정을 쓰고, 미정·피드백·인사이트는 같은 제목만 본다."""
+    """관련 항목과 비교한 판정. 후보는 단어 겹침(find_related)과 검색(search.query)으로 모으고 종류가 호환되는 것만 본다.
+    후보가 없으면 LLM 없이 새 항목이다. 피드백은 규칙(같은 제목)만 쓴다. LLM 판정이 실패하면 예외를 올린다(호출부가
+    기술 오류로 기록하고 다시 시도한다. 사람에게 확인을 요청하지 않는다)."""
+    extra: tuple[str, ...] = ()
+    if judge is not None and item["kind"] not in RULE_ONLY_KINDS:
+        try:
+            found = search.query(store, scope, item["title"], kinds=core.COMPARABLE.get(item["kind"]), limit=6, max_tokens=1500)
+            extra = tuple(r["id"] for r in found["records"])
+        except Exception:  # 검색은 후보를 더할 뿐이다. 실패해도 단어 겹침 후보로 판정한다
+            extra = ()
     with closing(db.connect(store)) as c:
-        related = core.find_related(c, scope, item)
-    if item["kind"] not in LLM_JUDGED_KINDS or judge is None:
+        related = core.candidates_for(c, scope, item, extra)
+    if item["kind"] in RULE_ONLY_KINDS or judge is None:
         same = [r for r in related if r["kind"] == item["kind"] and r["normalized_title"] == db.normalize_text(item["title"])]
         if not same:
-            return {"change_type": "proposed", "target": None, "affected": [], "judged_by": "rule",
+            return {"change_type": "proposed", "target": None, "affected": [], "judged_by": "rule", "decidable": True,
                     "rationale": "같은 제목의 기존 항목이 없다."}
         twin = same[0]
         unchanged = db.normalize_text(twin["statement_md"]) == db.normalize_text(item["statement"])
         return {"change_type": "unchanged" if unchanged else "supplementary", "target": twin, "affected": [],
-                "judged_by": "rule", "rationale": "같은 제목의 기존 항목이 있다."}
-    return core._judge(item, related, judge) or {"change_type": "unchanged", "target": None, "affected": [],
-                                                 "judged_by": "rule", "rationale": "반영할 것이 없다."}
+                "judged_by": "rule", "decidable": True, "rationale": "같은 제목의 기존 항목이 있다."}
+    return core._judge(item, related, judge, strict=True) or {"change_type": "unchanged", "target": None, "affected": [],
+                                                              "judged_by": "rule", "decidable": True,
+                                                              "rationale": "반영할 것이 없다."}
+
+
+def policy(relation: str, decidable: bool = True, important: bool = False, protected: bool = False) -> str:
+    """관계 판단 결과 → 처리(docs/implementation/v2.1/plan.md Phase 2 표). 출처 종류(회의록·문서)는 보지 않는다.
+    skip: 기록 없음 / auto: 자동 반영 / notify: 자동 반영 + 알림·되돌리기 / related: 두 항목 모두 유지하고 서로 잇는다 /
+    needs_discussion: 판단할 수 없는 중요한 충돌만. 사람 수정 보호가 먼저다: 사람이 고친 대상을 바꾸는 처리는
+    덮어쓰지 않고 확인 필요로 보낸다(새 항목·대안은 대상을 바꾸지 않으므로 그대로)."""
+    if relation == "unchanged":
+        return "skip"
+    if protected and relation in ("supplementary", "superseding", "resolving", "conflicting"):
+        return "needs_discussion"
+    if relation in ("proposed", "supplementary", "alternative", "resolving"):
+        return "auto"
+    if relation == "superseding":
+        return "notify"
+    if relation == "conflicting":
+        return "needs_discussion" if (important and not decidable) else "related"
+    return "auto"
+
+
+def _error_kind(error: BaseException) -> str:
+    if type(error).__name__ == "Busy" or "429" in str(error):
+        return "busy"
+    if isinstance(error, (ContractError, ValidationError)):
+        return "contract"
+    return "llm_failed"
 
 
 def _apply_one(store: Path, scope: str, part: dict, raw: dict, source: tuple[str, str], actor: str,
                judge: core.Judge | None) -> dict[str, Any]:
     item = _as_core_item(raw, source[0])
-    judgment = _judgment(store, scope, item, judge)
+    try:
+        judgment = _judgment(store, scope, item, judge)
+    except Exception as error:  # 판정 실패·한도 초과·계약 위반: 항목을 만들지 않고 오류로 돌려준다(apply_part가 runs에 남긴다)
+        return {"title": raw["title"], "kind": raw["kind"], "result": "error", "error_kind": _error_kind(error), "error": str(error)}
     if judgment["change_type"] == "unchanged":
         return {"title": raw["title"], "kind": raw["kind"], "result": "unchanged"}
-    unsure = (float(raw.get("confidence") if raw.get("confidence") is not None else 1) < CONFIDENCE
-              or judgment["judged_by"] == "fallback" or judgment["change_type"] == "conflicting")
-    if unsure:  # 기존 항목은 건드리지 않고 새 항목을 "추가 논의 필요"로 둔다
+    target = judgment.get("target")
+    with closing(db.connect(store)) as c:
+        protected = bool(target) and core.is_human_edited(c, target["id"])
+        important = bool(target) and core.is_important(c, target)
+    action = policy(judgment["change_type"], judgment.get("decidable", True), important, protected)
+    discuss, related = action == "needs_discussion", action == "related"
+    if discuss or related:  # 기존 항목은 건드리지 않고 새 항목으로 둔다(확인 필요이거나 서로 잇기만)
+        reason = "사람이 고친 항목이라 덮어쓰지 않는다. " if protected else ""
         judgment = dict(judgment, change_type="proposed", target=None, affected=[],
-                        rationale=judgment["rationale"] + " (확신이 낮거나 판정이 갈려 추가 논의 필요로 둔다.)")
+                        rationale=reason + judgment["rationale"] + (" (판단할 수 없는 중요한 충돌이라 확인이 필요하다.)" if discuss else ""))
     ts = db.now()
     with db.write(store) as c:
-        compared = [judgment["target"]["id"]] if judgment.get("target") else []
+        compared = [target["id"]] if (judgment.get("target") or target) else []
         candidate_id, _ = core._insert_candidate(c, scope, None, item, judgment, compared, {source[0]: source[1]}, ts)
     try:
         applied = core.approve(store, candidate_id, actor, note=f"부분 {part['id']} 확인 반영")
@@ -116,18 +167,23 @@ def _apply_one(store: Path, scope: str, part: dict, raw: dict, source: tuple[str
             if raw.get(key):
                 attributes[key] = raw[key]
         c.execute("UPDATE work_items SET attributes_json = ? WHERE id = ?", (db.to_json(attributes), item_id))
-        if unsure:
-            core._write_item(c, item_id, {"status": "needs_discussion"}, "확신이 낮거나 판정이 갈림", actor, db.now())
-    result = {"title": raw["title"], "kind": raw["kind"], "candidate_id": candidate_id, "item_id": item_id,
-              "result": "needs_discussion" if unsure else judgment["change_type"]}
-    if judgment["change_type"] == "superseding" and not unsure:
+        if related and target:
+            core._link(c, item_id, target["id"], core.LINK_RELATED_TO, candidate_id, db.now())
+        if discuss:
+            core._write_item(c, item_id, {"status": "needs_discussion"}, "판단할 수 없는 중요한 충돌", actor, db.now())
+        core._index(c, [item_id])
+    result_name = "needs_discussion" if discuss else ("related" if related else judgment["change_type"])
+    result = {"title": raw["title"], "kind": raw["kind"], "candidate_id": candidate_id, "item_id": item_id, "result": result_name}
+    if judgment["change_type"] == "superseding" and not discuss and judgment.get("target"):
         result["superseded"] = judgment["target"]["title"]
     return result
 
 
 def apply_part(store: Path, scope: str, part_id: str, actor: str, prompt_version: str,
                items: list[dict] | None = None, judge: core.Judge | None = None) -> dict[str, Any]:
-    """확인된 부분 하나를 반영한다. items가 있으면(고친 목록) 그것을, 없으면 저장된 추출 결과를 쓴다."""
+    """해석한 부분 하나를 반영한다. items가 있으면(고친 목록) 그것을, 없으면 저장된 추출 결과를 쓴다.
+    항목 중 판정에 실패한 것이 있으면 그 항목은 만들지 않고 runs에 오류로 남기며, 부분은 반영됨으로 올리지 않는다
+    (다음 주기에 다시 처리한다. 이미 반영된 항목은 '그대로'가 되어 겹치지 않는다)."""
     db.initialize(store)
     with closing(db.connect(store)) as c:
         part = _part(c, part_id)
@@ -139,6 +195,14 @@ def apply_part(store: Path, scope: str, part_id: str, actor: str, prompt_version
         if items is None:
             raise ValidationError(f"부분 {part_id}은 아직 추출 전이다")
     results = [_apply_one(store, scope, part, raw, source, actor, judge) for raw in items]
+    errors = [r for r in results if r["result"] == "error"]
+    key = runs.key_for("reconcile", scope, part_id)
+    if errors:
+        counted = any(r["error_kind"] != "busy" for r in errors)
+        runs.report(store, key, "reconcile", errors[0]["error_kind"], errors[0]["error"], count=counted,
+                    result={"failed": [{"title": r["title"], "error_kind": r["error_kind"]} for r in errors]})
+        return _summary(results)
+    runs.succeed(store, key)
     with db.write(store) as c:
         c.execute("""UPDATE source_parts SET state = 'applied', applied_hash = ?, confirmed_by = ?, confirmed_at = ?,
                          updated_at = ? WHERE id = ?""",
@@ -147,16 +211,19 @@ def apply_part(store: Path, scope: str, part_id: str, actor: str, prompt_version
 
 
 def _summary(results: list[dict]) -> dict[str, Any]:
+    done = {"proposed", "supplementary", "superseding", "alternative", "resolving", "related"}
     return {"results": results,
-            "applied": sum(1 for r in results if r["result"] in {"proposed", "supplementary", "superseding"}),
+            "applied": sum(1 for r in results if r["result"] in done),
             "needs_discussion": sum(1 for r in results if r["result"] == "needs_discussion"),
+            "errors": sum(1 for r in results if r["result"] == "error"),
             "superseded": [{"old": r["superseded"], "new": r["title"], "candidate_id": r["candidate_id"]}
                            for r in results if r.get("superseded")]}
 
 
 def apply_page(store: Path, scope: str, page_id: str, actor: str, prompt_version: str,
                corrected: dict[str, list[dict]] | None = None, judge: core.Judge | None = None) -> dict[str, Any]:
-    """한 페이지(회의록 행)의 확인 대기·추출된 회의 메모 부분을 모두 반영한다. corrected: 부분 ID → 고친 목록."""
+    """한 페이지(회의록 행·산출물 문서)의 확인 대기·추출된 해석 대상 부분을 모두 반영한다. corrected: 부분 ID → 고친 목록.
+    3번 실패해서 멈춘 부분은 `reprocess`로 다시 열기 전까지 건너뛴다."""
     results: list[dict] = []
     for part in meeting_parts(store, scope, page_id):
         if part["state"] == "applied" and part["applied_hash"] == parts.extract_hash(part):
@@ -164,32 +231,34 @@ def apply_page(store: Path, scope: str, page_id: str, actor: str, prompt_version
         items = (corrected or {}).get(part["id"])
         if items is None and extracted_items(store, part, prompt_version) is None:
             continue
+        if runs.exhausted(store, runs.key_for("reconcile", scope, part["id"])):
+            continue
         results += apply_part(store, scope, part["id"], actor, prompt_version, items, judge)["results"]
     return _summary(results)
 
 
 def meeting_parts(store: Path, scope: str, page_id: str) -> list[dict[str, Any]]:
-    return [p for p in parts.list_parts(store, scope, page_id=page_id) if p["kind"] == "meeting"]
+    """페이지의 해석하는 부분: 회의 메모 + 탐색이 고른 문서 부분(예전 이름 그대로 둔다)."""
+    return parts.interpretable(store, scope, page_id)
 
 
 AUTO_ACTOR = "자동(확인된 회의록 수정)"
 
 
 def apply_edits(store: Path, scope: str, prompt_version: str, judge: core.Judge | None = None) -> list[dict[str, Any]]:
-    """이미 확인된 회의록이 수정됐을 때: 새로 추출한 결과에서 새로 생긴 항목만 자동으로 반영한다(알림용 결과)."""
+    """이미 확인된 해석 대상이 수정됐을 때: 새로 추출한 결과에서 새로 생긴 항목만 자동으로 반영한다(알림용 결과)."""
     changed: list[dict[str, Any]] = []
-    with closing(db.connect(store)) as c:
-        rows = [dict(r) for r in c.execute(
-            """SELECT * FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting'
-               AND confirmed_by IS NOT NULL AND state != 'applied'""", (scope,))]
+    rows = [p for p in parts.interpretable(store, scope) if p["confirmed_by"] is not None and p["state"] != "applied"]
     for part in rows:
         new_items = extracted_items(store, part, prompt_version)
         if new_items is None:
             continue  # 아직 다시 추출 전
+        if runs.exhausted(store, runs.key_for("reconcile", scope, part["id"])):
+            continue
         with closing(db.connect(store)) as c:
             old = c.execute("SELECT items_json FROM part_extracts WHERE content_hash = ? AND prompt_version = ?",
                             (part["applied_hash"] or "", prompt_version)).fetchone()
-        seen = {(i["kind"], db.normalize_text(i["title"])) for i in json.loads(old["items_json"])} if old else set()
+        seen = {(i["kind"], db.normalize_text(i["title"])) for i in parts.decode_extract(old["items_json"])[0]} if old else set()
         fresh = [i for i in new_items if (i["kind"], db.normalize_text(i["title"])) not in seen]
         summary = apply_part(store, scope, part["id"], AUTO_ACTOR, prompt_version, fresh, judge)
         if summary["results"]:
@@ -206,13 +275,11 @@ def mark_extracted(store: Path, part_ids: list[str]) -> None:
 
 
 def promote_due(store: Path, scope: str, now: datetime | None = None) -> int:
-    """자동 감지된 새 회의록: 마지막 수정 후 2시간이 지난 추출 완료 부분을 확인 대기로 올린다."""
+    """자동 감지된 새 해석 대상: 마지막 수정 후 2시간이 지난 추출 완료 부분을 확인 대기로 올린다."""
     limit = ((now or datetime.now().astimezone()) - SETTLE).astimezone().isoformat()
+    rows = [p for p in parts.interpretable(store, scope) if p["state"] == "extracted" and p["confirmed_by"] is None]
+    due = [r["id"] for r in rows if r["last_edited"] and _parse(r["last_edited"]) <= _parse(limit)]
     with db.write(store) as c:
-        rows = [dict(r) for r in c.execute(
-            """SELECT id, last_edited FROM source_parts WHERE scope = ? AND status = 'active' AND kind = 'meeting'
-               AND state = 'extracted' AND confirmed_by IS NULL""", (scope,))]
-        due = [r["id"] for r in rows if r["last_edited"] and _parse(r["last_edited"]) <= _parse(limit)]
         for part_id in due:
             c.execute("UPDATE source_parts SET state = 'pending_confirm' WHERE id = ?", (part_id,))
     return len(due)
@@ -224,40 +291,46 @@ def _parse(value: str) -> datetime:
 
 def request_confirm(store: Path, scope: str, page_id: str) -> None:
     """사람이 [반영]을 눌러 직접 요청한 페이지: 2시간을 기다리지 않고 확인 대기로 올린다."""
+    ids = [p["id"] for p in parts.interpretable(store, scope, page_id) if p["state"] in ("collected", "extracted")]
     with db.write(store) as c:
-        c.execute("""UPDATE source_parts SET state = 'pending_confirm' WHERE scope = ? AND page_id = ? AND kind = 'meeting'
-                     AND status = 'active' AND state IN ('collected', 'extracted')""", (scope, page_id))
+        for part_id in ids:
+            c.execute("UPDATE source_parts SET state = 'pending_confirm' WHERE id = ?", (part_id,))
 
 
 def skip_page(store: Path, scope: str, page_id: str, actor: str) -> int:
+    ids = [p["id"] for p in parts.interpretable(store, scope, page_id) if p["state"] in ("collected", "extracted", "pending_confirm")]
     with db.write(store) as c:
-        return c.execute("""UPDATE source_parts SET state = 'skipped', confirmed_by = NULL, updated_at = ?
-                            WHERE scope = ? AND page_id = ? AND kind = 'meeting' AND status = 'active'
-                            AND state IN ('collected', 'extracted', 'pending_confirm')""",
-                         (db.now(), scope, page_id)).rowcount
+        for part_id in ids:
+            c.execute("UPDATE source_parts SET state = 'skipped', confirmed_by = NULL, updated_at = ? WHERE id = ?", (db.now(), part_id))
+    return len(ids)
 
 
 def pending_pages(store: Path, scope: str) -> list[dict[str, Any]]:
-    """확인 대기 중인 회의록 페이지: page_id, 제목, 부분 수, 마지막 수정."""
-    with closing(db.connect(store)) as c:
-        rows = c.execute(
-            """SELECT page_id, MIN(path) AS path, COUNT(*) AS n, MAX(last_edited) AS last_edited FROM source_parts
-               WHERE scope = ? AND status = 'active' AND kind = 'meeting' AND state = 'pending_confirm'
-               GROUP BY page_id ORDER BY last_edited DESC""", (scope,)).fetchall()
-    return [{"page_id": r["page_id"], "title": r["path"].rsplit(" > ", 2)[-2] if " > " in r["path"] else r["path"],
-             "parts": r["n"], "last_edited": r["last_edited"]} for r in rows]
+    """확인 대기 중인 페이지: page_id, 제목, 부분 수, 마지막 수정."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for part in parts.interpretable(store, scope):
+        if part["state"] == "pending_confirm":
+            grouped.setdefault(part["page_id"], []).append(part)
+    out = []
+    for page_id, rows in grouped.items():
+        path = min(r["path"] for r in rows)
+        out.append({"page_id": page_id, "title": path.rsplit(" > ", 2)[-2] if " > " in path else path, "parts": len(rows),
+                    "last_edited": max((r["last_edited"] or "" for r in rows), default="") or None})
+    return sorted(out, key=lambda p: p["last_edited"] or "", reverse=True)
 
 
 def recent_pages(store: Path, scope: str, limit: int = 10) -> list[dict[str, Any]]:
-    """4번 ② 고를 수 있는 회의록 페이지: 회의 메모가 있는 페이지, 최근 수정순. 상태(반영됨 여부) 포함."""
-    with closing(db.connect(store)) as c:
-        rows = c.execute(
-            """SELECT page_id, MIN(path) AS path, MAX(last_edited) AS last_edited,
-                      SUM(state = 'applied') AS applied, COUNT(*) AS n FROM source_parts
-               WHERE scope = ? AND status = 'active' AND kind = 'meeting' GROUP BY page_id
-               ORDER BY last_edited DESC LIMIT ?""", (scope, limit)).fetchall()
-    return [{"page_id": r["page_id"], "title": r["path"].rsplit(" > ", 2)[-2] if " > " in r["path"] else r["path"],
-             "last_edited": r["last_edited"], "applied": r["applied"] == r["n"]} for r in rows]
+    """4번 ② 고를 수 있는 페이지: 해석하는 부분이 있는 페이지, 최근 수정순. 상태(반영됨 여부) 포함."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for part in parts.interpretable(store, scope):
+        grouped.setdefault(part["page_id"], []).append(part)
+    out = []
+    for page_id, rows in grouped.items():
+        path = min(r["path"] for r in rows)
+        out.append({"page_id": page_id, "title": path.rsplit(" > ", 2)[-2] if " > " in path else path,
+                    "last_edited": max((r["last_edited"] or "" for r in rows), default="") or None,
+                    "applied": all(r["state"] == "applied" for r in rows)})
+    return sorted(out, key=lambda p: p["last_edited"] or "", reverse=True)[:limit]
 
 
 def preview(store: Path, scope: str, page_id: str, prompt_version: str) -> dict[str, Any]:
@@ -295,9 +368,9 @@ def revert(store: Path, candidate_id: str, actor: str) -> dict[str, Any]:
         if cand["status"] not in APPLIED:
             raise ConflictError(f"반영 {candidate_id}은 되돌릴 수 없는 상태({cand['status']})")
         change_type, item_id, target_id = cand["change_type"], cand["applied_item_id"], cand["target_id"]
-        if change_type == "proposed":
+        if change_type in ("proposed", "alternative"):
             core._write_item(c, item_id, {"status": "reverted"}, reason, actor, db.now())
-        elif change_type == "superseding" or (change_type == "conflicting" and cand["item_kind"] == "decision"):
+        elif change_type in ("superseding", "resolving") or (change_type == "conflicting" and cand["item_kind"] == "decision"):
             core._write_item(c, item_id, {"status": "reverted"}, reason, actor, db.now())
             _restore(c, target_id, reason, actor)
         else:
@@ -333,11 +406,13 @@ def auto_applied_count(store: Path, scope: str, hours: int = 24, now: datetime |
 
 
 def gone_confirmed_parts(store: Path, scope: str) -> list[dict[str, Any]]:
-    """확인·반영된 뒤 Notion에서 사라진 회의록 부분: 거기서 나온 항목을 지울지 권한자에게 묻는다."""
+    """확인·반영된 뒤 Notion에서 사라진 해석 대상 부분(다른 곳으로 옮겨진 것은 빼고): 거기서 나온 항목을 지울지 권한자에게 묻는다."""
+    chosen = parts.selected_ids(store, scope)
     with closing(db.connect(store)) as c:
-        return [dict(r) for r in c.execute(
-            """SELECT id, path FROM source_parts WHERE scope = ? AND status = 'gone' AND kind = 'meeting'
+        rows = [dict(r) for r in c.execute(
+            """SELECT id, path, kind FROM source_parts WHERE scope = ? AND status = 'gone'
                AND confirmed_by IS NOT NULL AND state = 'applied'""", (scope,))]
+    return [{"id": r["id"], "path": r["path"]} for r in rows if r["kind"] == "meeting" or r["id"] in chosen]
 
 
 def resolve_gone_part(store: Path, scope: str, part_id: str, remove_items: bool, actor: str) -> int:
@@ -454,11 +529,12 @@ def auto_apply_due(store: Path, scope: str, prompt_version: str, judge: core.Jud
     반영한다. 나중 회의록이 앞선 결정을 바꾸면 결정 대체로 남고(되돌리기·구조 화면에서 고치기), 판단이 갈리면
     "추가 논의 필요"로 둔다. 같은 날짜끼리는 마지막 수정 순."""
     limit = ((now or datetime.now().astimezone()) - SETTLE).astimezone()
+    latest: dict[str, str] = {}
+    for part in parts.interpretable(store, scope):
+        if part["state"] in ("extracted", "pending_confirm") and part["confirmed_by"] is None:
+            latest[part["page_id"]] = max(latest.get(part["page_id"], ""), part["last_edited"] or "")
+    rows = [{"page_id": page_id, "last_edited": edited or None} for page_id, edited in latest.items()]
     with closing(db.connect(store)) as c:
-        rows = [dict(r) for r in c.execute(
-            """SELECT page_id, MAX(last_edited) AS last_edited FROM source_parts WHERE scope = ? AND status = 'active'
-               AND kind = 'meeting' AND state IN ('extracted', 'pending_confirm') AND confirmed_by IS NULL
-               GROUP BY page_id""", (scope,))]
         contents = {r["locator"]: r["content"] for r in c.execute(
             "SELECT locator, content FROM sources ORDER BY captured_at, rowid")}
     due = [r for r in rows if r["page_id"] and r["last_edited"] and _parse(r["last_edited"]) <= limit]

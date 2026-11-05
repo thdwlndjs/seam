@@ -372,3 +372,49 @@ def snapshot(store: Path, scope: str, max_chars: int = 12000, per_section: int =
     if not parts:
         return None
     return {"text": "\n\n".join(parts), "as_of": as_of}
+
+
+# ── 해석 대상 탐색용 목록(v2.1 Phase 2) ─────────────────────────
+CATALOG_SUMMARY_CHARS = 120
+RECENT_MEETING_ITEMS = 15
+
+
+def catalog(store: Path, scope: str, include_all: bool = False) -> list[dict[str, Any]]:
+    """탐색(explore)에 보여 줄 소스(페이지) 목록. 본문은 넣지 않는다: 제목·수정일·부분(영역) 제목·길이·한 줄 설명만.
+    영역은 문서(document) 부분만이다(회의 메모는 항상 해석하고, 링크는 해석하지 않는다).
+    include_all=False면 문서 영역이 있는 페이지만, True면 페이지에 있는 모든 영역(사람이 올린 자료를 고를 때)."""
+    from . import parts as parts_mod  # parts가 sections를 쓰지 않으므로 순환은 없지만, 가져오기 비용은 호출 때만 낸다
+
+    db.initialize(store)
+    out: list[dict[str, Any]] = []
+    with closing(db.connect(store)) as c:
+        titles = {r["page_id"]: dict(r) for r in c.execute(
+            "SELECT page_id, path, last_edited FROM source_pages WHERE scope = ? AND status = 'active'", (scope,))}
+    rows = parts_mod.list_parts(store, scope)
+    by_page: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row["page_id"]:
+            by_page.setdefault(row["page_id"], []).append(row)
+    for page_id, page_rows in by_page.items():
+        areas = [{"area_id": r["id"], "title": r["path"].rsplit(" > ", 1)[-1], "chars": r["chars"],
+                  "summary": (r["summary"] or "")[:CATALOG_SUMMARY_CHARS]}
+                 for r in page_rows if r["kind"] == "document" or (include_all and r["kind"] in ("document", "link", "meeting"))]
+        if not areas and not include_all:
+            continue
+        info = titles.get(page_id, {})
+        top = [r for r in page_rows if r["parent_part_id"] is None]
+        out.append({"source_id": page_id, "title": (info.get("path") or (top[0]["path"] if top else "")).split(" > ")[0],
+                    "edited": (max((r["last_edited"] or "" for r in page_rows), default="") or info.get("last_edited") or "")[:10],
+                    "fingerprint": parts_mod.structure_fingerprint(page_rows), "areas": areas})
+    out.sort(key=lambda s: s["edited"], reverse=True)
+    return out
+
+
+def recent_meetings(store: Path, scope: str, prompt_version: str | None = None) -> list[dict[str, Any]]:
+    """최근 회의 메모를 해석해 나온 항목(제목·종류)만. 아직 지식 항목으로 반영되기 전(2시간 대기)이어도 보인다.
+    탐색이 "무엇을 읽어야 하는지" 가늠하는 출발점이다."""
+    from . import parts as parts_mod
+
+    found = parts_mod.meeting_items(store, scope, prompt_version) if prompt_version else []
+    return [{"kind": i["kind"], "title": i["title"]} for i in found
+            if i["kind"] in ("decision", "open", "task", "requirement", "hypothesis")][:RECENT_MEETING_ITEMS]

@@ -62,6 +62,8 @@ import notion_map  # noqa: E402
 import prompts  # noqa: E402
 import worklog_bridge  # noqa: E402
 from worklog import apply as wapply  # noqa: E402
+from worklog import explore as wexplore  # noqa: E402
+from worklog import lineage as wlineage  # noqa: E402
 from worklog import parts as wparts  # noqa: E402
 from worklog import people  # noqa: E402
 from worklog import stages as wstages  # noqa: E402
@@ -1233,14 +1235,21 @@ def _organize_parts() -> dict[str, dict[str, int]]:
     for team_key in _load_team_configs():
         try:
             judged = wparts.judge_pending(store, team_key, worklog_bridge.groq_classify_parts)
-            extracted = wparts.extract_pending(store, team_key, worklog_bridge.groq_extract_part,
-                                               worklog_bridge.EXTRACT_PROMPT_VERSION)
+            version = worklog_bridge.EXTRACT_PROMPT_VERSION
+            extracted = wparts.extract_pending(store, team_key, worklog_bridge.groq_extract_part, version)
+            # 회의 메모를 해석한 뒤, 그 항목을 보고 읽을 문서 영역을 고르고 고른 영역을 해석한다(v2.1 Phase 2).
+            explored = wexplore.run(store, team_key, worklog_bridge.groq_explore, version)
+            if explored:
+                extracted += wparts.extract_pending(store, team_key, worklog_bridge.groq_extract_part, version)
             # 새 회의록: 마지막 수정 후 2시간이 지나면 묻지 않고 날짜 순서로 반영한다(고치기는 구조 화면). 확인된
             # 회의록의 수정: 새 항목만 자동 반영.
             promoted = len(wapply.auto_apply_due(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION,
                                                  worklog_bridge.groq_judge))
             edits = wapply.apply_edits(store, team_key, worklog_bridge.EXTRACT_PROMPT_VERSION, worklog_bridge.groq_judge)
-            results[team_key] = {"judged": judged, "extracted": extracted, "promoted": promoted, "edited": len(edits)}
+            artifacts = wlineage.sync_artifacts(store, team_key, version)
+            moved = wlineage.reconcile_gone(store, team_key)
+            results[team_key] = {"judged": judged, "extracted": extracted, "explored": explored, "promoted": promoted,
+                                 "edited": len(edits), "artifacts": artifacts, "moved": moved}
         except Exception:
             traceback.print_exc()
     return results
@@ -1430,7 +1439,7 @@ def _decision_flow(store, team_key: str, decisions: list[dict]) -> list[str]:
 # ── 4번 반영 흐름·메인 카드 알림 (confirm_flow) ─────────────
 _CONFIRM_ACTIONS = {"apply_list", "apply_pick", "apply_pick_ready", "part_apply", "part_edit", "part_cancel",
                     "edit_delete", "edit_done", "applied_list", "revert", "gone_remove", "gone_keep",
-                    "upload_notes", "stage_answer", "source_add"}
+                    "upload_notes", "upload_type", "stage_answer", "source_add"}
 source_add_sessions: dict[str, dict] = {}
 
 
@@ -1514,6 +1523,8 @@ async def _handle_confirm_action(turn: Turn, action: str, value: dict) -> None:
         await confirm_flow.answer_stage(turn, team, value, _is_approver(turn, config))
     elif action == "upload_notes":
         await confirm_flow.start_upload(turn, team)
+    elif action == "upload_type":
+        await confirm_flow.set_upload_type(turn, value)
     elif action == "source_add":
         if not _is_approver(turn, config):
             await turn.send("소스 추가는 권한자(관리자·개발·권한을 받은 사람)가 해요.")

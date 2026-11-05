@@ -95,18 +95,21 @@ class ShippedPromptTests(unittest.TestCase):
         prompts.clear_cache()
 
     def test_moved_prompts_keep_their_version_names(self) -> None:
-        self.assertEqual(prompts.load("interpret").version, "part-extract-3")  # 기존 해석 캐시가 무효가 되지 않는다
-        self.assertEqual(prompts.load("reconcile").version, "reconcile-1")
+        self.assertEqual(prompts.load("interpret").version, "part-extract-5")  # 해석 계약이 바뀌어 판을 올렸다(v2.1 Phase 2)
+        self.assertEqual(prompts.load("reconcile").version, "reconcile-2")
+        self.assertEqual(prompts.load("explore").version, "explore-1")
         self.assertEqual(prompts.load("project-info").version, "project-info-1")
         self.assertEqual(worklog_bridge.EXTRACT_PROMPT_VERSION, prompts.load("interpret").version)
 
     def test_moved_prompts_say_what_they_said_before(self) -> None:
         interpret = prompts.load("interpret").text
-        self.assertTrue(interpret.startswith("너는 팀 회의·멘토링 메모에서 항목을 뽑는 분석기야."))
-        self.assertIn('JSON 하나만 출력해: {"items": [...]}. 뽑을 것이 없으면 {"items": []}.', interpret)
+        self.assertTrue(interpret.startswith("너는 팀의 회의·멘토링 메모나 문서에서 항목을 뽑는 분석기야."))
+        self.assertIn('JSON 하나만 출력해: {"artifact": {...} 또는 null, "items": [...]}.', interpret)
+        self.assertIn("agreement_quote", interpret)
         reconcile = prompts.load("reconcile").text
-        self.assertTrue(reconcile.startswith("너는 새 기록에서 나온 항목(item)을 기존 Task·Decision 목록(related)과 비교하는 판정기야."))
-        self.assertIn('"superseding": 기존 결정을 명시적으로 대체함 (decision끼리만)', reconcile)
+        self.assertTrue(reconcile.startswith("너는 새 기록에서 나온 항목(item)을 기존 항목 목록(related)과 비교하는 판정기야."))
+        for relation in ("alternative", "resolving", "decidable"):
+            self.assertIn(relation, reconcile)
         self.assertTrue(prompts.load("project-info").text.startswith("너는 팀 소개/프로젝트 정보 페이지 원문을"))
 
     def test_common_guidelines_load(self) -> None:
@@ -132,13 +135,16 @@ class ShippedPromptTests(unittest.TestCase):
             copy = Path(tmp)
             source = prompts.PROMPT_DIR / "interpret.md"
             (copy / "interpret.md").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            (copy / "common").mkdir()
+            for shared in ("states.md", "output-json.md"):
+                (copy / "common" / shared).write_text((prompts.PROMPT_DIR / "common" / shared).read_text(encoding="utf-8"), encoding="utf-8")
             with patch.object(prompts, "PROMPT_DIR", copy):
                 prompts.clear_cache()
-                self.assertEqual(worklog_bridge.EXTRACT_PROMPT_VERSION, "part-extract-3")
+                self.assertEqual(worklog_bridge.EXTRACT_PROMPT_VERSION, "part-extract-5")
                 with open(copy / "interpret.md", "a", encoding="utf-8") as handle:
                     handle.write("\n- 새 규칙 한 줄\n")
                 touch_later(copy / "interpret.md")
-                self.assertTrue(worklog_bridge.EXTRACT_PROMPT_VERSION.startswith("part-extract-3+"))
+                self.assertTrue(worklog_bridge.EXTRACT_PROMPT_VERSION.startswith("part-extract-5+"))
             prompts.clear_cache()
 
 

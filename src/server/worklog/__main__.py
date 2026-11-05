@@ -6,6 +6,7 @@ python -m worklog map     --scope team:<팀ID> [--json]   (섹션별 역할 보�
 python -m worklog map-set --scope team:<팀ID> "<섹션 이름>" <진행|회의|보관|제외> --actor <이름>   (역할 바꾸기)
 python -m worklog extract-eval --scope team:<팀ID> [--prompt-version ...]   (정답지와 추출 비교)
 python -m worklog reindex-fts [--scope team:<팀ID>]   (지식 검색 색인을 항목에서 다시 만든다. 색인은 파생 데이터)
+python -m worklog reprocess --scope team:<팀ID> [--error-kind contract|quote_mismatch|llm_failed]   (멈춘 해석·반영 오류를 다시 열어 다음 주기에 다시 처리)
 python -m worklog search --scope team:<팀ID> "<질문>" [--kind decision ...] [--limit 8] [--max-tokens 3000]   (색인 검색)
 
 저장소 위치: --store > WORKLOG_STORE > server/../worklog.sqlite3
@@ -21,7 +22,7 @@ from pathlib import Path
 
 from contextlib import closing
 
-from . import apply, core, db, search, sections
+from . import apply, core, db, runs, search, sections
 from .db import ConflictError, NotFoundError, WorklogError
 
 DEFAULT_STORE = Path(__file__).resolve().parents[2] / "worklog.sqlite3"
@@ -48,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--prompt-version", help="비교할 추출 버전 (기본: 가장 최근에 쓴 버전)")
     reindex = sub.add_parser("reindex-fts", help="지식 검색 색인 다시 만들기")
     reindex.add_argument("--scope", help="이 팀만(기본: 전체)")
+    redo = sub.add_parser("reprocess", help="멈춘 처리 오류 다시 열기")
+    redo.add_argument("--scope", required=True)
+    redo.add_argument("--error-kind", choices=["contract", "quote_mismatch", "llm_failed", "busy"], help="이 종류만(기본: 전부)")
     find = sub.add_parser("search", help="지식 검색(색인)")
     find.add_argument("text", help="질문 또는 검색어")
     find.add_argument("--scope", required=True)
@@ -82,6 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "extract-eval":
             version = args.prompt_version or _latest_prompt_version(store)
             data = {"prompt_version": version, **apply.extract_eval(store, args.scope, version or "")}
+        elif args.command == "reprocess":
+            data = {"scope": args.scope, "stuck_before": len(runs.stuck(store, args.scope)),
+                    "reopened": runs.reprocess(store, args.scope, args.error_kind)}
         elif args.command == "reindex-fts":
             data = {"scope": args.scope, "indexed": search.rebuild(store, args.scope)}
         elif args.command == "search":

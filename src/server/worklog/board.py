@@ -103,11 +103,13 @@ def snapshot(store: Path, scope: str, now: datetime | None = None) -> dict[str, 
     since = ((now or datetime.now().astimezone()) - timedelta(hours=24)).astimezone().isoformat()
     with closing(db.connect(store)) as c:
         sources = _sources(c, scope)
+        # 탭은 아직 항목 다섯 종류만 다룬다(산출물 문서·요구사항·가설 화면은 Phase 3)
         rows = c.execute(f"""SELECT * FROM work_items WHERE scope = ? AND status NOT IN ({",".join("?" * len(HIDDEN))})
-                             ORDER BY updated_at DESC, rowid DESC""", (scope, *HIDDEN)).fetchall()
+                             AND kind IN ({",".join("?" * len(KINDS))}) ORDER BY updated_at DESC, rowid DESC""",
+                         (scope, *HIDDEN, *KINDS)).fetchall()
         items = [_item(c, r, sources) for r in rows]
         changes = _changes(c, scope)
-        recent = c.execute("""SELECT COUNT(DISTINCT page_id) FROM source_parts WHERE scope = ? AND kind = 'meeting'
+        recent = c.execute("""SELECT COUNT(DISTINCT page_id) FROM source_parts WHERE scope = ? AND status = 'active'
                               AND state = 'applied' AND confirmed_at >= ?""", (scope, since)).fetchone()[0]
     used = {s["part_id"] for i in items for s in i["sources"]}
     pages: dict[str, dict] = {}
