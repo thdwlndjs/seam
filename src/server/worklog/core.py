@@ -61,6 +61,7 @@ COMPARABLE = {
 }
 SUPERSEDING_KINDS = ("decision", "requirement")
 HUMAN_EDIT_PREFIX = "구조 화면에서"  # board.py가 사람이 탭에서 고친 revisions에 쓰는 사유의 앞부분
+HUMAN_COORDINATION_PREFIX = "조율에서 사람이 기록"
 
 # Ends like a question or an open suggestion: "…할까요?", "…어때요", "…인가요".
 _QUESTION_RE = re.compile(r"(\?|？|할까요?|될까요?|을까요?|일까요?|어떨까요?|어때요?|인가요|나요|건가요?|는지)\s*[.!~…]*\s*$")
@@ -316,9 +317,10 @@ def candidates_for(c: sqlite3.Connection, scope: str, item: dict[str, Any], extr
 
 
 def is_human_edited(c: sqlite3.Connection, item_id: str) -> bool:
-    """사람이 탭에서 고친 항목인가(자동 처리의 revisions는 actor가 "자동(…"로 시작한다). 사람 수정은 재해석이 덮어쓰지 않는다."""
+    """사람이 탭에서 고치거나 조율에서 직접 기록한 항목은 재해석이 덮어쓰지 않는다."""
     return c.execute("""SELECT 1 FROM revisions WHERE object_type = 'work_item' AND object_id = ? AND version > 1
-                        AND reason LIKE ? AND actor NOT LIKE '자동(%' LIMIT 1""", (item_id, HUMAN_EDIT_PREFIX + "%")).fetchone() is not None
+                        AND (reason LIKE ? OR reason LIKE ?) AND actor NOT LIKE '자동(%' LIMIT 1""",
+                     (item_id, HUMAN_EDIT_PREFIX + "%", HUMAN_COORDINATION_PREFIX + "%")).fetchone() is not None
 
 
 def is_important(c: sqlite3.Connection, target: dict[str, Any]) -> bool:

@@ -28,6 +28,7 @@ WORKLOG_STORE = Path(
     os.environ.get("WORKLOG_STORE")
     or Path(__file__).resolve().parent.parent / "worklog.sqlite3"
 )
+_WORKLOG_STORE_ENV_AT_IMPORT = os.environ.get("WORKLOG_STORE")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # 분석할 묶음이 있는지 확인하는 주기. 확인 자체는 로컬 DB 조회뿐이라 비용이 없고, 분석 시점의 오차만 정한다.
@@ -63,6 +64,11 @@ def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGR
 
     백그라운드(순위 2·3)는 공급자를 차례로 시도한다(Groq → Cerebras, 키가 있는 것만). 대기열 한도에 막히거나
     429를 받으면 다음 공급자로 넘기고, 모두 막히면 llm_queue.Busy를 낸다(호출부는 그 주기를 멈춘다)."""
+    # Verification harnesses may redirect metering after import. Preserve explicit module-level
+    # overrides used by runtime adapters and isolated tests when the environment did not change.
+    configured_store = os.environ.get("WORKLOG_STORE")
+    store = (Path(configured_store) if configured_store and configured_store != _WORKLOG_STORE_ENV_AT_IMPORT
+             else WORKLOG_STORE)
     body = json.dumps(payload, ensure_ascii=False)
     estimated = len(body) * 3 // 4 + len(system_prompt) // 2
     candidates = llm_queue.available(priority) or llm_queue.PROVIDERS[:1]
@@ -72,7 +78,7 @@ def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGR
         content = body
         for attempt in range(2 if retry_invalid_json else 1):
             try:
-                llm_queue.check(provider, priority, estimated, WORKLOG_STORE)
+                llm_queue.check(provider, priority, estimated, store)
             except llm_queue.Busy as error:
                 busy = error
                 break
@@ -93,7 +99,7 @@ def _llm_call(system_prompt: str, payload: Any, priority: int = llm_queue.BACKGR
             usage = usage_of(resp) or {}
             status = getattr(resp, "status_code", 200)
             metrics.count_groq(usage)
-            llm_queue.record(WORKLOG_STORE, provider.name, priority, getattr(resp, "headers", None), status,
+            llm_queue.record(store, provider.name, priority, getattr(resp, "headers", None), status,
                              int(usage.get("total_tokens") or 0))
             if status == 429:
                 busy = llm_queue.Busy("minute", 60, provider.name)
@@ -216,7 +222,8 @@ def lead_call(prompt_name: str, payload: dict) -> tuple[dict, dict, str]:
     답이 JSON 객체가 아니면 ContractError. LLM 키가 없으면 llm_queue.Busy가 아니라 RuntimeError(호출부가 대체 표시로 넘어간다)."""
     if not (GROQ_API_KEY or llm_ready()):
         raise RuntimeError("LLM 키가 없어요")
-    data, usage, label = _llm_call(prompts.load(prompt_name).text, payload, llm_queue.USER, retry_invalid_json=prompt_name != "qa")
+    data, usage, label = _llm_call(prompts.load(prompt_name).text, payload, llm_queue.USER,
+                                   retry_invalid_json=prompt_name not in ("qa", "coordination"))
     if not isinstance(data, dict):
         raise worklog.ContractError(f"{prompt_name} 답이 JSON 객체가 아님")
     return data, usage, label

@@ -216,7 +216,7 @@ def briefing_items(store: Path, scope: str, issue_states: dict[int, str], commit
         excluded = 0
         for row in rows:
             attributes = json.loads(row["attributes_json"])
-            found = [sources[p] for p in attributes.get("part_ids") or [] if p in sources]
+            found = [sources[p] for p in attributes.get("part_ids") or [] if p in sources] + board._human_sources(c, row["id"])
             if not found:
                 excluded += 1
                 continue

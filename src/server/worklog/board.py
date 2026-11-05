@@ -79,7 +79,22 @@ def _quotes(c: Any, item_id: str) -> list[str]:
                         JOIN object_evidence oe ON oe.object_type = 'change_candidate' AND oe.object_id = cc.id
                         JOIN evidence e ON e.id = oe.evidence_id
                         WHERE cc.applied_item_id = ? AND e.section_locator = 'quote'""", (item_id,)).fetchall()
-    return [r["excerpt"] for r in rows]
+    direct = c.execute("""SELECT DISTINCT e.excerpt FROM object_evidence oe JOIN evidence e ON e.id = oe.evidence_id
+                          WHERE oe.object_type = 'work_item' AND oe.object_id = ? AND e.section_locator = 'human_input'""",
+                       (item_id,)).fetchall()
+    return list(dict.fromkeys([r["excerpt"] for r in rows] + [r["excerpt"] for r in direct]))
+
+
+def _human_sources(c: Any, item_id: str) -> list[dict[str, Any]]:
+    """사람이 조율에서 직접 남긴 문장도 읽을 수 있는 출처로 조립한다."""
+    rows = c.execute("""SELECT DISTINCT s.id, s.captured_at FROM object_evidence oe
+                        JOIN evidence e ON e.id = oe.evidence_id JOIN sources s ON s.id = e.source_id
+                        WHERE oe.object_type = 'work_item' AND oe.object_id = ? AND e.section_locator = 'human_input'""",
+                     (item_id,)).fetchall()
+    return [{"part_id": f"human:{r['id']}", "page_id": None, "origin": "human",
+             "path": "사람이 직접 기록", "page_path": "사람이 직접 기록", "title": "사람이 직접 기록",
+             "part_kind": "human", "date": (r["captured_at"] or "")[:10] or None,
+             "url": None, "section_url": None, "section": None} for r in rows]
 
 
 def _history(c: Any, item_id: str) -> list[dict[str, Any]]:
@@ -87,7 +102,7 @@ def _history(c: Any, item_id: str) -> list[dict[str, Any]]:
     for row in c.execute("""SELECT version, snapshot_json, reason, actor, changed_at FROM revisions
                             WHERE object_type = 'work_item' AND object_id = ? ORDER BY version""", (item_id,)):
         snap = json.loads(row["snapshot_json"])
-        human = (row["reason"] or "").startswith(core.HUMAN_EDIT_PREFIX) and not (row["actor"] or "").startswith("자동(")
+        human = (row["reason"] or "").startswith((core.HUMAN_EDIT_PREFIX, core.HUMAN_COORDINATION_PREFIX)) and not (row["actor"] or "").startswith("자동(")
         out.append({"version": row["version"], "at": row["changed_at"], "actor": row["actor"], "reason": row["reason"],
                     "title": snap.get("title"), "kind": snap.get("kind"), "status": snap.get("status"), "by_human": human})
     return out
@@ -112,13 +127,14 @@ def _github(attributes: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _item(c: Any, row: Any, sources: dict[str, dict], links: dict[str, list] | None = None) -> dict[str, Any]:
     attributes = json.loads(row["attributes_json"])
-    found = [sources[p] for p in attributes.get("part_ids") or [] if p in sources]
+    found = [sources[p] for p in attributes.get("part_ids") or [] if p in sources] + _human_sources(c, row["id"])
     quotes = _quotes(c, row["id"])
     mine = (links or {}).get(row["id"], [])
     maturity = attributes.get("maturity")
     return {"id": row["id"], "kind": row["kind"], "kind_label": KINDS.get(row["kind"], row["kind"]),
             "status": row["status"], "title": row["title"], "statement": row["statement_md"],
             "assignee": attributes.get("assignee"), "due": attributes.get("due"),
+            "agenda": bool(attributes.get("agenda")), "deferred": bool(attributes.get("deferred")),
             "maturity": maturity if maturity in MATURITY_LABELS else None,
             "artifact_type": attributes.get("artifact_type"), "github": _github(attributes),
             "sources": sorted(found, key=lambda s: s["date"] or ""), "quotes": quotes,
@@ -172,10 +188,9 @@ def snapshot(store: Path, scope: str, now: datetime | None = None) -> dict[str, 
         changes = _changes(c, scope)
         recent = c.execute("""SELECT COUNT(DISTINCT page_id) FROM source_parts WHERE scope = ? AND status = 'active'
                               AND state = 'applied' AND confirmed_at >= ?""", (scope, since)).fetchone()[0]
-    used = {s["part_id"] for i in items for s in i["sources"]}
+    used = {s["part_id"]: s for i in items for s in i["sources"]}
     pages: dict[str, dict] = {}
-    for part_id in used:
-        s = sources[part_id]
+    for part_id, s in used.items():
         pages.setdefault(s["page_id"] or part_id, {"page_id": s["page_id"] or part_id, "title": s["title"], "date": s["date"]})
     found = stages.board(store, scope)
     candidate = found["candidate"]  # 확정 > AI 추정(논의 중) > 게이트 기준: 메뉴 2·단계 카드와 같은 값

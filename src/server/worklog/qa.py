@@ -19,7 +19,7 @@ from typing import Any
 
 import prompts
 
-from . import board, core, db, decision_state, leading, parts, search
+from . import board, coordination, core, db, decision_state, leading, parts, search
 from .db import ContractError
 
 MAX_CALLS = 2
@@ -76,7 +76,7 @@ def gather(store: Path, scope: str, question: str) -> dict[str, Any]:
             if row is None:
                 continue
             attributes = json.loads(row["attributes_json"])
-            found_sources = [sources[p] for p in attributes.get("part_ids") or [] if p in sources]
+            found_sources = [sources[p] for p in attributes.get("part_ids") or [] if p in sources] + board._human_sources(c, item_id)
             relations = []
             for link in links.get(item_id, []):
                 names = REL.get(link["type"])
@@ -283,9 +283,9 @@ def validate_need(need: list[dict[str, str]], ctx: dict[str, Any], pack: dict[st
 # ── 4. 호출 흐름 ───────────────────────────────────────────
 
 def ask(ctx: dict[str, Any], github: dict[str, Any], call: Callable[[str, dict[str, Any]], tuple[dict, dict, str]],
-        tab_link: Callable[[str], str] | None = None) -> dict[str, Any]:
+        tab_link: Callable[[str], str] | None = None, coord_context: Callable[[], dict] | None = None) -> dict[str, Any]:
     """질문 한 건(plan 2.4). 모델 호출은 최대 2회이고 3회째는 CallLimit. github = {"status", "repo", "pack", ...}(호출부가 실제로 조회한 것).
-    1차 → intent=coordination이면 2차 없이 "준비 중"(Phase 6 전) / need가 있으면 검증해 2차 1회 / 아니면 1차로 끝.
+    1차 → intent=coordination이면 조율 1회 / need가 있으면 검증해 2차 qa 1회 / 아니면 1차로 끝.
     계약 위반이나 호출 실패는 재시도 없이 "답을 만들지 못함 + 조회 범위"로 끝낸다."""
     calls: list[dict[str, Any]] = []
     pack = github.get("pack") if github.get("status") == "ok" else None
@@ -317,7 +317,50 @@ def ask(ctx: dict[str, Any], github: dict[str, Any], call: Callable[[str, dict[s
         return _failure(ctx, github, calls, error)
     result, unknowns, note = first, list(first["unknowns"]), None
     if first["intent"] == "coordination":
-        note = "🧭 팀 조율은 아직 준비 중이에요. 위 답은 저장된 지식으로 본 것이에요."
+        try:
+            if coord_context:
+                context = coord_context()
+            else:
+                context = {"question": ctx["question"], "people": [], "stage": None,
+                           "items": [{"id": alias, "kind": item["kind"], "status": item["status"],
+                                      "title": item["title"], "statement": item["statement"],
+                                      "relations": item["relations"], "refs": item["refs"]}
+                                     for alias, item in visible_ctx["items"].items()]}
+            context["question"] = ctx["question"]
+
+            def guarded_coord(name: str, payload: dict):
+                if len(calls) >= MAX_CALLS:
+                    raise CallLimit("질문 한 건의 모델 호출은 2회까지예요")
+                calls.append({"usage": {}, "model": None})
+                data, usage, model = call(name, payload)
+                calls[-1] = {"usage": usage, "model": model}
+                return data, usage, model
+
+            visible_ids = {i["id"] for i in context["items"]}
+            prior_findings = []
+            for finding in first["findings"]:
+                evidence_ids = []
+                for alias in finding["evidence_ids"]:
+                    target = alias if alias in visible_ids else visible_ctx["items"].get(alias, {}).get("item_id")
+                    if target in visible_ids:
+                        evidence_ids.append(target)
+                prior_findings.append(dict(finding, evidence_ids=evidence_ids))
+            proposal = coordination.propose(context, guarded_coord, question_path=True,
+                                             first={"answer": first["answer"], "findings": prior_findings})
+        except CallLimit:
+            raise
+        except Exception as error:
+            return _failure(ctx, github, calls, error)
+        visible_github = dict(github, pack=visible_pack) if visible_pack is not None else github
+        rendered = _render(first, unknowns, None, visible_ctx, visible_github, calls, tab_link)
+        has_proposal = bool(proposal["result"]["compared_alternatives"] or
+                            any(proposal["result"][key] for key, _ in coordination.SECTIONS))
+        if has_proposal:
+            rendered["text"] = rendered["text"].replace("저장된 근거로 질문에 대한 답을 확인하지 못했어요.",
+                                                        "팀이 함께 검토할 내용을 정리했어요.", 1)
+        rendered["text"] += "\n\n" + proposal["text"]
+        rendered["coordination"] = proposal
+        return rendered
     elif first["need"]:
         granted, rejected = validate_need(first["need"], visible_ctx, visible_pack)
         unknowns += rejected
@@ -388,12 +431,19 @@ def _render(result: dict[str, Any], unknowns: list[str], note: str | None, ctx: 
     def cite_item(alias: str) -> list[int]:
         out = []
         for ref in ctx["items"][alias]["refs"][:2]:
-            if not ref["url"]:
+            url = ref["url"]
+            kind = "notion"
+            if (not url and ref.get("part_kind") == "human" and tab_link
+                    and ctx["items"][alias]["status"] not in board.HIDDEN):
+                url = tab_link(ctx["items"][alias]["item_id"])
+                ref = dict(ref, url=url)
+                kind = "human"
+            if not url:
                 continue
-            key = ref["url"]
+            key = url
             if key not in numbering:
                 numbering[key] = len(numbering) + 1
-                links.append({"n": numbering[key], "text": leading.ref_text(ref), "url": ref["url"] or "", "kind": "notion"})
+                links.append({"n": numbering[key], "text": leading.ref_text(ref), "url": url, "kind": kind})
             out.append(numbering[key])
         if out and first_item[0] is None and ctx["items"][alias]["status"] not in board.HIDDEN:
             first_item[0] = ctx["items"][alias]["item_id"]

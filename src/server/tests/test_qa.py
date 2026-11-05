@@ -99,10 +99,53 @@ class QuestionTests(Base):
         self.assertIn("k999", result["text"])
         self.assertNotIn("조율은 아직 준비 중", result["text"])
 
-    def test_coordination_waits_for_phase_6_without_second_call(self):
-        result, calls = self.run_answer(answer(intent="coordination", need=[{"type": "item_source", "id": self.alias}]))
-        self.assertEqual(len(calls), 1)
-        self.assertIn("조율은 아직 준비 중", result["text"])
+    def test_coordination_compares_alternative_within_two_calls(self):
+        self.assertIn("만들면서 QA", prompts.load("qa").text)
+        self.ctx["question"] = "만들면서 QA를 하는 대안은 어때요?"
+        second = {"now": [], "later": [], "cross_role": [], "parallel": [],
+                  "compared_alternatives": [
+                      {"option": "현재 안", "fits_when": "먼저 범위를 정할 때", "tradeoffs": "결정을 기다려야 해요"},
+                      {"option": "만들면서 QA", "fits_when": "짧은 피드백을 병행할 때", "tradeoffs": "변경 가능성을 살펴야 해요"}],
+                  "methods_used": ["product-discovery"], "need_method": "unknown-and-ignored"}
+        result, calls = self.run_answer(answer(intent="coordination", need=[{"type": "item_source", "id": self.alias}]), second)
+        self.assertEqual([name for name, _ in calls], ["qa", "coordination"])
+        self.assertEqual(result["calls"], 2)
+        self.assertIn("만들면서 QA", result["text"])
+        self.assertIn("현재 안", result["text"])
+        self.assertNotIn("조율은 아직 준비 중", result["text"])
+        self.assertNotIn("저장된 근거로 질문에 대한 답을 확인하지 못했어요.", result["text"])
+
+    def test_question_coordination_turn_uses_real_saved_context_and_buttons(self):
+        turn = SessionTests().turn(text="로그인 방식은 만들면서 QA를 하면 어때요?")
+        config = {"notion_page_id": "root", "notion_token": "fake"}
+        calls = []
+        def fake_model(name, payload):
+            calls.append(name)
+            if name == "qa":
+                alias = next(i["id"] for i in payload["items"] if i["title"] == "로그인 방식 이메일")
+                return answer(intent="coordination", findings=[{"claim": "기록된 로그인 방식이 있어요",
+                              "evidence_ids": [alias], "link_basis": "explicit"}]), {}, "fake"
+            item = next(i for i in payload["context"]["items"] if i["id"] == self.item)
+            self.assertEqual(payload["first"]["findings"][0]["evidence_ids"], [self.item])
+            result = {"now": [{"item_id": item["id"], "suggestion": "방식을 같이 검토해요",
+                               "reason": "로그인 방식이 기록돼 있어요", "roles": [], "evidence_ids": [item["id"]]}],
+                      "later": [], "cross_role": [], "parallel": [],
+                      "compared_alternatives": [{"option": "현재 안", "fits_when": "범위를 먼저 정할 때", "tradeoffs": "확인이 필요해요"},
+                                                {"option": "만들면서 QA", "fits_when": "피드백을 병행할 때", "tradeoffs": "변경을 살펴야 해요"}],
+                      "methods_used": [payload["methods"][0]["id"]], "need_method": "spike"}
+            return result, {}, "fake"
+        with patch.object(worklog_bridge, "WORKLOG_STORE", self.store), patch.object(worklog_bridge, "lead_call", fake_model), \
+             patch.object(main, "_qa_github", new=AsyncMock(return_value={"status": "skipped"})):
+            asyncio.run(main._handle_qa(turn, config, turn.req.text))
+        events = []
+        while not turn.queue.empty():
+            events.append(turn.queue.get_nowait())
+        self.assertEqual(calls, ["qa", "coordination"])
+        self.assertTrue(any("만들면서 QA" in e.get("text", "") for e in events))
+        actions = [b.get("data", {}).get("action") for e in events if e["type"] == "buttons" for b in e["buttons"]]
+        self.assertIn("coord_decision", actions)
+        self.assertFalse(any(i["kind"] == "decision" and i["title"] == "방식을 같이 검토해요"
+                             for i in board.snapshot(self.store, SCOPE)["items"]))
 
     def test_invalid_contract_fails_without_retry_and_reports_scope(self):
         for bad in (answer(intent="other"), answer(need=[{"type": "github", "id": "x"}] * 6),
@@ -291,18 +334,20 @@ class SessionTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
-    def test_qa_invalid_json_does_not_send_a_second_request(self):
-        provider = SimpleNamespace(name="fake", url="https://example.invalid", key="fake", model="fake")
-        response = MagicMock(status_code=200, headers={})
-        response.json.return_value = {"choices": [{"message": {"content": "not json"}}]}
-        client = MagicMock()
-        client.__enter__.return_value.post.return_value = response
-        with patch.object(worklog_bridge, "GROQ_API_KEY", "fake"), \
-             patch.object(worklog_bridge.llm_queue, "available", return_value=[provider]), \
-             patch.object(worklog_bridge.llm_queue, "record"), patch.object(worklog_bridge.httpx, "Client", return_value=client):
-            with self.assertRaises(ContractError):
-                worklog_bridge.lead_call("qa", {"question": "가상 질문"})
-        self.assertEqual(client.__enter__.return_value.post.call_count, 1)
+    def test_waiting_user_invalid_json_does_not_send_a_second_request(self):
+        for prompt_name in ("qa", "coordination"):
+            with self.subTest(prompt=prompt_name):
+                provider = SimpleNamespace(name="fake", url="https://example.invalid", key="fake", model="fake")
+                response = MagicMock(status_code=200, headers={})
+                response.json.return_value = {"choices": [{"message": {"content": "not json"}}]}
+                client = MagicMock()
+                client.__enter__.return_value.post.return_value = response
+                with patch.object(worklog_bridge, "GROQ_API_KEY", "fake"), \
+                     patch.object(worklog_bridge.llm_queue, "available", return_value=[provider]), \
+                     patch.object(worklog_bridge.llm_queue, "record"), patch.object(worklog_bridge.httpx, "Client", return_value=client):
+                    with self.assertRaises(ContractError):
+                        worklog_bridge.lead_call(prompt_name, {"question": "가상 질문"})
+                self.assertEqual(client.__enter__.return_value.post.call_count, 1)
 
     def test_rate_limit_uses_another_provider_within_one_call(self):
         providers = [SimpleNamespace(name=n, url="https://example.invalid/" + n, key="fake", model="fake") for n in ("a", "b")]

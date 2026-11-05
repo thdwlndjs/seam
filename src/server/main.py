@@ -62,6 +62,7 @@ import notion_map  # noqa: E402
 import prompts  # noqa: E402
 import worklog_bridge  # noqa: E402
 from worklog import apply as wapply  # noqa: E402
+from worklog import coordination as wcoord  # noqa: E402
 from worklog import explore as wexplore  # noqa: E402
 from worklog import leading as wleading  # noqa: E402
 from worklog import lineage as wlineage  # noqa: E402
@@ -70,6 +71,7 @@ from worklog import people  # noqa: E402
 from worklog import qa as wqa  # noqa: E402
 from worklog import runs as wruns  # noqa: E402
 from worklog import stages as wstages  # noqa: E402
+from worklog.db import ConflictError, NotFoundError, ValidationError  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
 # ── 설정 ────────────────────────────────────────────────
@@ -465,7 +467,8 @@ async def handle_turn(turn: Turn) -> None:
         await asyncio.to_thread(_sync_member, turn, config)
         action = turn.req.value.get("action") if isinstance(turn.req.value, dict) else None
         in_qa = has_qa_session(turn.aad_id) and qa_sessions[turn.aad_id]["team_key"] == turn.team_key
-        if action != "qa_start" and not (in_qa and not action):
+        in_coord = turn.aad_id in coord_sessions and coord_sessions[turn.aad_id]["team_key"] == turn.team_key
+        if action != "qa_start" and not str(action or "").startswith("coord_") and not (in_qa and not action) and not (in_coord and not action):
             _check_on_open(turn.team_key, config)
 
     # 카드 버튼(Action.Submit / Action.Execute) — 에코봇이 data를 value에 그대로 실어 보낸다.
@@ -514,6 +517,7 @@ async def _dispatch_value(turn: "Turn", value: dict) -> bool:
     action = value.get("action")
     if action == "menu" and "choice" in value:
         qa_sessions.pop(turn.aad_id, None)
+        coord_sessions.pop(turn.aad_id, None)
         await _run_action(turn, str(value["choice"]))
     elif action == "claim_issue" and "issue_number" in value:
         await _handle_claim_click(turn, int(value["issue_number"]))
@@ -525,6 +529,12 @@ async def _dispatch_value(turn: "Turn", value: dict) -> bool:
         await _start_qa(turn)
     elif action == "qa_agenda":
         await _handle_qa_agenda(turn, value)
+    elif action == "coord_start":
+        qa_sessions.pop(turn.aad_id, None)
+        coord_sessions.pop(turn.aad_id, None)
+        await _handle_coordination(turn)
+    elif action in ("coord_agenda", "coord_defer", "coord_resume", "coord_decision"):
+        await _handle_coord_action(turn, action, str(value.get("item_id") or ""))
     elif action in _CONFIRM_ACTIONS:
         await _handle_confirm_action(turn, action, value)
     else:
@@ -546,6 +556,22 @@ async def _handle_text(turn: "Turn", config: dict | None, raw_text: str, aad_id:
     if raw_text.lower() in _CANCEL_TRIGGERS and _cancel_pending_sessions(aad_id):
         await turn.send("취소했어요. 처음부터 다시 하려면 원하는 메뉴나 '설정'을 입력해주세요.")
         return
+
+    session = coord_sessions.get(aad_id)
+    if session:
+        if (session["team_key"] != turn.team_key or time.monotonic() - session["at"] > QA_SESSION_SECONDS
+                or raw_text in ("1", "2", "3", "4", "0", "설정")):
+            coord_sessions.pop(aad_id, None)
+        else:
+            try:
+                made = await asyncio.to_thread(wcoord.record_decision, worklog_bridge.WORKLOG_STORE, turn.team_key,
+                                               session["item_id"], raw_text, turn.user_name or aad_id)
+            except (ValidationError, ConflictError, NotFoundError) as error:
+                await turn.send(f"결정을 기록하지 못했어요: {error}")
+                return
+            coord_sessions.pop(aad_id, None)
+            await turn.send(f"📌 직접 입력한 결정을 기록했어요: {made['statement']}")
+            return
 
     if aad_id in source_add_sessions and config is not None:  # 4번 ⑤ 소스 추가 다음 메시지
         await _handle_source_add(turn, config, raw_text)
@@ -617,6 +643,8 @@ def _cancel_pending_sessions(aad_id: str) -> bool:
     if source_add_sessions.pop(aad_id, None) is not None:
         cancelled = True
     if qa_sessions.pop(aad_id, None) is not None:
+        cancelled = True
+    if coord_sessions.pop(aad_id, None) is not None:
         cancelled = True
     return cancelled
 
@@ -736,9 +764,18 @@ async def _run_menu(turn: Turn, raw_text: str) -> None:
         elif raw_text == "2":
             turn.status("🔍 진행상황을 확인하는 중...")
             reply_text, unassigned_issues = await fetch_team_status(config, turn.team_key, on_stage=turn.status)
+            agendas = await asyncio.to_thread(wcoord.agendas, worklog_bridge.WORKLOG_STORE, turn.team_key)
+            if agendas:
+                reply_text += "\n\n📅 다음 회의 안건\n" + "\n".join(f"- {item['title']}" for item in agendas)
             await turn.send(reply_text)
             if "📎 근거" in reply_text:  # 새 브리핑: 줄마다 근거가 있다. 출처·이력과 고치기는 탭에서
-                await turn.send_buttons("더 궁금한 것은 물어보거나, 출처·이력을 구조 보기에서 확인해 주세요.", [_QA_BUTTON, _board_button(turn)])
+                await turn.send_buttons("더 궁금한 것은 물어보거나, 출처·이력을 구조 보기에서 확인해 주세요.",
+                                        [_QA_BUTTON, _COORD_BUTTON, _board_button(turn)])
+            deferred = await asyncio.to_thread(wcoord.deferred, worklog_bridge.WORKLOG_STORE, turn.team_key)
+            if deferred:
+                await turn.send_buttons("보류한 항목을 다시 검토할 수 있어요.",
+                                        [{"title": f"▶ 다시 검토: {i['title'][:25]}",
+                                          "data": {"action": "coord_resume", "item_id": i["id"]}} for i in deferred[:10]])
             if unassigned_issues:
                 await turn.send_buttons(*_claim_buttons(unassigned_issues), emphasis=True)
             return
@@ -1260,6 +1297,8 @@ async def _lead_status(team_key: str, issue_states: dict[int, str], commit_touch
 QA_SESSION_SECONDS = 600
 # key: aad_object_id, value: {"team_key", "at"}
 qa_sessions: dict[str, dict] = {}
+# aad_id → 다음 채팅으로 사람이 결정 문장을 직접 입력할 대상
+coord_sessions: dict[str, dict] = {}
 _QA_INTRO = ("💬 무엇이 궁금한가요? 저장된 회의·문서 지식으로 찾아 답해요. 구현·작업 상태를 물으면 GitHub 이슈·PR도 같이 봐요.\n"
              "(10분 동안 이어서 물어볼 수 있어요. 끝내려면 '취소')")
 
@@ -1278,6 +1317,7 @@ async def _start_qa(turn: Turn) -> None:
         return
     for other in (setup_sessions, github_onboarding_sessions, source_add_sessions, confirm_flow.upload_sessions, confirm_flow.edit_sessions):
         other.pop(turn.aad_id, None)
+    coord_sessions.pop(turn.aad_id, None)
     qa_sessions[turn.aad_id] = {"team_key": turn.team_key, "at": time.monotonic()}
     await turn.send(_QA_INTRO)
 
@@ -1339,8 +1379,15 @@ async def _handle_qa(turn: Turn, config: dict, question: str) -> None:
     def call(name: str, payload: dict):
         return worklog_bridge.lead_call(name, payload)
 
+    facts = (github.get("pack") or {}).get("facts", [])
+    issue_states = {f["number"]: ("closed" if f["state_key"] == "done" else "open")
+                    for f in facts if f["kind"] == "issue" and f["state_key"] != "unknown"}
+    touched = {f["number"] for f in facts if f["kind"] == "issue" and f["state_key"] == "in_progress"}
     try:
-        outcome = await asyncio.to_thread(wqa.ask, ctx, github, call)
+        outcome = await asyncio.to_thread(wqa.ask, ctx, github, call,
+                                          lambda item_id: _board_button(turn, f"item:{item_id}")["url"],
+                                          lambda: wcoord.gather(worklog_bridge.WORKLOG_STORE, turn.team_key,
+                                                                issue_states, touched, question, config.get("github_repo")))
     except wqa.CallLimit as error:  # 코드 오류 방어선: 질문당 2회를 넘기려 했다
         traceback.print_exc()
         outcome = wqa._failure(ctx, github, [], error)
@@ -1354,6 +1401,79 @@ async def _handle_qa(turn: Turn, config: dict, question: str) -> None:
     if outcome["buttons"]:
         view = f"item:{outcome['view_item']}" if outcome["view_item"] else ""
         await turn.send_buttons("다음에 할 수 있는 것", [*outcome["buttons"], _board_button(turn, view)])
+    if outcome.get("coordination"):
+        await _coordination_buttons(turn, outcome["coordination"])
+
+
+async def _coordination_buttons(turn: Turn, proposal: dict) -> None:
+    items = {i["id"]: i for i in proposal["context"]["items"]}
+    shown: set[str] = set()
+    for section, _ in wcoord.SECTIONS:
+        for entry in proposal["result"][section]:
+            item_id = entry["item_id"]
+            if item_id in shown or item_id not in items or len(shown) >= 5:
+                continue
+            shown.add(item_id)
+            buttons = [
+                {"title": "📅 다음 회의 안건으로", "data": {"action": "coord_agenda", "item_id": item_id}},
+                {"title": "⏸ 보류", "data": {"action": "coord_defer", "item_id": item_id}},
+                {"title": "✍️ 결정 기록하기", "data": {"action": "coord_decision", "item_id": item_id}},
+            ]
+            await turn.send_buttons(f"'{items[item_id]['title']}'에 대해 선택해 주세요.", buttons)
+
+
+async def _handle_coord_action(turn: Turn, action: str, item_id: str) -> None:
+    if _get_config(turn.team_key) is None:
+        await turn.send(_NO_CONFIG_TEXT)
+        return
+    try:
+        if action == "coord_decision":
+            title = await asyncio.to_thread(wcoord.item_title, worklog_bridge.WORKLOG_STORE, turn.team_key, item_id)
+            coord_sessions[turn.aad_id] = {"team_key": turn.team_key, "item_id": item_id, "at": time.monotonic()}
+            await turn.send(f"'{title}'에 대한 결정 문장을 직접 입력해 주세요. 취소하려면 '취소'라고 입력하세요.")
+            return
+        selected = {"coord_agenda": "agenda", "coord_defer": "defer", "coord_resume": "resume"}[action]
+        result = await asyncio.to_thread(wcoord.act, worklog_bridge.WORKLOG_STORE, turn.team_key, item_id,
+                                         selected, turn.user_name or turn.aad_id)
+        message = {"agenda": "다음 회의 안건에 올렸어요.", "defer": "보류했어요.", "resume": "다시 검토할 수 있게 했어요."}
+        await turn.send(f"'{result['title']}'을(를) " + message[selected])
+    except (ValidationError, ConflictError, NotFoundError) as error:
+        await turn.send(f"처리하지 못했어요: {error}")
+
+
+async def _coordination_github(config: dict) -> tuple[dict[int, str], set[int]]:
+    repo, token = config.get("github_repo"), config.get("github_token")
+    if not repo or not token:
+        return {}, set()
+    try:
+        issues = await _github_get_cached(repo, "/issues", token, {"state": "all", "per_page": 30})
+        touched = await _get_commit_touched_issues(repo, token)
+        return {int(i["number"]): i["state"] for i in issues if "pull_request" not in i}, touched
+    except Exception:
+        return {}, set()
+
+
+async def _handle_coordination(turn: Turn) -> None:
+    config = _get_config(turn.team_key)
+    if config is None:
+        await turn.send(_NO_CONFIG_TEXT)
+        return
+    turn.status("🧭 저장된 항목과 역할을 살펴보는 중...")
+    states, touched = await _coordination_github(config)
+    try:
+        context = await asyncio.to_thread(wcoord.gather, worklog_bridge.WORKLOG_STORE, turn.team_key, states, touched,
+                                          "", config.get("github_repo"))
+        proposal = await asyncio.to_thread(wcoord.propose, context, worklog_bridge.lead_call)
+    except Exception:
+        try:
+            built = await asyncio.to_thread(wleading.briefing_items, worklog_bridge.WORKLOG_STORE, turn.team_key, states, touched)
+            fallback = wleading.render_briefing({"lines": [], "overview": None}, built)
+        except Exception:
+            fallback = "구조 보기에서 저장된 항목을 확인해 주세요."
+        await turn.send("조율 제안을 만들지 못했어요. 기존 브리핑을 보여 드려요.\n\n" + fallback)
+        return
+    await turn.send(proposal["text"])
+    await _coordination_buttons(turn, proposal)
 
 
 async def _handle_qa_agenda(turn: Turn, value: dict) -> None:
@@ -1708,6 +1828,7 @@ board_tab.register(app, BOT_SERVER_SECRET, lambda: worklog_bridge.WORKLOG_STORE,
 
 
 _QA_BUTTON = {"title": "💬 질문하기", "data": {"action": "qa_start"}}
+_COORD_BUTTON = {"title": "🧭 조율 보기", "data": {"action": "coord_start"}}
 
 
 def _board_button(turn: Turn, view: str = "") -> dict:

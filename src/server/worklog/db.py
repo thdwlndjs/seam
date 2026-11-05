@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import unicodedata
@@ -384,6 +385,11 @@ def normalize_text(value: str) -> str:
 
 
 def connect(store: Path) -> sqlite3.Connection:
+    if os.environ.get("WORKLOG_TEST_MODE") == "1":
+        protected = Path(os.environ.get("WORKLOG_PROTECTED_STORE") or
+                         Path(__file__).resolve().parents[2] / "worklog.sqlite3").resolve()
+        if Path(store).resolve() == protected:
+            raise RuntimeError("test isolation: refusing to open the protected worklog store")
     store.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(store, timeout=10)
     connection.row_factory = sqlite3.Row

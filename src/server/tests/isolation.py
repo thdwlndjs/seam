@@ -15,6 +15,8 @@ TEST_STORE = Path(tempfile.mkdtemp(prefix="pm-bot-tests-")) / "worklog.sqlite3"
 REAL_STORE = Path(__file__).resolve().parents[2] / "worklog.sqlite3"
 
 os.environ["WORKLOG_STORE"] = str(TEST_STORE)
+os.environ["WORKLOG_TEST_MODE"] = "1"
+os.environ["WORKLOG_PROTECTED_STORE"] = str(REAL_STORE)
 os.environ.setdefault("BOT_SERVER_SECRET", "test-secret")
 os.environ["WORKLOG_LOOP"] = "0"
 # 테스트는 실제 LLM을 부르지 않는다(필요한 테스트가 patch.dict로 가짜 키를 넣는다). 지우기만 하면 서버 모듈이

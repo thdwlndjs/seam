@@ -355,6 +355,7 @@ function matTag(i) {
 }
 function flags(i) {
   return [i.conflict && i.status !== "needs_discussion" ? h("span", { class: "flag", title: "서로 다른 내용이 연결돼 있어요" }, "충돌") : "",
+    i.deferred ? h("span", { class: "flag", title: "조율에서 보류한 항목" }, "보류") : "",
     i.source_missing ? h("span", { class: "flag", title: "원문이 사라졌거나 옮겨진 곳을 찾지 못했어요" }, "출처 없음") : "",
     i.human_edited ? h("span", { class: "flag soft", title: "사람이 고친 항목이라 다시 수집해도 덮어쓰지 않아요" }, "✎ 사람 수정") : ""];
 }
@@ -388,6 +389,9 @@ function sections(d) {
   const col = h("div", { class: "col" });
   const pending = by((i) => i.status === "needs_discussion");
   const live = (k) => by((i) => i.kind === k && i.status !== "needs_discussion");
+  const agenda = by((i) => i.agenda && !i.deferred);
+  if (agenda.length) col.append(section("blue", ICON.question, "다음 회의 안건", agenda.map((i) => row(i)),
+    "조율이나 질문에서 사람이 선택한 안건이에요."));
   if (pending.length) col.append(section("amber", ICON.alert, "확인 필요", pending.map((i) => row(i, answers(i))),
     "중요한 결정끼리 충돌해 스스로 판단하지 못했거나, 사람이 고친 항목과 부딪친 것이에요. 확정·미정·무시 중 하나를 골라 주세요."));
   const docs = visibleArtifacts();

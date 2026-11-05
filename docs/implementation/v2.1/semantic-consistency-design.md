@@ -30,8 +30,8 @@ kind=decision, status=active, 일반 저장 승인, 자동 반영, GitHub 완료
 - 브리핑의 decision/requirement에 성숙도가 없으면 [합의 여부 미확인]을 표시한다. [확정, 성숙도 미기록] 표시는 제거한다. 유효한 기존 성숙도 표시는 유지한다.
 - 브리핑·QA 모델 입력에 동일 함수가 만든 decision_state를 추가한다. 기존 maturity 키·유효 값·null과 응답 계약을 유지한다. 저장 데이터나 enum에 unknown을 쓰지 않는다.
 - QA는 실제 표시 가능한 finding이 참조한 decision/requirement/hypothesis/open의 상태를 코드로 표시한다. 입력에서 제외됐거나 근거 링크가 없는 항목의 상태는 추가하지 않는다. 이 표시는 저장 기록의 해석이다.
-- common/decision-state.md를 두 생성 프롬프트만 공유한다. qa-2/project-leading-2로 판을 올려 브리핑 캐시를 무효화한다. 추출·관계 판정이 공유하는 common/states.md는 고치지 않아 기존 추출 캐시와 판단 규칙을 유지한다.
-- QA의 바로 답/need/coordination 분기, 최대 2회 상한과 두 번째 호출의 기존 역할을 유지한다. 별도 원문 대조 호출·새 wire schema·semantic 저장 속성을 도입하지 않는다.
+- common/decision-state.md를 두 생성 프롬프트만 공유한다. A 작업에서 qa-2/project-leading-2로 판을 올려 브리핑 캐시를 무효화했다. 이후 Phase 6 대안 분기를 반영해 QA는 qa-3이다. 추출·관계 판정이 공유하는 common/states.md는 고치지 않아 기존 추출 캐시와 판단 규칙을 유지한다.
+- A 작업에서 QA의 기존 분기와 최대 2회 상한을 유지했다. 이후 Phase 6은 조율 질문을 QA 1회와 조율 1회로 처리한다. 별도 원문 대조 호출·새 wire schema·semantic 저장 속성은 도입하지 않았다.
 
 ### A.3 이번 수정의 검증·완료 기준
 
@@ -54,6 +54,8 @@ kind=decision, status=active, 일반 저장 승인, 자동 반영, GitHub 완료
 ## B. 후속 품질 고도화 설계 — 미착수
 
 아래 §1~12는 기존 Astra 설계의 원인 분석·문헌·데이터 계약·검증 계획을 보존한 후속 명세다. 요약 생성·검증 파이프라인 변경, QA 초안+LLM 대조 2회, 구조화 출력 확장, provenance 저장, 관계 반영 정책 변경, 대규모 독립 평가가 여기에 속한다. A의 완료 조건과 구분하며, 이번 구현·전체 회귀 통과를 B의 완료로 간주하지 않는다.
+
+2026-11-06 현재 Phase 6의 조율 질문은 QA 1회와 조율 1회를 이미 사용한다. B의 QA 원문 대조까지 같은 질문에 추가하면 2회 상한과 충돌한다. 두 기능의 통합 방식은 B 착수 시 별도로 결정하며, 아래 설계만으로 세 번째 호출을 허용하지 않는다.
 
 ### 1. 후속 설계의 최종 결정
 
@@ -437,8 +439,8 @@ if no usable content evidence/facts:             # scope metadata alone does not
 draft = call("qa", QaInputV2)                    # logical call 1
 validate shape, IDs and code-owned state rules
 if draft.intent == coordination:
-    return preparation notice + evidence-safe listing
-    # Phase 6 미구현. 검토되지 않은 자유 초안을 표시하지 않음
+    return existing Phase 6 coordination path     # logical call 2
+    # B의 별도 원문 대조와 함께 쓰는 방식은 미결정
 extra = validate_need(draft.need)                # local saved sources/known GitHub only
 review_input = pack(draft.claims, initial evidence + extra)
 if no reviewable claims:
@@ -454,7 +456,7 @@ return render(original accepted text, provenance, scope, unknowns)
 - verifier 실패·한도 초과·계약 위반이면 초안을 그대로 노출하지 않는다. 확인된 구조화 사실, 제한된 원문 인용, 조회 범위를 반환한다.
 - 두 번째 호출의 형식 오류를 재시도하지 않는다. 실패도 logical_calls에 포함한다.
 - 예상 변화: 실질적인 내용 답변은 기존 1회가 가능하던 경우도 2회가 된다. 이는 계획의 1회 기본 분기를 변경하는 명시적인 설계 결정이며 상한 2회는 유지한다.
-- 현재 Phase 6 분기는 준비 안내만 한다. 향후 조율 호출과 QA 검토를 모두 요구하면 총 3회가 되므로 별도 Phase 6 설계 결정이 필요하다. 이 명세는 그 추가 호출을 허용하지 않는다.
+- 현재 Phase 6 분기는 QA 1회와 조율 1회를 사용한다. 여기에 별도 QA 검토까지 더하면 총 3회가 되므로 B 착수 시 통합 설계 결정이 필요하다. 이 명세는 그 추가 호출을 허용하지 않는다.
 
 #### 6.2 추출·관계·산출물
 
@@ -485,7 +487,7 @@ return render(original accepted text, provenance, scope, unknowns)
 | 메뉴 1·2 | 메뉴 전체 0~1회 | 구조화 실패 후 코드 fallback. 2차 요약 금지 |
 | QA 근거 없음 | 0회 | 범위+미확인 |
 | QA 내용 답변 | 2회 이내 | 검토 불가 시 근거/미확인 fallback |
-| QA coordination(Phase 6 전) | 1회 이내 | 준비 안내. 조율 또는 3차 검토 없음 |
+| QA coordination(Phase 6) | QA 1회 + 조율 1회 | 조율의 need_method 무시. B 원문 대조를 추가하는 방법은 미결정 |
 
 Groq→Cerebras의 기존 429 전환은 동일 논리 호출의 공급자 재전송으로 계산하되 provider_attempts도 별도 기록한다. 성공한 답을 바꾸기 위한 재호출을 공급자 전환으로 숨기지 않는다. 두 공급자 모두 같은 기반 모델이면 독립 검증으로 계산하지 않는다.
 
@@ -649,6 +651,6 @@ DB 접근과 생성 호출은 현재 오케스트레이터가 소유한다. grou
 2. 새로운 앱 코드에 대한 단위·통합·관련 회귀와 §10의 의미 평가가 통과한다.
 3. 기존 사람 검토 20문항을 보존하고, 정정된 원문 기준으로 사람이 판정한다.
 4. 미충족 항목, 사람 판정 여부, 실행 서버 반영 여부, 설정·외부 연동 검증 범위를 각각 보고한다.
-5. 실제 DB 정정·서버 반영은 별도 승인 범위에서 수행한다. Phase 6 구현과 Git 푸시는 포함하지 않는다.
+5. 실제 DB 정정·서버 반영은 별도 승인 범위에서 수행한다. B에는 추가 조율 구현과 Git 푸시가 포함되지 않는다.
 
 B의 초기 설계 작성 때에는 구현·모델 평가를 수행하지 않았다. 이번 A 수정과 회귀 결과는 상단 범위 및 progress.md에서 관리하며, B의 의미 평가·사람 판정은 미완료다.
