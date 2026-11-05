@@ -63,9 +63,11 @@ import prompts  # noqa: E402
 import worklog_bridge  # noqa: E402
 from worklog import apply as wapply  # noqa: E402
 from worklog import explore as wexplore  # noqa: E402
+from worklog import leading as wleading  # noqa: E402
 from worklog import lineage as wlineage  # noqa: E402
 from worklog import parts as wparts  # noqa: E402
 from worklog import people  # noqa: E402
+from worklog import runs as wruns  # noqa: E402
 from worklog import stages as wstages  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
@@ -717,6 +719,8 @@ async def _run_menu(turn: Turn, raw_text: str) -> None:
             turn.status("🔍 진행상황을 확인하는 중...")
             reply_text, unassigned_issues = await fetch_team_status(config, turn.team_key, on_stage=turn.status)
             await turn.send(reply_text)
+            if "📎 근거" in reply_text:  # 새 브리핑: 줄마다 근거가 있다. 출처·이력과 고치기는 탭에서
+                await turn.send_buttons("출처·이력을 보고 고치려면 구조 보기를 열어 주세요.", [_board_button(turn)])
             if unassigned_issues:
                 await turn.send_buttons(*_claim_buttons(unassigned_issues), emphasis=True)
             return
@@ -966,7 +970,7 @@ async def _summarize_project_info(raw_text: str, on_chunk: Callable[[str], None]
         return None
     raw_text = _fit_for_groq(raw_text)
 
-    system_prompt = prompts.load("project-info").text
+    system_prompt = prompts.load("project-info-raw").text
     ready = [c for c in candidates if not llm_queue.cooling_down(c[0])] or candidates
     for provider, key in ready:
         full_text = ""
@@ -1063,7 +1067,7 @@ def _display_tz() -> tzinfo:
 async def _summarize_snapshot(team_key: str, snapshot: dict, on_chunk: Callable[[str], None] | None = None) -> str:
     """저장된 팀 정보 원문을 요약한다. 원문이 지난번과 같으면(해시 동일) Groq를 다시 부르지 않는다."""
     # 입력 원문과 지침의 판이 모두 같을 때만 캐시를 쓴다(지침 파일을 고치면 다시 요약)
-    content_hash = hashlib.sha256((snapshot["text"] + "\0" + prompts.load("project-info").version).encode("utf-8")).hexdigest()
+    content_hash = hashlib.sha256((snapshot["text"] + "\0" + prompts.load("project-info-raw").version).encode("utf-8")).hexdigest()
     cached = _project_summary_cache.get(team_key)
     if cached and cached["hash"] == content_hash:
         if on_chunk:
@@ -1150,6 +1154,11 @@ async def fetch_project_info(
         return text
     if on_stage:
         on_stage("🧠 요약 정리하는 중...")
+    led = await _lead_project(team_key, snapshot["text"])  # 산출물 문서가 있으면 문서 요약+팀 정보로(문단마다 출처). 없거나 실패하면 아래 예전 방식
+    if led:
+        if on_chunk:
+            on_chunk(led)
+        return led
     summary = await _summarize_snapshot(team_key, snapshot, on_chunk)
     docs = _document_lines(await asyncio.to_thread(wparts.documents, worklog_bridge.WORKLOG_STORE, team_key))
     if docs and on_chunk:
@@ -1158,6 +1167,75 @@ async def fetch_project_info(
     if as_of and on_chunk:
         on_chunk(f"\n\n(Notion 기준 {as_of})")
     return "\n\n".join(filter(None, [summary, "\n".join(docs)]))
+
+
+_lead_usage: dict[tuple[str, str], dict] = {}  # (팀, 메뉴) → 마지막 호출의 토큰 사용량(입력·출력). 로그에도 남는다
+
+
+def _lead_cached(team_key: str, menu: str, digest: str) -> dict | None:
+    """메뉴 1·2 모델 답 캐시(재시작해도 남도록 runs에 저장). 입력 지문과 지침 판이 같을 때만 쓴다."""
+    row = wruns.get(worklog_bridge.WORKLOG_STORE, wruns.key_for("lead", team_key, menu))
+    if row and row["status"] == "succeeded" and row["result_json"]:
+        saved = json.loads(row["result_json"])
+        if saved.get("hash") == digest:
+            return saved["answer"]
+    return None
+
+
+def _lead_save(team_key: str, menu: str, digest: str, answer: dict, usage: dict, model: str) -> None:
+    wruns.put(worklog_bridge.WORKLOG_STORE, wruns.key_for("lead", team_key, menu), "lead", "succeeded",
+              result={"hash": digest, "answer": answer, "usage": usage, "model": model})
+    _lead_usage[(team_key, menu)] = {"input": int(usage.get("prompt_tokens") or 0), "output": int(usage.get("completion_tokens") or 0)}
+    logging.getLogger("worklog").info("lead menu=%s team=%s model=%s tokens_in=%s tokens_out=%s", menu, team_key, model,
+                                      usage.get("prompt_tokens"), usage.get("completion_tokens"))
+
+
+def _lead_digest(payload: dict, prompt_name: str) -> str:
+    return hashlib.sha256((json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\0" + prompts.load(prompt_name).version).encode("utf-8")).hexdigest()
+
+
+async def _lead_project(team_key: str, team_text: str) -> str | None:
+    """메뉴 1 새 방식. 산출물 문서가 없거나 모델 호출·검증이 실패하면 None(예전 팀 정보 요약으로 대체). 같은 입력이면 모델을 다시 부르지 않는다."""
+    try:
+        built = await asyncio.to_thread(wleading.project_input, worklog_bridge.WORKLOG_STORE, team_key, team_text)
+        if built is None:
+            return None
+        digest = _lead_digest(built["payload"], "project-info")
+        answer = await asyncio.to_thread(_lead_cached, team_key, "menu1", digest)
+        if answer is None:
+            answer, usage, model = await asyncio.to_thread(worklog_bridge.lead_call, "project-info", built["payload"])
+            text = wleading.render_project(answer, built["refs"])  # 검증이 실패하면 저장하지 않는다
+            await asyncio.to_thread(_lead_save, team_key, "menu1", digest, answer, usage, model)
+            return text
+        return wleading.render_project(answer, built["refs"])
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+async def _lead_status(team_key: str, issue_states: dict[int, str], commit_touched: set[int], tasks: dict[str, list[str]]) -> str | None:
+    """메뉴 2 새 방식(결정됨 / 진행 중 / 불명확 + 근거). 항목이 없거나 모델 호출·검증이 실패하면 None(예전 목록형으로 대체)."""
+    try:
+        store = worklog_bridge.WORKLOG_STORE
+        live_tasks = [t for t in wapply.live_items(store, team_key).get("task", []) if t.get("assignee")]
+        by_text = {f"{t['assignee']}: {t['title']}": t["id"] for t in live_tasks}
+        task_states = {by_text[text]: key for key, texts in tasks.items() for text in texts if text in by_text}  # 기존 분류 결과 그대로
+        built = await asyncio.to_thread(wleading.briefing_items, store, team_key, issue_states, commit_touched, task_states)
+        if not built["aliased"]:
+            return None
+        docs = (await asyncio.to_thread(wleading.project_docs, store, team_key, 800))["docs"]
+        payload = wleading.fit_payload(built, docs)
+        digest = _lead_digest(payload, "project-leading")
+        answer = await asyncio.to_thread(_lead_cached, team_key, "menu2", digest)
+        if answer is None:
+            answer, usage, model = await asyncio.to_thread(worklog_bridge.lead_call, "project-leading", payload)
+            text = wleading.render_briefing(answer, built)
+            await asyncio.to_thread(_lead_save, team_key, "menu2", digest, answer, usage, model)
+            return text
+        return wleading.render_briefing(answer, built)
+    except Exception:
+        traceback.print_exc()
+        return None
 
 
 def _document_lines(docs: list[dict]) -> list[str]:
@@ -1383,6 +1461,17 @@ async def fetch_team_status(config: dict, team_key: str,
 
     commit_touched = await _get_commit_touched_issues(repo, github_token)
     tasks = _classify_tasks_by_github_state(confirmed, issue_state_by_number, commit_touched)
+    if on_stage:
+        on_stage("🧠 최근 회의와 문서를 종합하는 중...")
+    briefing = await _lead_status(team_key, issue_state_by_number, commit_touched, tasks)
+    if briefing:  # 새 방식: 구역·성숙도·GitHub 상태·근거는 코드가 저장본에서 정했다. 단계는 한 줄 참고
+        head = ["👥 팀 진행상황 (회의록·문서 종합)"]
+        if stored["board"]["candidate"]:
+            board_ = stored["board"]
+            stage_line = (f"확정 {wstages.label(board_['stage'])}" if board_["approved"]
+                          else f"AI 추정 {wstages.label(board_['candidate'])} (확정 전)")
+            head += ["", f"🧭 현재 단계(참고): {stage_line}"]
+        return chr(10).join(head + ["", briefing] + unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer), unassigned_open
 
     # 6개 분류(spec P2-7): 현재 단계 / 확정된 흐름 / 지금 진행 중 / 이전 단계에서 남은 것 / 추가 논의 필요 / 천천히 정해도 되는 것
     board = stored["board"]

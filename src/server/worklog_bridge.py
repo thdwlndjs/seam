@@ -209,6 +209,17 @@ def groq_extract_part(payload: dict, priority: int = llm_queue.BACKGROUND) -> di
     return {"items": items, "artifact": data.get("artifact"), "usage": usage, "model": label}
 
 
+def lead_call(prompt_name: str, payload: dict) -> tuple[dict, dict, str]:
+    """프로젝트 리딩(메뉴 1·2) 호출: 사람이 기다리는 호출(순위 1)이라 대기열이 막지 않는다. (답, usage, "공급자:모델").
+    답이 JSON 객체가 아니면 ContractError. LLM 키가 없으면 llm_queue.Busy가 아니라 RuntimeError(호출부가 대체 표시로 넘어간다)."""
+    if not (GROQ_API_KEY or llm_ready()):
+        raise RuntimeError("LLM 키가 없어요")
+    data, usage, label = _llm_call(prompts.load(prompt_name).text, payload, llm_queue.USER)
+    if not isinstance(data, dict):
+        raise worklog.ContractError(f"{prompt_name} 답이 JSON 객체가 아님")
+    return data, usage, label
+
+
 def groq_explore(payload: dict, priority: int = llm_queue.BACKGROUND) -> dict:
     """해석할 문서 영역을 고른다(v2.1 Phase 2). {"read": [{"area_id", "reason"}], "usage", "model"}. LLM 키가 없으면 빈 dict."""
     if not (GROQ_API_KEY or llm_ready()):

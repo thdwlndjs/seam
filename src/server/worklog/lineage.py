@@ -60,7 +60,7 @@ def sync_artifacts(store: Path, scope: str, prompt_version: str) -> dict[str, in
                 found.append((part, artifact))
         if not found:
             continue
-        title = (catalog.get(page_id) or {}).get("title") or found[0][0]["path"].split(" > ")[0]
+        title = (catalog.get(page_id) or {}).get("title") or sections.page_title(page_parts)
         lines = [f"- {part['path'].rsplit(' > ', 1)[-1]}: {artifact['summary']}" for part, artifact in found]
         statement = _statement(page_id, title, lines)
         part_ids = sorted(p["id"] for p, _ in found)
@@ -71,10 +71,14 @@ def sync_artifacts(store: Path, scope: str, prompt_version: str) -> dict[str, in
             existing = next((r for r in c.execute("SELECT * FROM work_items WHERE scope = ? AND kind = 'artifact'", (scope,))
                              if _attributes(r).get("page_id") == page_id), None)
             ts = db.now()
+            def unique_name(own_id: str | None) -> str:
+                clash = c.execute("""SELECT 1 FROM work_items WHERE scope = ? AND kind = 'artifact' AND normalized_title = ?
+                                     AND id != ? AND status NOT IN ('superseded', 'reverted', 'cancelled', 'resolved')""",
+                                  (scope, db.normalize_text(title), own_id or "")).fetchone()
+                return f"{title} ({page_id[:8]})" if clash else title
+
             if existing is None:
-                clash = c.execute("SELECT 1 FROM work_items WHERE scope = ? AND kind = 'artifact' AND normalized_title = ?",
-                                  (scope, db.normalize_text(title))).fetchone()
-                name = f"{title} ({page_id[:8]})" if clash else title
+                name = unique_name(None)
                 proposal = {"title": name, "statement": statement, "artifact_type": kind, "summary": found[0][1]["summary"],
                             "maturity": maturity}
                 item_id = core._create_item(c, scope, "artifact", proposal, "해석한 문서의 산출물", AUTO_ACTOR, ts)
@@ -98,10 +102,13 @@ def sync_artifacts(store: Path, scope: str, prompt_version: str) -> dict[str, in
                 attributes = _attributes(existing)
                 changed = {k: v for k, v in {"part_ids": part_ids, "artifact_type": kind, "maturity": maturity,
                                              "summary": found[0][1]["summary"]}.items() if v and attributes.get(k) != v}
-                if changed or existing["statement_md"] != statement:
+                name = unique_name(item_id)  # 예전에 루트 이름으로 붙은 제목도 페이지 제목으로 바로잡는다(사람이 고친 것은 위에서 건너뜀)
+                update = {"statement_md": statement, "attributes_json": attributes}
+                if name != existing["title"]:
+                    update.update(title=name, normalized_title=db.normalize_text(name))
+                if changed or existing["statement_md"] != statement or "title" in update:
                     attributes.update(changed)
-                    core._write_item(c, item_id, {"statement_md": statement, "attributes_json": attributes},
-                                     "문서를 다시 해석해 산출물 갱신", AUTO_ACTOR, ts)
+                    core._write_item(c, item_id, update, "문서를 다시 해석해 산출물 갱신", AUTO_ACTOR, ts)
                     stats["updated"] += 1
             stats["linked"] += _link_derived(c, scope, item_id, set(part_ids), ts)
     return stats

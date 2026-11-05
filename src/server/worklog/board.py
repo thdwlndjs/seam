@@ -55,7 +55,7 @@ def _sources(c: Any, scope: str) -> dict[str, dict[str, Any]]:
         locator = f"{row['origin']}:{row['page_id']}"
         page_path = page_paths.get(row["page_id"], row["path"])
         out[row["id"]] = {"part_id": row["id"], "page_id": row["page_id"], "origin": row["origin"], "path": row["path"],
-                          "title": page_path.split(" > ")[-1], "part_kind": row["kind"],
+                          "page_path": page_path, "title": page_path.split(" > ")[-1], "part_kind": row["kind"],
                           "date": _page_date(contents.get(locator), row["last_edited"]),
                           "url": _notion_url(row["page_id"], row["origin"])}
     return out

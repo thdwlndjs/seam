@@ -57,7 +57,7 @@ class Base(unittest.TestCase):
     def add_page(self, page_id: str, md: str, kind: str, title: str = "페이지", edited: str = EDITED) -> list[dict]:
         core.record(self.store, scope=SCOPE, kind="notion_record", conversation_key="notion:sec", locator=f"notion:{page_id}",
                     text=parts.md_to_text(md), sent_at=edited)
-        built = parts.build_unit_parts(page_id, f"{title} > 본문", md, None)
+        built = parts.build_unit_parts(page_id, title, md, None)
         parts.save_unit_parts(self.store, SCOPE, "notion", page_id, "sec", built, last_edited=edited)
         found = parts.list_parts(self.store, SCOPE, page_id=page_id)
         for part in found:
@@ -212,7 +212,7 @@ class ExploreTests(Base):
 
     def test_catalog_has_no_bodies(self) -> None:
         source = sections.catalog(self.store, SCOPE)[0]
-        self.assertEqual({"source_id", "title", "edited", "fingerprint", "areas"}, set(source))
+        self.assertEqual({"source_id", "title", "path", "edited", "fingerprint", "areas"}, set(source))
         self.assertTrue(all(set(a) == {"area_id", "title", "chars", "summary"} for a in source["areas"]))
 
 

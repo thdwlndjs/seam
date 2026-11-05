@@ -379,6 +379,20 @@ CATALOG_SUMMARY_CHARS = 120
 RECENT_MEETING_ITEMS = 15
 
 
+def page_path(rows: list[dict[str, Any]]) -> str:
+    """한 페이지(행)의 위치 경로. 부분 경로는 "루트 > … > 페이지 제목 > 부분 제목"이라서, 그 페이지의 가장 짧은 최상위 부분
+    경로에서 마지막 마디(부분 제목)를 뗀 것이 페이지 경로다."""
+    tops = [r["path"] for r in rows if r.get("parent_part_id") is None and " > " in r["path"]]
+    if tops:
+        return min(tops, key=len).rsplit(" > ", 1)[0]
+    return rows[0]["path"] if rows else ""
+
+
+def page_title(rows: list[dict[str, Any]]) -> str:
+    """페이지 제목 = 페이지 경로의 마지막 마디. (경로의 첫 마디는 루트 이름이라 모든 페이지에서 같다.)"""
+    return page_path(rows).split(" > ")[-1]
+
+
 def catalog(store: Path, scope: str, include_all: bool = False) -> list[dict[str, Any]]:
     """탐색(explore)에 보여 줄 소스(페이지) 목록. 본문은 넣지 않는다: 제목·수정일·부분(영역) 제목·길이·한 줄 설명만.
     영역은 문서(document) 부분만이다(회의 메모는 항상 해석하고, 링크는 해석하지 않는다).
@@ -402,8 +416,7 @@ def catalog(store: Path, scope: str, include_all: bool = False) -> list[dict[str
         if not areas and not include_all:
             continue
         info = titles.get(page_id, {})
-        top = [r for r in page_rows if r["parent_part_id"] is None]
-        out.append({"source_id": page_id, "title": (info.get("path") or (top[0]["path"] if top else "")).split(" > ")[0],
+        out.append({"source_id": page_id, "title": page_title(page_rows), "path": page_path(page_rows),
                     "edited": (max((r["last_edited"] or "" for r in page_rows), default="") or info.get("last_edited") or "")[:10],
                     "fingerprint": parts_mod.structure_fingerprint(page_rows), "areas": areas})
     out.sort(key=lambda s: s["edited"], reverse=True)

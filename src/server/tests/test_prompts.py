@@ -98,7 +98,9 @@ class ShippedPromptTests(unittest.TestCase):
         self.assertEqual(prompts.load("interpret").version, "part-extract-5")  # 해석 계약이 바뀌어 판을 올렸다(v2.1 Phase 2)
         self.assertEqual(prompts.load("reconcile").version, "reconcile-2")
         self.assertEqual(prompts.load("explore").version, "explore-1")
-        self.assertEqual(prompts.load("project-info").version, "project-info-1")
+        self.assertEqual(prompts.load("project-info-raw").version, "project-info-1")  # 예전 요약(산출물 문서가 없을 때)은 그대로
+        self.assertEqual(prompts.load("project-info").version, "project-info-2")
+        self.assertEqual(prompts.load("project-leading").version, "project-leading-1")
         self.assertEqual(worklog_bridge.EXTRACT_PROMPT_VERSION, prompts.load("interpret").version)
 
     def test_moved_prompts_say_what_they_said_before(self) -> None:
@@ -110,7 +112,10 @@ class ShippedPromptTests(unittest.TestCase):
         self.assertTrue(reconcile.startswith("너는 새 기록에서 나온 항목(item)을 기존 항목 목록(related)과 비교하는 판정기야."))
         for relation in ("alternative", "resolving", "decidable"):
             self.assertIn(relation, reconcile)
-        self.assertTrue(prompts.load("project-info").text.startswith("너는 팀 소개/프로젝트 정보 페이지 원문을"))
+        self.assertTrue(prompts.load("project-info-raw").text.startswith("너는 팀 소개/프로젝트 정보 페이지 원문을"))
+        leading = prompts.load("project-leading").text
+        for needle in ("검증 완료", "추정", "lines", "overview"):
+            self.assertIn(needle, leading)
 
     def test_common_guidelines_load(self) -> None:
         for name in ("common/evidence", "common/states", "common/output-json"):
