@@ -126,6 +126,29 @@ button:disabled { cursor: default; opacity: .55; }
 .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.2); max-width: calc(100% - 32px); z-index: 20; }
 .toast[hidden] { display: none; }
 .scrim { display: none; }
+.mat { font-size: 12px; padding: 1px 8px; border-radius: 999px; white-space: nowrap; flex-shrink: 0; border: 1px solid var(--line); background: var(--panel); color: var(--muted); }
+.mat-agreed { background: var(--green-soft); color: var(--green); border-color: transparent; }
+.mat-discussed { background: var(--blue-soft); color: var(--blue); border-color: transparent; }
+.mat-recommended { background: var(--violet-soft); color: var(--violet); border-color: transparent; }
+.mat-draft { background: var(--amber-soft); color: var(--amber); border-color: transparent; }
+.flag { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--red-soft); color: var(--red); white-space: nowrap; flex-shrink: 0; }
+.flag.soft { background: var(--bg); color: var(--muted); }
+.md { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--bg); overflow-wrap: anywhere; }
+.md h4, .md h5 { margin: 8px 0 4px; font-size: 14px; }
+.md p { margin: 4px 0; }
+.md ul, .md ol { margin: 4px 0; padding-left: 20px; }
+.md a { color: var(--brand-strong); }
+.rel { list-style: none; margin: 0; padding: 0; }
+.rel li { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.rel li:last-child { border-bottom: none; }
+.rel .kindname { color: var(--muted); font-size: 12.5px; flex-shrink: 0; min-width: 78px; }
+.rel a { cursor: pointer; color: var(--brand-strong); }
+.rel .gone, .row .gone { color: var(--muted); text-decoration: line-through; }
+.note { color: var(--muted); font-size: 12.5px; margin: 4px 0 0; }
+.note.warn { color: var(--amber); }
+.panel > .note { margin: 0 0 12px; }
+details.fold > summary { cursor: pointer; padding: 12px 14px; font-weight: 600; }
+details.fold[open] > summary { padding-bottom: 6px; }
 .stage button.pill { cursor: pointer; font: inherit; font-weight: 600; color: inherit; }
 .stage button.pill:hover { background: var(--brand-soft); }
 dialog.stages { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text); padding: 18px 20px; width: min(520px, calc(100% - 32px)); box-shadow: 0 8px 32px rgba(0,0,0,.25); }
@@ -169,7 +192,13 @@ const ICON = {
   doc: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg>',
   chev: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>',
 };
-const S = { token: null, data: null, kind: "all", source: "", q: "", selected: null, saving: false };
+const S = { token: null, data: null, kind: "all", source: "", q: "", hits: null, selected: null, saving: false };
+const REL = {  // 관계 종류 → [이 항목이 시작일 때, 이 항목이 대상일 때]
+  SUPERSEDES: ["이 항목이 대체함", "이 항목을 대체한 결정"], RESOLVES: ["이 항목이 해결함", "이 미정을 해결한 항목"],
+  ALTERNATIVE_TO: ["이 항목의 대상 결정(이 항목은 대안)", "이 결정의 대안"], DERIVED_FROM: ["이 항목이 나온 문서", "이 문서에서 나온 항목"],
+  AFFECTS: ["영향을 주는 대상", "영향을 받음"], RELATED_TO: ["관련·충돌 가능", "관련·충돌 가능"],
+};
+const STATUS_TEXT = { superseded: "대체됨", reverted: "되돌림", cancelled: "삭제됨", resolved: "해결됨", needs_discussion: "확인 필요" };
 
 // ── 작은 DOM 도우미: 회의록 내용은 모두 textContent로 넣는다 ──
 function h(tag, attrs, ...kids) {
@@ -228,9 +257,12 @@ async function api(path, body) {
   if (!res.ok) throw new Error(payload.detail || "요청을 처리하지 못했어요 (" + res.status + ")");
   return payload;
 }
+function findItem(id) {
+  return S.data.items.find((x) => x.id === id) || S.data.artifacts.find((x) => x.id === id) || S.data.deleted.find((x) => x.id === id);
+}
 async function load() {
   S.data = await api("/api/board");
-  if (S.selected && !S.data.items.some((i) => i.id === S.selected)) S.selected = null;
+  if (S.selected && !findItem(S.selected)) S.selected = null;
   render();
 }
 async function act(fn, done) {
@@ -242,12 +274,41 @@ async function act(fn, done) {
 }
 
 // ── 화면 ──
-function visible() {
+function matches(i) {  // 검색어: 서버 검색(색인) 결과가 있으면 그것을, 없으면(서버 검색 실패) 화면 안에서 찾는다
   const q = S.q.trim().toLowerCase();
+  if (!q) return true;
+  if (S.hits) return S.hits.has(i.id);
+  return (i.title + " " + i.statement + " " + (i.assignee || "")).toLowerCase().includes(q);
+}
+function visible() {
   return S.data.items.filter((i) =>
     (S.kind === "all" || i.kind === S.kind) &&
-    (!S.source || i.sources.some((s) => (s.page_id || s.part_id) === S.source)) &&
-    (!q || (i.title + " " + i.statement + " " + (i.assignee || "")).toLowerCase().includes(q)));
+    (!S.source || i.sources.some((s) => (s.page_id || s.part_id) === S.source)) && matches(i));
+}
+function visibleArtifacts() {
+  return S.data.artifacts.filter((a) => (S.kind === "all" || S.kind === "artifact") &&
+    (!S.source || a.sources.some((s) => (s.page_id || s.part_id) === S.source)) && matches(a));
+}
+let searchTimer, searchSeq = 0;
+function runSearch() {  // 입력이 멎으면 서버 검색(색인)을 부른다. 삭제·대체된 항목은 서버가 뺀다
+  clearTimeout(searchTimer);
+  const q = S.q.trim();
+  if (!q) { S.hits = null; refocusSearch(true); return; }
+  searchTimer = setTimeout(async () => {
+    const mine = ++searchSeq;
+    try {
+      const found = await api("/api/board/search?q=" + encodeURIComponent(q));
+      if (mine === searchSeq) S.hits = new Set(found.ids);
+    } catch (e) { if (mine === searchSeq) S.hits = null; }
+    if (mine === searchSeq) refocusSearch(true);
+  }, 250);
+}
+function refocusSearch(rerender) {
+  const input = document.querySelector('input[type="search"]');
+  const pos = input ? input.selectionStart : 0, had = input && document.activeElement === input;
+  if (rerender) render();
+  const el = document.querySelector('input[type="search"]');
+  if (el && had) { el.focus(); el.setSelectionRange(pos, pos); }
 }
 function render() {
   const d = S.data, root = document.getElementById("app");
@@ -264,7 +325,7 @@ function banner(d) {
   return el;
 }
 function toolbar(d) {
-  const counts = { all: d.items.length };
+  const counts = { all: d.items.length + d.artifacts.length, artifact: d.artifacts.length };
   for (const i of d.items) counts[i.kind] = (counts[i.kind] || 0) + 1;
   const chip = (kind, label) => h("button", { class: "chip", "aria-pressed": String(S.kind === kind),
     onclick: () => { S.kind = kind; render(); } }, label, h("span", { class: "n" }, counts[kind] || 0));
@@ -275,26 +336,37 @@ function toolbar(d) {
   return h("div", { class: "toolbar" },
     h("div", { class: "stage" }, "현재 단계", stage),
     h("div", { class: "chips", role: "group", "aria-label": "종류 필터" },
-      chip("all", "전체"), ...Object.entries(d.kinds).map(([k, v]) => chip(k, v))));
+      chip("all", "전체"), chip("artifact", "산출물 문서"), ...Object.entries(d.kinds).map(([k, v]) => chip(k, v))));
 }
 function filters(d) {
   const select = h("select", { id: "src", onchange: (e) => { S.source = e.target.value; render(); } },
     h("option", { value: "" }, "전체 출처"),
     ...d.sources.map((s) => h("option", { value: s.page_id, selected: S.source === s.page_id }, `${s.title}${s.date ? " (" + day(s.date) + ")" : ""}`)));
-  const search = h("input", { type: "search", placeholder: "키워드로 검색해요", value: S.q, "aria-label": "검색",
-    oninput: (e) => { S.q = e.target.value; const pos = e.target.selectionStart; render(); const el = document.querySelector('input[type="search"]'); el.focus(); el.setSelectionRange(pos, pos); } });
+  const search = h("input", { type: "search", placeholder: "키워드로 검색해요(저장된 지식 전체)", value: S.q, "aria-label": "검색",
+    oninput: (e) => { S.q = e.target.value; S.hits = null; runSearch(); } });
   return h("div", { class: "filters" }, h("label", { for: "src" }, "출처 필터"), select, search);
 }
 function sourceTag(i) {
   const s = i.sources[i.sources.length - 1];
   return s ? h("span", { class: "tag", title: s.path }, s.title.length > 14 ? s.title.slice(0, 13) + "…" : s.title) : "";
 }
+function matTag(i) {
+  return i.maturity ? h("span", { class: "mat mat-" + i.maturity, title: "성숙도" }, S.data.maturity[i.maturity]) : "";
+}
+function flags(i) {
+  return [i.conflict && i.status !== "needs_discussion" ? h("span", { class: "flag", title: "서로 다른 내용이 연결돼 있어요" }, "충돌") : "",
+    i.source_missing ? h("span", { class: "flag", title: "원문이 사라졌거나 옮겨진 곳을 찾지 못했어요" }, "출처 없음") : "",
+    i.human_edited ? h("span", { class: "flag soft", title: "사람이 고친 항목이라 다시 수집해도 덮어쓰지 않아요" }, "✎ 사람 수정") : ""];
+}
 function row(i, extra) {
+  const sub = i.kind === "task" ? h("span", { class: "sub" }, i.assignee ? "담당 " + i.assignee : "담당 미정")
+    : i.kind === "artifact" ? h("span", { class: "sub" }, (i.artifact_type || "문서") + (i.date ? " · " + day(i.date) : "") + (i.derived ? " · 연결 " + i.derived.length + "건" : "")) : "";
   return h("li", { class: "row", role: "option", "aria-selected": String(S.selected === i.id), tabindex: "0",
       onclick: () => select(i.id), onkeydown: (e) => { if (e.key === "Enter") select(i.id); } },
     h("span", { class: "doc", html: ICON.doc }),
-    h("span", { class: "title" }, i.title, i.kind === "task" ? h("span", { class: "sub" }, i.assignee ? "담당 " + i.assignee : "담당 미정") : ""),
-    extra || sourceTag(i),
+    h("span", { class: "title" }, i.title, sub),
+    matTag(i), flags(i),
+    extra || (i.kind === "artifact" ? "" : sourceTag(i)),
     h("span", { class: "doc", html: ICON.chev }));
 }
 function section(tone, icon, title, list, desc, body) {
@@ -317,22 +389,47 @@ function sections(d) {
   const pending = by((i) => i.status === "needs_discussion");
   const live = (k) => by((i) => i.kind === k && i.status !== "needs_discussion");
   if (pending.length) col.append(section("amber", ICON.alert, "확인 필요", pending.map((i) => row(i, answers(i))),
-    "회의록끼리 판단이 갈렸거나 확신이 낮은 것이에요. 확정·미정·무시 중 하나를 골라 주세요."));
+    "중요한 결정끼리 충돌해 스스로 판단하지 못했거나, 사람이 고친 항목과 부딪친 것이에요. 확정·미정·무시 중 하나를 골라 주세요."));
+  const docs = visibleArtifacts();
+  if (S.kind === "artifact" || (S.kind === "all" && docs.length))
+    col.append(section("violet", ICON.doc, "산출물 문서", docs.map((a) => row(a)), "문서마다 요약과 연결된 지식 항목을 보여요. 요약을 고치면 검색과 이후 판단에 바로 쓰여요."));
   if (S.kind === "all" || S.kind === "decision") col.append(section("green", ICON.check, "최종 결정", live("decision").map((i) => row(i))));
   if (S.kind === "all" || S.kind === "decision") col.append(changes(d));
+  if (S.kind === "requirement" || (S.kind === "all" && live("requirement").length))
+    col.append(section("green", ICON.list, "요구사항", live("requirement").map((i) => row(i))));
   if (S.kind === "all" || S.kind === "open") col.append(section("blue", ICON.question, "남은 쟁점·미정", live("open").map((i) => row(i))));
+  if (S.kind === "hypothesis" || (S.kind === "all" && live("hypothesis").length))
+    col.append(section("blue", ICON.question, "가설", live("hypothesis").map((i) => row(i))));
   for (const k of ["task", "insight", "feedback"]) {
     if (S.kind === "all" || S.kind === k) {
       const list = live(k);
       if (list.length || S.kind === k) col.append(section("gray", ICON.list, d.kinds[k], list.map((i) => row(i))));
     }
   }
+  const gone = d.deleted.filter((i) => matchesDeleted(i));
+  if (S.kind === "all" && gone.length) col.append(deletedSection(gone));
   if (!col.children.length) col.append(h("div", { class: "card empty-sec" }, "조건에 맞는 항목이 없어요."));
   return col;
 }
+function matchesDeleted(i) {  // 삭제된 항목은 서버 검색에서 빠지므로 화면 안에서만 찾는다
+  const q = S.q.trim().toLowerCase();
+  return !q || (i.title + " " + i.statement).toLowerCase().includes(q);
+}
+function deletedSection(list) {
+  const rows = list.map((i) => h("li", { class: "row", role: "option", "aria-selected": String(S.selected === i.id), tabindex: "0",
+      onclick: () => select(i.id), onkeydown: (e) => { if (e.key === "Enter") select(i.id); } },
+    h("span", { class: "doc", html: ICON.doc }), h("span", { class: "title gone" }, i.title, h("span", { class: "sub" }, i.kind_label + " · " + day(i.deleted_at) + " 삭제")),
+    S.data.viewer.can_edit ? h("button", { class: "btn small", onclick: (e) => { e.stopPropagation(); restoreItem(i); } }, "↩ 복원") : ""));
+  return h("details", { class: "card fold t-gray", "aria-label": "삭제한 항목" },
+    h("summary", {}, `삭제한 항목 (${list.length})`), h("div", { class: "sec-desc" }, "검색·리딩·질문에서 빠져 있어요. 복원하면 돌아오고 이력에 남아요."),
+    h("ul", { class: "rows", role: "listbox", "aria-label": "삭제한 항목" }, rows));
+}
+function restoreItem(i) {
+  act(() => api(`/api/board/items/${i.id}/restore`, {}), "복원했어요");
+}
 function changes(d) {
   const ids = new Set(visible().map((i) => i.id));
-  const list = d.changes.filter((c) => !S.q && !S.source ? true : ids.has(c.new.id));
+  const list = d.changes.filter((c) => !S.q.trim() && !S.source ? true : ids.has(c.new.id));
   const el = list.length ? h("div", { class: "rows" }, list.map((c) => h("div", { class: "change" },
     h("div", { class: "flow" }, h("span", { class: "old" }, c.old.title), h("span", { class: "arrow", "aria-label": "에서" }, "→"),
       h("a", { onclick: () => select(c.new.id), tabindex: "0", onkeydown: (e) => { if (e.key === "Enter") select(c.new.id); } }, c.new.title)),
@@ -351,43 +448,119 @@ function select(id) {
 function closePanel() {
   S.selected = null; render(); document.getElementById("scrim").classList.remove("open");
 }
-const REASONS = [[/확인 반영|confirmed|approve/i, "회의록에서 반영"], [/^구조 화면에서 고침$/, "고침"], [/되돌림/, "되돌림"]];
+const REASONS = [[/확인 반영|confirmed|approve/i, "회의록에서 반영"], [/^구조 화면에서 고침$/, "고침"], [/복원/, "복원"],
+  [/반영 취소/, "삭제"], [/되돌림/, "되돌림"], [/출처 이동/, "출처 이동"], [/출처 없음/, "출처 없음 표시"], [/산출물/, "문서 해석"]];
 function reasonText(r) { for (const [re, text] of REASONS) if (re.test(r)) return text; return r; }
+
+// ── 안전한 Markdown 보기: 줄 단위로 DOM을 만들고 모든 글은 textContent로 넣는다(HTML 삽입 없음, 링크는 http(s)만) ──
+function inline(text) {
+  const out = [], re = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s)]+)|\*\*([^*]+)\*\*/g;
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m[4]) out.push(h("b", {}, m[4]));
+    else { const url = m[2] || m[3]; out.push(h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, m[1] || url)); }
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+function mdView(text) {
+  const root = h("div", { class: "md" });
+  let list = null;
+  for (const raw of (text || "").split("\n")) {
+    const line = raw.replace(/\s+$/, "");
+    const bullet = /^\s*(?:[-*]|\d+\.)\s+(.*)$/.exec(line), head = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (bullet) {
+      if (!list) { list = h("ul", {}); root.append(list); }
+      list.append(h("li", {}, inline(bullet[1])));
+      continue;
+    }
+    list = null;
+    if (head) root.append(h(head[1].length <= 2 ? "h4" : "h5", {}, inline(head[2])));
+    else if (line.trim()) root.append(h("p", {}, inline(line)));
+  }
+  if (!root.children.length) root.append(h("p", { class: "note" }, "내용이 없어요"));
+  return root;
+}
+
+function relations(i) {
+  if (!i.links.length) return h("div", { class: "date" }, "연결된 항목이 없어요");
+  return h("ul", { class: "rel" }, i.links.map((l) => {
+    const known = findItem(l.other.id);
+    const name = (REL[l.type] || [l.type, l.type])[l.direction === "out" ? 0 : 1];
+    const state = STATUS_TEXT[l.other.status];
+    return h("li", {}, h("span", { class: "kindname" }, name),
+      known ? h("a", { tabindex: "0", onclick: () => select(l.other.id), onkeydown: (e) => { if (e.key === "Enter") select(l.other.id); } }, l.other.title)
+        : h("span", { class: state ? "gone" : "" }, l.other.title),
+      state ? h("span", { class: "tag" }, state) : "");
+  }));
+}
+function githubLine(i) {
+  if (!i.github.length) return "";
+  return h("div", { class: "field" }, h("span", { class: "label" }, "GitHub 연결"),
+    h("ul", { class: "rel" }, i.github.map((g) => h("li", {}, h("span", { class: "kindname" }, g.basis === "explicit" ? "명시" : "추정"),
+      `${g.type === "pr" ? "PR" : "이슈"} #${g.number}`))),
+    i.github.some((g) => g.basis !== "explicit") ? h("p", { class: "note" }, "추정은 내용이 비슷해서 이어 본 것이에요. 확인되지 않았어요.") : "");
+}
+function historyList(i) {
+  return h("ol", { class: "hist" }, i.history.map((r) => h("li", {}, h("span", { class: "when" }, day(r.at)),
+    reasonText(r.reason), r.title && r.title !== i.title ? ` · “${r.title}”` : "", " ",
+    r.by_human ? h("span", { class: "flag soft" }, "사람 수정") : "", " ", h("span", { class: "who" }, r.actor))));
+}
+function sourcesView(i) {
+  return h("div", { class: "field" }, h("span", { class: "label" }, "출처"),
+    i.source_missing ? h("p", { class: "note warn" }, "원문이 사라졌거나 옮겨진 곳을 찾지 못했어요. 항목은 지우지 않았어요.") : "",
+    i.sources.length ? i.sources.map((s, n) => h("div", { class: "src" },
+      h("div", { class: "head" }, h("span", { html: ICON.doc }), s.title, s.date ? h("span", { class: "date" }, "(" + day(s.date) + ")") : ""),
+      (i.quotes[n] || (n === i.sources.length - 1 && i.quotes[0])) ? h("blockquote", {}, "“" + (i.quotes[n] || i.quotes[0]) + "”") : "",
+      s.url ? h("a", { href: s.url, target: "_blank", rel: "noopener" }, "Notion 원문 열기 ↗") : h("span", { class: "date" }, s.path)))
+      : h("div", { class: "date" }, "출처 기록이 없어요"));
+}
 function panel(d) {
-  const i = d.items.find((x) => x.id === S.selected);
+  const i = findItem(S.selected);
   const el = h("aside", { class: "card panel" + (i ? " open" : ""), id: "panel", "aria-label": "항목 수정" });
   if (!i) {
     el.append(h("h3", {}, "항목 수정"), h("div", { class: "placeholder" }, "왼쪽에서 항목을 고르면 출처와 이력을 보고 고칠 수 있어요."));
     return el;
   }
-  const can = d.viewer.can_edit;
-  const kind = h("select", { id: "f-kind", disabled: !can }, Object.entries(d.kinds).map(([k, v]) => h("option", { value: k, selected: i.kind === k }, v)));
+  const isDoc = i.kind === "artifact", gone = i.status === "cancelled";
+  const can = d.viewer.can_edit && !gone;
+  const kind = isDoc ? null : h("select", { id: "f-kind", disabled: !can }, Object.entries(d.kinds).map(([k, v]) => h("option", { value: k, selected: i.kind === k }, v)));
   const title = h("input", { id: "f-title", value: i.title, disabled: !can, maxlength: "200" });
+  const maturity = h("select", { id: "f-maturity", disabled: !can }, h("option", { value: "" }, "표시 없음"),
+    Object.entries(d.maturity).map(([k, v]) => h("option", { value: k, selected: i.maturity === k }, v)));
   const assignee = h("input", { id: "f-assignee", value: i.assignee || "", disabled: !can, list: "members", placeholder: "담당 미정" });
-  const statement = h("textarea", { id: "f-statement", disabled: !can, rows: "3" }, i.statement === i.title ? "" : i.statement);
-  const save = () => act(() => api(`/api/board/items/${i.id}`, { kind: kind.value, title: title.value, assignee: assignee.value,
-    statement: statement.value || undefined }), "저장했어요");
+  const statement = h("textarea", { id: "f-statement", disabled: !can, rows: isDoc ? "10" : "3" }, i.statement === i.title ? "" : i.statement);
+  const save = () => act(() => api(`/api/board/items/${i.id}`, { ...(isDoc ? {} : { kind: kind.value, assignee: assignee.value }),
+    title: title.value, maturity: maturity.value, statement: statement.value || undefined }), "저장했어요");
   el.append(
-    h("h3", {}, "항목 수정", h("button", { class: "icon-btn close", "aria-label": "닫기", html: ICON.x, onclick: closePanel })),
-    can ? "" : h("p", { class: "readonly" }, "보기 전용이에요. 고치기는 권한자(관리자·개발·권한을 받은 사람)가 해요."),
-    h("div", { class: "field" }, h("label", { for: "f-kind" }, "종류"), kind),
+    h("h3", {}, isDoc ? "산출물 문서" : "항목 수정", i.maturity ? h("span", { class: "mat mat-" + i.maturity }, d.maturity[i.maturity]) : "",
+      h("button", { class: "icon-btn close", "aria-label": "닫기", html: ICON.x, onclick: closePanel })),
+    gone ? h("p", { class: "readonly" }, "삭제된 항목이에요. 검색·리딩·질문에서 빠져 있고, 복원하면 돌아와요.") : "",
+    !gone && !d.viewer.can_edit ? h("p", { class: "readonly" }, "보기 전용이에요. 고치기는 권한자(관리자·개발·권한을 받은 사람)가 해요.") : "",
+    i.human_edited ? h("p", { class: "note" }, "✎ 사람이 고친 항목이에요. 다시 수집해도 덮어쓰지 않고, 바뀐 내용이 있으면 확인 필요로 보내요.") : "",
+    isDoc ? "" : h("div", { class: "field" }, h("label", { for: "f-kind" }, "종류"), kind),
     h("div", { class: "field" }, h("label", { for: "f-title" }, "제목"), title),
-    h("div", { class: "field" }, h("label", { for: "f-assignee" }, "담당"), assignee,
+    h("div", { class: "field" }, h("label", { for: "f-maturity" }, "성숙도"), maturity),
+    isDoc ? "" : h("div", { class: "field" }, h("label", { for: "f-assignee" }, "담당"), assignee,
       h("datalist", { id: "members" }, d.members.map((m) => h("option", { value: m })))),
-    h("div", { class: "field" }, h("label", { for: "f-statement" }, "내용"), statement),
-    h("div", { class: "field" }, h("span", { class: "label" }, "출처"),
-      i.sources.length ? i.sources.map((s, n) => h("div", { class: "src" },
-        h("div", { class: "head" }, h("span", { html: ICON.doc }), s.title, s.date ? h("span", { class: "date" }, "(" + day(s.date) + ")") : ""),
-        (i.quotes[n] || (n === i.sources.length - 1 && i.quotes[0])) ? h("blockquote", {}, "“" + (i.quotes[n] || i.quotes[0]) + "”") : "",
-        s.url ? h("a", { href: s.url, target: "_blank", rel: "noopener" }, "Notion 원문 열기 ↗") : h("span", { class: "date" }, s.path)))
-        : h("div", { class: "date" }, "출처 기록이 없어요")),
-    h("div", { class: "field" }, h("span", { class: "label" }, "이력"),
-      h("ol", { class: "hist" }, i.history.map((r) => h("li", {}, h("span", { class: "when" }, day(r.at)),
-        reasonText(r.reason), r.title && r.title !== i.title ? ` · “${r.title}”` : "", " ", h("span", { class: "who" }, r.actor))))),
-    can ? h("div", { class: "actions" },
+    isDoc ? h("div", { class: "field" }, h("span", { class: "label" }, "요약 (Markdown)"), mdView(i.statement),
+      can ? h("div", { class: "field" }, h("label", { for: "f-statement", class: "note" }, "고치기"), statement) : "")
+      : h("div", { class: "field" }, h("label", { for: "f-statement" }, "내용"), statement),
+    isDoc ? h("div", { class: "field" }, h("span", { class: "label" }, `연결된 지식 항목 (${i.derived.length})`),
+      i.derived.length ? h("ul", { class: "rel" }, i.derived.map((x) => h("li", {}, h("span", { class: "kindname" }, d.kinds[x.kind] || x.kind),
+        findItem(x.id) ? h("a", { tabindex: "0", onclick: () => select(x.id) }, x.title) : x.title)))
+        : h("div", { class: "date" }, "아직 연결된 항목이 없어요")) : "",
+    h("div", { class: "field" }, h("span", { class: "label" }, "관계"), relations(i)),
+    githubLine(i),
+    sourcesView(i),
+    h("div", { class: "field" }, h("span", { class: "label" }, "이력"), historyList(i)),
+    gone ? (d.viewer.can_edit ? h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: () => restoreItem(i) }, "↩ 복원")) : "")
+      : can ? h("div", { class: "actions" },
       h("button", { class: "btn primary", onclick: save }, "저장"),
-      h("button", { class: "btn danger", onclick: () => { if (confirm(`“${i.title}” 반영을 취소할까요? 목록에서 사라지고 이력은 남아요.`))
-        act(() => api(`/api/board/items/${i.id}/cancel`, {}), "반영을 취소했어요"); } }, "반영 취소")) : "");
+      h("button", { class: "btn danger", onclick: () => { if (confirm(`“${i.title}”을(를) 삭제할까요? 목록·검색에서 빠지고 이력은 남아요. 삭제한 항목 보기에서 복원할 수 있어요.`))
+        act(() => api(`/api/board/items/${i.id}/cancel`, {}), "삭제했어요"); } }, "삭제")) : "");
   return el;
 }
 function openStages() {

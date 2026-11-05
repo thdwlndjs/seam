@@ -80,6 +80,7 @@ class EditBody(BaseModel):
     title: str | None = None
     assignee: str | None = None
     statement: str | None = None
+    maturity: str | None = None
 
 
 class AnswerBody(BaseModel):
@@ -131,6 +132,16 @@ def register(app: FastAPI, secret: str, store: Callable[[], Path], can_edit: Cal
     async def board_cancel(item_id: str, authorization: str | None = Header(None)):
         claims = editor(authorization)
         return await run(board.cancel, store(), claims["s"], item_id, actor(claims))
+
+    @app.get("/api/board/search")
+    async def board_search(q: str = "", authorization: str | None = Header(None)):
+        claims = viewer(authorization)
+        return await run(board.find, store(), claims["s"], q[:200])
+
+    @app.post("/api/board/items/{item_id}/restore")
+    async def board_restore(item_id: str, authorization: str | None = Header(None)):
+        claims = editor(authorization)
+        return await run(board.restore, store(), claims["s"], item_id, actor(claims))
 
     @app.post("/api/board/items/{item_id}/answer")
     async def board_answer(item_id: str, body: AnswerBody, authorization: str | None = Header(None)):

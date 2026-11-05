@@ -17,12 +17,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import apply, core, db, people, stages
+from . import apply, core, db, people, search, stages
 from .db import ConflictError, NotFoundError, ValidationError
 
-KINDS = {"decision": "결정", "open": "미정", "task": "할 일", "insight": "인사이트", "feedback": "피드백"}
+KINDS = {"decision": "결정", "requirement": "요구사항", "open": "미정", "hypothesis": "가설", "task": "할 일",
+         "insight": "인사이트", "feedback": "피드백"}
+ARTIFACT = "artifact"  # 산출물 문서: 목록은 따로 보이고, 종류를 바꿀 수 없다
+MATURITY_LABELS = {"draft": "가안", "recommended": "조언", "discussed": "논의", "agreed": "합의"}
 HIDDEN = ("superseded", "reverted", "cancelled", "resolved")
 EDIT_REASON = "구조 화면에서 고침"
+RESTORE_REASON = "구조 화면에서 복원"
+DELETED_LIMIT = 30  # 삭제된 항목 보기에 보이는 최근 건수
 
 
 _page_date = apply.date_from
@@ -69,21 +74,56 @@ def _history(c: Any, item_id: str) -> list[dict[str, Any]]:
     for row in c.execute("""SELECT version, snapshot_json, reason, actor, changed_at FROM revisions
                             WHERE object_type = 'work_item' AND object_id = ? ORDER BY version""", (item_id,)):
         snap = json.loads(row["snapshot_json"])
+        human = (row["reason"] or "").startswith(core.HUMAN_EDIT_PREFIX) and not (row["actor"] or "").startswith("자동(")
         out.append({"version": row["version"], "at": row["changed_at"], "actor": row["actor"], "reason": row["reason"],
-                    "title": snap.get("title"), "kind": snap.get("kind"), "status": snap.get("status")})
+                    "title": snap.get("title"), "kind": snap.get("kind"), "status": snap.get("status"), "by_human": human})
     return out
 
 
-def _item(c: Any, row: Any, sources: dict[str, dict]) -> dict[str, Any]:
+def _links(c: Any, scope: str) -> dict[str, list[dict[str, Any]]]:
+    """항목 ID → 관계 목록. type: 관계 종류, direction: out(이 항목이 시작) / in(이 항목이 대상), other: 상대 항목."""
+    titles = {r["id"]: {"id": r["id"], "title": r["title"], "kind": r["kind"], "status": r["status"]}
+              for r in c.execute("SELECT id, title, kind, status FROM work_items WHERE scope = ?", (scope,))}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for r in c.execute("SELECT source_id, target_id, type FROM work_links ORDER BY created_at, rowid"):
+        if r["source_id"] in titles and r["target_id"] in titles:
+            out.setdefault(r["source_id"], []).append({"type": r["type"], "direction": "out", "other": titles[r["target_id"]]})
+            out.setdefault(r["target_id"], []).append({"type": r["type"], "direction": "in", "other": titles[r["source_id"]]})
+    return out
+
+
+def _github(attributes: dict[str, Any]) -> list[dict[str, Any]]:
+    """GitHub 연결. basis: explicit(본문·커밋에 적힌 번호) / inferred(의미상 추정). 화면은 추정을 추정이라고 적는다."""
+    return [{"type": r["type"], "number": int(r["number"]), "basis": r.get("basis", "explicit")} for r in core.github_refs(attributes)]
+
+
+def _item(c: Any, row: Any, sources: dict[str, dict], links: dict[str, list] | None = None) -> dict[str, Any]:
     attributes = json.loads(row["attributes_json"])
     found = [sources[p] for p in attributes.get("part_ids") or [] if p in sources]
     quotes = _quotes(c, row["id"])
+    mine = (links or {}).get(row["id"], [])
+    maturity = attributes.get("maturity")
     return {"id": row["id"], "kind": row["kind"], "kind_label": KINDS.get(row["kind"], row["kind"]),
             "status": row["status"], "title": row["title"], "statement": row["statement_md"],
             "assignee": attributes.get("assignee"), "due": attributes.get("due"),
+            "maturity": maturity if maturity in MATURITY_LABELS else None,
+            "artifact_type": attributes.get("artifact_type"), "github": _github(attributes),
             "sources": sorted(found, key=lambda s: s["date"] or ""), "quotes": quotes,
             "from_document": bool(found) and all(s["part_kind"] == "document" for s in found),
+            "source_missing": bool(attributes.get("source_missing")),
+            "human_edited": core.is_human_edited(c, row["id"]),  # 사람이 고친 판: 재수집이 덮어쓰지 않는다
+            "links": mine,
+            "conflict": row["status"] == "needs_discussion" or any(link["type"] == core.LINK_RELATED_TO for link in mine),
             "updated_at": row["updated_at"], "history": _history(c, row["id"])}
+
+
+def _artifact(c: Any, row: Any, sources: dict[str, dict], links: dict[str, list]) -> dict[str, Any]:
+    """산출물 문서: 항목 모양 + 문서 날짜와 이 문서에서 나온 항목(DERIVED_FROM)."""
+    item = _item(c, row, sources, links)
+    derived = [link["other"] for link in item["links"]
+               if link["type"] == core.LINK_DERIVED_FROM and link["direction"] == "in" and link["other"]["status"] not in HIDDEN]
+    dates = [s["date"] for s in item["sources"] if s["date"]]
+    return dict(item, derived=derived, date=max(dates) if dates else (row["updated_at"] or "")[:10])
 
 
 def _changes(c: Any, scope: str) -> list[dict[str, Any]]:
@@ -103,11 +143,19 @@ def snapshot(store: Path, scope: str, now: datetime | None = None) -> dict[str, 
     since = ((now or datetime.now().astimezone()) - timedelta(hours=24)).astimezone().isoformat()
     with closing(db.connect(store)) as c:
         sources = _sources(c, scope)
-        # 탭은 아직 항목 다섯 종류만 다룬다(산출물 문서·요구사항·가설 화면은 Phase 3)
-        rows = c.execute(f"""SELECT * FROM work_items WHERE scope = ? AND status NOT IN ({",".join("?" * len(HIDDEN))})
+        links = _links(c, scope)
+        live = f"status NOT IN ({','.join('?' * len(HIDDEN))})"
+        rows = c.execute(f"""SELECT * FROM work_items WHERE scope = ? AND {live}
                              AND kind IN ({",".join("?" * len(KINDS))}) ORDER BY updated_at DESC, rowid DESC""",
                          (scope, *HIDDEN, *KINDS)).fetchall()
-        items = [_item(c, r, sources) for r in rows]
+        items = [_item(c, r, sources, links) for r in rows]
+        artifacts = [_artifact(c, r, sources, links) for r in c.execute(
+            f"SELECT * FROM work_items WHERE scope = ? AND kind = ? AND {live} ORDER BY updated_at DESC, rowid DESC",
+            (scope, ARTIFACT, *HIDDEN))]
+        deleted = [dict(_item(c, r, sources, links), deleted_at=r["updated_at"]) for r in c.execute(
+            f"""SELECT * FROM work_items WHERE scope = ? AND status = 'cancelled' AND kind IN
+                ({",".join("?" * (len(KINDS) + 1))}) ORDER BY updated_at DESC, rowid DESC LIMIT ?""",
+            (scope, *KINDS, ARTIFACT, DELETED_LIMIT))]
         changes = _changes(c, scope)
         recent = c.execute("""SELECT COUNT(DISTINCT page_id) FROM source_parts WHERE scope = ? AND status = 'active'
                               AND state = 'applied' AND confirmed_at >= ?""", (scope, since)).fetchone()[0]
@@ -118,7 +166,8 @@ def snapshot(store: Path, scope: str, now: datetime | None = None) -> dict[str, 
         pages.setdefault(s["page_id"] or part_id, {"page_id": s["page_id"] or part_id, "title": s["title"], "date": s["date"]})
     found = stages.board(store, scope)
     candidate = found["candidate"]  # 확정 > AI 추정(논의 중) > 게이트 기준: 메뉴 2·단계 카드와 같은 값
-    return {"items": items, "changes": changes, "kinds": KINDS,
+    return {"items": items, "artifacts": artifacts, "deleted": deleted, "changes": changes, "kinds": KINDS,
+            "maturity": MATURITY_LABELS,
             "sources": sorted(pages.values(), key=lambda p: (p["date"] or "", p["title"])),
             "members": [m["display_name"] for m in people.team(store, scope) if m.get("display_name")],
             "stage": {"code": found["shown"], "label": stages.label(found["shown"]) if found["shown"] else None,
@@ -151,7 +200,10 @@ def edit(store: Path, scope: str, item_id: str, changes: dict[str, Any], actor: 
         row = _live(c, scope, item_id)
         attributes = json.loads(row["attributes_json"])
         kind = changes.get("kind", row["kind"])
-        if kind not in KINDS:
+        if row["kind"] == ARTIFACT:
+            if kind != ARTIFACT:
+                raise ValidationError("산출물 문서는 종류를 바꿀 수 없어요")
+        elif kind not in KINDS:
             raise ValidationError("알 수 없는 종류예요")
         title = (changes.get("title") if changes.get("title") is not None else row["title"]).strip()
         if not title:
@@ -175,12 +227,47 @@ def edit(store: Path, scope: str, item_id: str, changes: dict[str, Any], actor: 
                 else:
                     attributes.pop("assignee", None)
                 update["attributes_json"] = attributes
+        if "maturity" in changes and changes["maturity"] != attributes.get("maturity"):
+            if changes["maturity"] not in (*MATURITY_LABELS, None, ""):
+                raise ValidationError("성숙도는 가안·조언·논의·합의 중 하나여야 해요")
+            if changes["maturity"]:
+                attributes["maturity"] = changes["maturity"]
+            else:
+                attributes.pop("maturity", None)
+            update["attributes_json"] = attributes
         if not update:
             return {"id": item_id, "changed": False}
         if "kind" in update or "title" in update:
             _clash(c, scope, item_id, kind, title)
         core._write_item(c, item_id, update, EDIT_REASON, actor, db.now())
     return {"id": item_id, "changed": True}
+
+
+def restore(store: Path, scope: str, item_id: str, actor: str) -> dict[str, Any]:
+    """삭제(반영 취소)한 항목을 이력의 직전 상태로 되돌린다. 이력에 남고, 같은 제목의 살아 있는 항목이 있으면 막는다."""
+    with db.write(store) as c:
+        row = c.execute("SELECT * FROM work_items WHERE id = ? AND scope = ?", (item_id, scope)).fetchone()
+        if row is None:
+            raise NotFoundError("항목을 찾을 수 없어요")
+        if row["status"] != "cancelled":
+            raise ConflictError("삭제된 항목만 복원할 수 있어요")
+        before = None
+        for rev in c.execute("""SELECT snapshot_json FROM revisions WHERE object_type = 'work_item' AND object_id = ?
+                                ORDER BY version DESC""", (item_id,)):
+            snap = json.loads(rev["snapshot_json"])
+            if snap.get("status") != "cancelled":
+                before = snap
+                break
+        status = (before or {}).get("status") or ("open" if row["kind"] == "task" else "active")
+        _clash(c, scope, item_id, row["kind"], row["title"])
+        core._write_item(c, item_id, {"status": status}, RESTORE_REASON, actor, db.now())
+    return {"id": item_id, "status": status}
+
+
+def find(store: Path, scope: str, text: str, limit: int = 30) -> dict[str, Any]:
+    """서버 검색(색인): 화면의 검색창이 쓴다. 삭제·되돌린·대체된 항목은 검색에서 빠진다. 찾은 ID를 점수 순으로 돌려준다."""
+    found = search.query(store, scope, text, limit=limit, max_tokens=search.DEFAULT_MAX_TOKENS)
+    return {"query": text, "ids": [r["id"] for r in found["records"]], "searched": found["searched"]}
 
 
 def cancel(store: Path, scope: str, item_id: str, actor: str) -> dict[str, Any]:
