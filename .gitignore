@@ -18,3 +18,5 @@ devTools/extract-draft-*.md
 # 검증 도구 캡처(화면 PNG·HTML). 문서와 steps.json만 커밋한다
 docs/refactor/evidence/**/*.png
 docs/refactor/evidence/**/*.html
+# DB·설정 백업(개인정보·토큰이 들어 있음)
+backups/
