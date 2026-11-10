@@ -39,6 +39,7 @@ import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -54,6 +55,7 @@ load_dotenv(os.environ.get("ENV_FILE"))
 import board_tab  # noqa: E402
 import stage_image  # noqa: E402
 import confirm_flow  # noqa: E402
+import setup_flow  # noqa: E402
 import member_flow  # noqa: E402
 import meeting_inputs  # noqa: E402
 import llm_queue  # noqa: E402
@@ -73,6 +75,7 @@ from worklog import qa as wqa  # noqa: E402
 from worklog import runs as wruns  # noqa: E402
 from worklog import search as wsearch  # noqa: E402
 from worklog import stages as wstages  # noqa: E402
+from worklog import teams as wteams  # noqa: E402
 from worklog.db import ConflictError, NotFoundError, ValidationError  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
 
@@ -186,6 +189,10 @@ class Turn:
             event["card"] = card
         self._put(event)
 
+    async def replace(self, heading: str, text: str) -> None:
+        """방금 누른 카드(토큰 입력 카드 등)를 값 없는 카드로 바꾼다. 봇이 Teams의 그 메시지를 갱신한다."""
+        self._put({"type": "replace", "title": heading, "buttons": [], "card": {"heading": heading, "text": text}})
+
     def finish(self) -> None:
         self.queue.put_nowait(None)
 
@@ -245,10 +252,29 @@ def _load_team_configs() -> dict:
         return {}
 
 
-def _save_team_configs(data: dict) -> None:
-    with open(TEAM_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+_team_configs_lock = threading.Lock()
 
+
+def _save_team_configs(data: dict) -> None:
+    # 임시 파일에 쓰고 바꿔 끼운다: 쓰는 도중 멈춰도 설정 파일이 반쯤 비지 않는다
+    tmp = f"{TEAM_CONFIG_PATH}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, TEAM_CONFIG_PATH)
+
+
+def _add_team_config(scope: str, values: dict) -> bool:
+    """팀 설정에 값을 더한다. 이미 값이 있는 키는 덮어쓰지 않는다(바꾸려면 먼저 사람에게 묻는다). 더한 것이 있으면 True."""
+    with _team_configs_lock:
+        configs = _load_team_configs()
+        current = dict(configs.get(scope) or {})
+        added = {k: v for k, v in values.items() if current.get(k) in (None, "")}
+        if not added:
+            return False
+        current.update(added)
+        configs[scope] = current
+        _save_team_configs(configs)
+        return True
 
 
 def _load_member_profiles() -> dict:
@@ -350,6 +376,108 @@ async def _github_token_valid(token: str) -> bool:
         return False
 
 
+def _notion_page_title(token: str, page_id: str) -> str | None:
+    """노션 페이지(또는 DB)를 이 토큰으로 열어 제목을 돌려준다. 못 열면 None. 토큰·응답을 로그에 남기지 않는다."""
+    client = notion_client_for(token)
+    for kind in ("pages", "databases"):
+        try:
+            found = getattr(client, kind).retrieve(page_id)
+        except Exception:
+            continue
+        for prop in (found.get("properties") or {}).values():
+            if isinstance(prop, dict) and prop.get("type") == "title":
+                return "".join(t.get("plain_text", "") for t in prop.get("title") or []) or "(제목 없음)"
+        title = found.get("title")
+        if isinstance(title, list):
+            return "".join(t.get("plain_text", "") for t in title) or "(제목 없음)"
+        return "(제목 없음)"
+    return None
+
+
+async def _github_repo_ok(repo: str, token: str) -> bool:
+    try:
+        await _github_get(repo, "", token)
+        return True
+    except Exception:
+        return False
+
+
+_BOARD_QUERY = """query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id owner{id}
+  projectsV2(first:5){nodes{id number closed}}}}"""
+_BOARD_CREATE = """mutation($ownerId:ID!,$title:String!,$repositoryId:ID!){
+  createProjectV2(input:{ownerId:$ownerId,title:$title,repositoryId:$repositoryId}){projectV2{id number}}}"""
+
+
+async def _github_find_board(repo: str, token: str) -> dict | None:
+    """저장소에 붙은 열린 작업 보드(Projects v2) 하나. 없거나 못 읽으면 None."""
+    owner, name = repo.split("/", 1)
+    try:
+        data = await _github_graphql(_BOARD_QUERY, token, {"owner": owner, "name": name})
+    except Exception:
+        return None
+    nodes = [n for n in ((data.get("repository") or {}).get("projectsV2") or {}).get("nodes") or [] if not n.get("closed")]
+    return {"id": nodes[0]["id"], "number": nodes[0]["number"]} if nodes else None
+
+
+async def _github_create_board(repo: str, token: str, title: str) -> dict | None:
+    """작업 보드를 만들어 저장소에 붙인다(기본 Status 칸: Todo·In Progress·Done). 못 만들면 None."""
+    owner, name = repo.split("/", 1)
+    try:
+        data = await _github_graphql(_BOARD_QUERY, token, {"owner": owner, "name": name})
+        repository = data["repository"]
+        made = await _github_graphql(_BOARD_CREATE, token, {"ownerId": repository["owner"]["id"], "title": title,
+                                                            "repositoryId": repository["id"]})
+        project = made["createProjectV2"]["projectV2"]
+        return {"id": project["id"], "number": project["number"]}
+    except Exception:
+        return None
+
+
+def _setup_deps() -> "setup_flow.Deps":
+    """팀 연결 흐름이 쓰는 바깥 함수. 부를 때마다 만들어 테스트가 바꿔 끼운 함수를 그대로 쓴다."""
+    return setup_flow.Deps(
+        store=lambda: worklog_bridge.WORKLOG_STORE, get_config=_get_config, save_config=_add_team_config,
+        parse_notion_page=_extract_notion_page_id, parse_github_repo=_extract_github_repo,
+        notion_page_title=lambda token, page_id: _notion_page_title(token, page_id),
+        github_token_ok=lambda token: _github_token_valid(token),
+        github_repo_ok=lambda repo, token: _github_repo_ok(repo, token),
+        find_board=lambda repo, token: _github_find_board(repo, token),
+        create_board=lambda repo, token, title: _github_create_board(repo, token, title),
+        after_connect=lambda scope, page_id, token: _spawn(_register_team_map(scope, [page_id], token)))
+
+
+# 개발용 번호 대체(Playground 사용자 = 정한 번호). 개발 환경이 아니면 여기서 예외가 나서 서버가 시작하지 않는다.
+DEV_ROSTER_PATH = Path(os.environ.get("SEAM_DEV_ROSTER") or Path(__file__).resolve().parent.parent / "roster.playground.json")
+
+
+def _load_dev_override() -> dict | None:
+    number = wteams.dev_member(os.environ)
+    return wteams.dev_roster(DEV_ROSTER_PATH, number) if number else None
+
+
+_DEV_OVERRIDE = _load_dev_override()
+if _DEV_OVERRIDE:
+    logging.getLogger("setup").warning("개발용 번호 대체가 켜져 있어요(개발 환경 전용)")
+
+
+def _roster_team(turn: "Turn") -> dict | str | None:
+    """명단을 쓰는 설치면 Teams 표시 이름의 번호로 팀을 찾아 turn의 팀 범위를 바꾼다.
+    명단이 비어 있으면 None(예전 방식), 명단에 없으면 "blocked".
+    개발용 번호 대체가 켜져 있으면 표시 이름에 번호가 없는 사용자(Playground)를 개발용 팀으로 본다."""
+    store = worklog_bridge.WORKLOG_STORE
+    if _DEV_OVERRIDE and wteams.member_no(turn.user_name) is None:
+        team = wteams.find_dev(store, _DEV_OVERRIDE)
+        turn.team_key, turn.team_name = team["scope"], team["name"]
+        return team
+    if not wteams.roster_active(store):
+        return None
+    team = wteams.find(store, turn.user_name)
+    if team is None:
+        return "blocked"
+    turn.team_key, turn.team_name = team["scope"], team["name"]
+    return team
+
+
 def _notion_page_accessible(page_id: str, notion_client: Client) -> bool:
     """페이지 'Connections'에 이 integration이 추가돼 있어야만 API로 읽을 수 있다."""
     try:
@@ -423,6 +551,12 @@ _ASK_GITHUB_ID_TEXT = (
     "(그만두려면 '취소' 또는 '나가기')"
 )
 _NO_CONFIG_TEXT = "아직 연결된 설정이 없어요.\n'설정'이라고 입력해서 먼저 연결해줄래요?"
+_NO_GITHUB_TEXT = "GitHub가 아직 연결되지 않았어요. 팀 연결을 마친 뒤 GitHub도 연결하면 쓸 수 있어요."
+
+
+def _has_github(config: dict | None) -> bool:
+    """GitHub는 선택이다(노션만 연결한 팀도 있다). GitHub를 쓰는 기능은 이것으로 먼저 확인한다."""
+    return bool(config and config.get("github_repo") and config.get("github_token"))
 _SETUP_GUIDES: dict[str, str] = {
     "github_token": (
         "**GitHub 토큰 발급 가이드**\n\n"
@@ -461,6 +595,15 @@ _SETUP_LABELS = {
 
 # ── 턴 라우팅 (예전 handle_message의 판단 부분) ─────────────────
 async def handle_turn(turn: Turn) -> None:
+    team = await asyncio.to_thread(_roster_team, turn)
+    if team == "blocked":  # 명단에 없는 사람: 어느 팀에도 연결하지 않는다
+        logging.getLogger("setup").info("team lookup: not found")
+        await turn.send(setup_flow.blocked_text())
+        return
+    if team is not None:  # 명단 팀원: 팀이 아직 연결 전이면 팀 연결 흐름(시나리오 A)
+        value = turn.req.value if isinstance(turn.req.value, dict) else None
+        if await setup_flow.handle(turn, team, value, _setup_deps()):
+            return
     if turn.req.kind == "welcome":
         await _send_welcome(turn)
         return
@@ -2026,10 +2169,12 @@ async def _start_worklog() -> None:
 async def fetch_team_status(config: dict, team_key: str,
                             on_stage: Callable[[str], None] | None = None) -> tuple[str, list[dict]]:
     """회의 기록은 저장본(worklog)에서, 이슈·커밋은 GitHub에서 읽는다. Notion은 다시 읽지 않는다."""
-    github_token = config["github_token"]
-    repo = config["github_repo"]
+    github_token = config.get("github_token")
+    repo = config.get("github_repo")
 
     async def _fetch_issues() -> dict | list[dict]:
+        if not _has_github(config):
+            return []  # GitHub 없이 연결한 팀: 회의록·문서 기준으로만 보인다
         return await _github_get_cached(repo, "/issues", github_token, {"state": "all", "per_page": 30})
 
     notes, issues = await asyncio.gather(_stored_notes(config, team_key, on_stage), _fetch_issues())
@@ -2074,7 +2219,7 @@ async def fetch_team_status(config: dict, team_key: str,
         text = header + "\n" + "\n".join(f"- {_brief(t)}" for t in note_lines[-10:])
         return "\n".join([text] + completed_lines + unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer), unassigned_open
 
-    commit_touched = await _get_commit_touched_issues(repo, github_token)
+    commit_touched = await _get_commit_touched_issues(repo, github_token) if _has_github(config) else set()
     tasks = _classify_tasks_by_github_state(confirmed, issue_state_by_number, commit_touched)
     if on_stage:
         on_stage("🧠 최근 회의와 문서를 종합하는 중...")
@@ -2288,10 +2433,10 @@ async def _send_welcome(turn: Turn) -> None:
 async def fetch_my_role(github_id: str | None, display_name: str | None, config: dict, team_key: str,
                         on_stage: Callable[[str], None] | None = None, aliases: list[str] | None = None) -> str:
     """배정된 이슈는 GitHub에서, 회의록 속 내 이름은 저장본(worklog)에서 찾는다. Notion은 다시 읽지 않는다."""
-    github_token = config["github_token"]
+    github_token = config.get("github_token")
 
     async def _fetch_github_lines() -> tuple[list[str], set[int]]:
-        if not github_id:
+        if not github_id or not _has_github(config):
             return [], set()
         issues = await _github_get_cached(
             config["github_repo"], "/issues", github_token, {"assignee": github_id, "state": "open", "per_page": 30}
@@ -2430,6 +2575,10 @@ async def _set_project_item_status(project_id: str, field_id: str, option_id: st
 
 async def share_completed_work(config: dict, github_id: str, team_key: str | None = None,
                                actor: str = "GitHub 완료 동기화") -> str:
+    if not _has_github(config):
+        return _NO_GITHUB_TEXT
+    if not config.get("github_project_number"):
+        return "작업 보드가 아직 연결되지 않았어요. 팀 연결의 GitHub 단계에서 보드를 만들거나 연결하면 쓸 수 있어요."
     repo = config["github_repo"]
     owner, repo_name = repo.split("/", 1)
     project_number = config["github_project_number"]
@@ -2494,6 +2643,8 @@ async def share_completed_work(config: dict, github_id: str, team_key: str | Non
 # ── 담당자 없는 이슈 self-claim ─────────────────────────────
 async def claim_issue(config: dict, issue_number: int, github_id: str) -> str:
     """직전에 캐시 없이 다시 조회한다 — 두 사람이 동시에 눌러도 중복 배정되지 않게."""
+    if not _has_github(config):
+        return _NO_GITHUB_TEXT
     repo = config["github_repo"]
     token = config["github_token"]
 

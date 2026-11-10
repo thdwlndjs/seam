@@ -1,0 +1,428 @@
+[
+  {
+    "label": "1. 봇 열기",
+    "sent": {
+      "text": "",
+      "value": {}
+    },
+    "events": [
+      {
+        "type": "buttons",
+        "title": "안녕하세요! 아래에서 골라주세요\n\n⚙️ 연결 설정을 바꾸고 싶으면 '설정'이라고 입력하세요.",
+        "emphasis": false,
+        "buttons": [
+          {
+            "title": "1️⃣ 팀/프로젝트 정보",
+            "data": {
+              "action": "menu",
+              "choice": "1"
+            }
+          },
+          {
+            "title": "2️⃣ 진행상황 조회",
+            "data": {
+              "action": "menu",
+              "choice": "2"
+            }
+          },
+          {
+            "title": "3️⃣ 내 역할 조회",
+            "data": {
+              "action": "menu",
+              "choice": "3"
+            }
+          },
+          {
+            "title": "4️⃣ 작업 공유·회의록 반영",
+            "data": {
+              "action": "menu",
+              "choice": "4"
+            }
+          },
+          {
+            "title": "💬 질문하기",
+            "data": {
+              "action": "qa_start"
+            }
+          },
+          {
+            "title": "🗂 구조 보기·고치기",
+            "url": "http://localhost:3978/tab/board?t=eyJ1IjogImFhZC05MDIiLCAibiI6ICJVc2VyIDkwMiIsICJzIjogInVzZXI6YWFkLTkwMiIsICJlIjogMTc5NDI1NDM3NH0.2p-yFDorOMfIeWQmmVu-y4ZY1DAJLsY6Z7IONcx61EA"
+          }
+        ]
+      }
+    ],
+    "cards": [
+      {
+        "event": "buttons",
+        "card": {
+          "type": "AdaptiveCard",
+          "requires": {},
+          "isSortKey": false,
+          "version": "1.5",
+          "body": [
+            {
+              "type": "TextBlock",
+              "requires": {},
+              "isVisible": true,
+              "separator": false,
+              "height": "auto",
+              "spacing": "Default",
+              "isSortKey": false,
+              "text": "안녕하세요! 아래에서 골라주세요\n\n⚙️ 연결 설정을 바꾸고 싶으면 '설정'이라고 입력하세요.",
+              "wrap": true
+            }
+          ],
+          "actions": [
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "1️⃣ 팀/프로젝트 정보",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "menu",
+                "choice": "1"
+              },
+              "conditionallyEnabled": false
+            },
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "2️⃣ 진행상황 조회",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "menu",
+                "choice": "2"
+              },
+              "conditionallyEnabled": false
+            },
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "3️⃣ 내 역할 조회",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "menu",
+                "choice": "3"
+              },
+              "conditionallyEnabled": false
+            },
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "4️⃣ 작업 공유·회의록 반영",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "menu",
+                "choice": "4"
+              },
+              "conditionallyEnabled": false
+            },
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "💬 질문하기",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "qa_start"
+              },
+              "conditionallyEnabled": false
+            },
+            {
+              "type": "Action.OpenUrl",
+              "requires": {},
+              "title": "🗂 구조 보기·고치기",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "url": "http://localhost:3978/tab/board?t=eyJ1IjogImFhZC05MDIiLCAibiI6ICJVc2VyIDkwMiIsICJzIjogInVzZXI6YWFkLTkwMiIsICJlIjogMTc5NDI1NDM3NH0.2p-yFDorOMfIeWQmmVu-y4ZY1DAJLsY6Z7IONcx61EA"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "label": "2. 메뉴 1 누르기",
+    "sent": {
+      "text": "",
+      "value": {
+        "action": "menu",
+        "choice": "1"
+      }
+    },
+    "events": [
+      {
+        "type": "buttons",
+        "title": "👋 처음 오셨네요! 먼저 역할을 골라 주세요 (권한과 3번 메뉴에 쓰여요)",
+        "emphasis": false,
+        "buttons": [
+          {
+            "title": "기획",
+            "data": {
+              "action": "set_role",
+              "role": "plan"
+            }
+          },
+          {
+            "title": "디자인",
+            "data": {
+              "action": "set_role",
+              "role": "design"
+            }
+          },
+          {
+            "title": "개발",
+            "data": {
+              "action": "set_role",
+              "role": "dev"
+            }
+          },
+          {
+            "title": "기타",
+            "data": {
+              "action": "set_role",
+              "role": "other"
+            }
+          }
+        ]
+      }
+    ],
+    "cards": [
+      {
+        "event": "buttons",
+        "card": {
+          "type": "AdaptiveCard",
+          "requires": {},
+          "isSortKey": false,
+          "version": "1.5",
+          "body": [
+            {
+              "type": "TextBlock",
+              "requires": {},
+              "isVisible": true,
+              "separator": false,
+              "height": "auto",
+              "spacing": "Default",
+              "isSortKey": false,
+              "text": "👋 처음 오셨네요! 먼저 역할을 골라 주세요 (권한과 3번 메뉴에 쓰여요)",
+              "wrap": true
+            }
+          ],
+          "actions": [
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "기획",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "set_role",
+                "role": "plan"
+              },
+              "conditionallyEnabled": false
+            },
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "디자인",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "set_role",
+                "role": "design"
+              },
+              "conditionallyEnabled": false
+            },
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "개발",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "set_role",
+                "role": "dev"
+              },
+              "conditionallyEnabled": false
+            },
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "기타",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "set_role",
+                "role": "other"
+              },
+              "conditionallyEnabled": false
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "label": "3. 역할 고르기",
+    "sent": {
+      "text": "",
+      "value": {
+        "action": "set_role",
+        "role": "dev"
+      }
+    },
+    "events": [
+      {
+        "type": "buttons",
+        "title": "GitHub 아이디를 알려 주세요. `thdwlndjs`처럼 아이디만 보내면 돼요.",
+        "emphasis": false,
+        "buttons": [
+          {
+            "title": "⏭ 건너뛰기",
+            "data": {
+              "action": "onboard_skip"
+            }
+          }
+        ]
+      }
+    ],
+    "cards": [
+      {
+        "event": "buttons",
+        "card": {
+          "type": "AdaptiveCard",
+          "requires": {},
+          "isSortKey": false,
+          "version": "1.5",
+          "body": [
+            {
+              "type": "TextBlock",
+              "requires": {},
+              "isVisible": true,
+              "separator": false,
+              "height": "auto",
+              "spacing": "Default",
+              "isSortKey": false,
+              "text": "GitHub 아이디를 알려 주세요. `thdwlndjs`처럼 아이디만 보내면 돼요.",
+              "wrap": true
+            }
+          ],
+          "actions": [
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "⏭ 건너뛰기",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "onboard_skip"
+              },
+              "conditionallyEnabled": false
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "label": "4. GitHub 건너뛰기",
+    "sent": {
+      "text": "",
+      "value": {
+        "action": "onboard_skip"
+      }
+    },
+    "events": [
+      {
+        "type": "buttons",
+        "title": "회의록에 이름이 어떻게 적히나요? 여러 개면 쉼표로 (예: User 902, 줄인 이름이나 영어 이름)",
+        "emphasis": false,
+        "buttons": [
+          {
+            "title": "⏭ 건너뛰기",
+            "data": {
+              "action": "onboard_skip"
+            }
+          }
+        ]
+      }
+    ],
+    "cards": [
+      {
+        "event": "buttons",
+        "card": {
+          "type": "AdaptiveCard",
+          "requires": {},
+          "isSortKey": false,
+          "version": "1.5",
+          "body": [
+            {
+              "type": "TextBlock",
+              "requires": {},
+              "isVisible": true,
+              "separator": false,
+              "height": "auto",
+              "spacing": "Default",
+              "isSortKey": false,
+              "text": "회의록에 이름이 어떻게 적히나요? 여러 개면 쉼표로 (예: User 902, 줄인 이름이나 영어 이름)",
+              "wrap": true
+            }
+          ],
+          "actions": [
+            {
+              "type": "Action.Submit",
+              "requires": {},
+              "title": "⏭ 건너뛰기",
+              "style": "default",
+              "mode": "primary",
+              "isEnabled": true,
+              "data": {
+                "action": "onboard_skip"
+              },
+              "conditionallyEnabled": false
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "label": "5. 별칭 건너뛰기",
+    "sent": {
+      "text": "",
+      "value": {
+        "action": "onboard_skip"
+      }
+    },
+    "events": [
+      {
+        "type": "message",
+        "text": "✅ 등록했어요 — 역할 개발. 건너뛴 것은 '별칭'이나 3번 메뉴에서 다시 정할 수 있어요."
+      },
+      {
+        "type": "status",
+        "text": "🧠 요약 정리하는 중..."
+      },
+      {
+        "type": "done"
+      }
+    ],
+    "cards": []
+  }
+]

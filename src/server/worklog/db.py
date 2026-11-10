@@ -347,6 +347,32 @@ MIGRATIONS: list[list[str]] = [
         """CREATE UNIQUE INDEX work_items_live_title ON work_items(scope, kind, normalized_title)
            WHERE status NOT IN ('superseded', 'reverted', 'cancelled', 'resolved')""",
     ],
+    [  # 10: 팀 등록부·명단·설정 변경 기록(추가만). 문서: docs/seam/01-setup.md, 시나리오 A(처음 온 팀원)
+        # 명단은 번호→팀만 담는다(이름 없음). 설정 변경 기록에는 값을 남기지 않는다(누가·언제·무엇만).
+        """CREATE TABLE teams (
+            scope TEXT PRIMARY KEY,          -- squad:<팀 코드>
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new',  -- new | setting_up | connected
+            setup_by TEXT,                   -- 연결을 진행 중인(또는 끝낸) 사람의 Teams ID
+            setup_started_at TEXT,
+            connected_at TEXT,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE roster (
+            member_no TEXT PRIMARY KEY,      -- Teams 표시 이름 'User <번호>'의 번호
+            scope TEXT NOT NULL REFERENCES teams(scope),
+            is_leader INTEGER NOT NULL DEFAULT 0
+        )""",
+        """CREATE TABLE team_config_log (
+            id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            field TEXT NOT NULL,             -- notion_token, github_repo …(값은 저장하지 않는다)
+            action TEXT NOT NULL,            -- set | cleared
+            actor TEXT NOT NULL,
+            changed_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX team_config_log_scope ON team_config_log(scope, changed_at)",
+    ],
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

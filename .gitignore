@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 team_configs.json
 member_profiles.json
+# 팀 명단(번호→팀). 학번이라 커밋하지 않음(Playground용 테스트 명단 포함)
+roster*.json
 
 # 실제 Notion 녹화본(공개 저장소라 커밋하지 않음)
 src/server/tests/fixtures/notion_local/
@@ -13,3 +15,6 @@ src/server/tests/fixtures/notion_local/
 # 실행 로그와 추출 초안(실제 회의 내용이 들어감, 공개 저장소라 커밋하지 않음)
 devTools/*.log
 devTools/extract-draft-*.md
+# 검증 도구 캡처(화면 PNG·HTML). 문서와 steps.json만 커밋한다
+docs/refactor/evidence/**/*.png
+docs/refactor/evidence/**/*.html

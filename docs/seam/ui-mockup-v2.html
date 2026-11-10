@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SEAM PM Bot — Teams Playground</title>
+<style>
+:root{--bg:#f5f5f5;--panel:#fff;--chat:#fff;--ink:#242424;--muted:#666;--line:#e5e5e5;--soft:#f4f4f4;--brand:#6264a7;--brand-soft:#efeff8;--green:#107c41;--red:#c4314b;--shadow:0 2px 8px #00000012}
+*{box-sizing:border-box}
+body{margin:0;background:#e8e8e8;color:var(--ink);font:14px "Segoe UI",Arial,sans-serif;overflow:hidden}
+button,input,textarea,select{font:inherit}
+button{cursor:pointer}
+.scenarios{position:sticky;top:0;z-index:20;display:flex;justify-content:center;gap:8px;padding:12px;background:#242424;color:white}
+.scenarios button{border:1px solid #777;background:transparent;color:#eee;padding:10px 16px;border-radius:8px;font-weight:600}
+.scenarios button.active{background:#6264a7;border-color:#6264a7;color:white}
+.app{height:calc(100vh - 58px);height:calc(100dvh - 58px);min-height:0;max-height:none;max-width:1440px;margin:auto;display:grid;grid-template-columns:68px 250px minmax(0,1fr);background:var(--panel);box-shadow:var(--shadow);overflow:hidden}
+.rail{background:#292929;color:#eee;display:flex;align-items:center;flex-direction:column;gap:22px;padding:20px 0}
+.rail .logo{width:34px;height:34px;border-radius:9px;background:#6264a7;display:grid;place-items:center;font-weight:800}
+.rail span{font-size:19px;opacity:.8}
+.sidebar{background:#f8f8f8;border-right:1px solid var(--line);padding:20px 14px}
+.org{font-size:16px;font-weight:700;margin-bottom:24px}
+.side-title{font-size:11px;color:#777;font-weight:700;margin:20px 8px 8px}
+.nav{padding:10px 9px;border-radius:6px;margin:3px 0;display:flex;gap:10px;align-items:center}
+.nav.active{background:#e9e9f4;color:#45468a;font-weight:600}
+.nav span{font-size:16px;width:18px;text-align:center}
+.main{min-width:0;min-height:0;height:100%;display:flex;flex-direction:column;background:var(--chat);overflow:hidden}
+.topbar{height:62px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 24px;flex-shrink:0}
+.topbar strong{font-size:15px}
+.topbar small{color:var(--muted)}
+.timeline{flex:1 1 0%;min-width:0;min-height:0;height:0;overflow-y:auto;overflow-x:hidden;padding:22px max(20px,calc((100% - 720px)/2));scroll-behavior:smooth;overscroll-behavior:contain}
+.day{text-align:center;color:#888;font-size:11px;margin:4px 0 22px}
+.msg{display:flex;gap:10px;margin:0 0 20px;align-items:flex-start}
+.avatar{width:30px;height:30px;border-radius:8px;background:#6264a7;color:#fff;display:grid;place-items:center;flex-shrink:0;font-weight:700}
+.msg-content{max-width:100%;min-width:0;flex:1}
+.msg-head{font-size:12px;color:#666;margin-bottom:6px}
+.bubble{background:#f4f4f4;border-radius:0 10px 10px 10px;padding:12px 14px;line-height:1.65;max-width:640px}
+.user{justify-content:flex-end}
+.user .msg-content{display:flex;flex-direction:column;align-items:flex-end;flex:0 1 auto}
+.user .bubble{background:#e9e8f5;border-radius:10px 0 10px 10px}
+.card{border:1px solid #ddd;border-radius:10px;background:#fff;overflow:hidden;max-width:640px;box-shadow:0 1px 3px #0000000a}
+.card-head{padding:15px 16px 12px;border-bottom:1px solid #eee}
+.card-head strong{font-size:15px}
+.card-head p{margin:5px 0 0;color:#666;font-size:12px;line-height:1.5}
+.card-body{padding:16px;min-height:210px}
+.card-foot{padding:12px 16px;border-top:1px solid #eee;background:#fcfcfc}
+.field{margin-bottom:13px}
+.field label{display:block;font-size:12px;font-weight:600;margin-bottom:6px}
+.field input,.field textarea,.composer input{width:100%;border:1px solid #c9c9c9;border-radius:5px;padding:10px;background:white;outline:none}
+.field input:focus,.composer input:focus{border-color:#6264a7;box-shadow:0 0 0 1px #6264a7}
+.help-row{display:flex;align-items:center;justify-content:space-between;margin-top:14px;padding-top:12px;border-top:1px solid #eee;color:#777;font-size:12px}
+.btn{border:1px solid #bbb;border-radius:5px;background:white;padding:9px 13px;color:#333}
+.btn.primary{background:#6264a7;border-color:#6264a7;color:white;font-weight:600}
+.btn.text{border:0;color:#555;padding:5px;background:transparent}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap}
+.full{width:100%}
+.progress{display:flex;gap:5px;margin:0 0 17px}
+.progress i{height:4px;border-radius:4px;background:#e6e6e6;flex:1}
+.progress i.on{background:#6264a7}
+.tag{display:inline-block;background:#efeff8;color:#55568f;padding:4px 8px;border-radius:20px;font-size:11px}
+.success{color:var(--green);font-size:12px}
+.guide{background:#f7f7fb;border:1px solid #e5e5f1;padding:14px;border-radius:7px;line-height:1.7}
+.guide h4{margin:0 0 8px}
+.guide ol{padding-left:20px;margin:8px 0}
+.guide ul{padding-left:18px;margin:4px 0}
+.guide li{margin:3px 0}
+.guide a{color:#4f52b2}
+.guide code{background:#ebebf5;border-radius:3px;padding:1px 5px;font-size:12px}
+.guide-outro{margin-top:10px;padding-top:10px;border-top:1px solid #e5e5f1;color:#555}
+.field input.err{border-color:var(--red);box-shadow:0 0 0 1px var(--red)}
+.field-error{margin-top:6px;color:var(--red);font-size:12px;line-height:1.5}
+.field-error button{border:0;background:none;color:#4f52b2;padding:0;margin-left:4px;font-size:12px;text-decoration:underline}
+.field select{width:100%;border:1px solid #c9c9c9;border-radius:5px;padding:10px;background:white;outline:none}
+.field select:focus{border-color:#6264a7;box-shadow:0 0 0 1px #6264a7}
+.foot-meta{display:flex;justify-content:space-between;color:#777;font-size:12px;margin-bottom:10px}
+.done-title{display:inline-flex;align-items:center;gap:7px;font-weight:600}
+.done-ico{width:18px;height:18px;border-radius:50%;background:var(--green);display:inline-grid;place-items:center;flex-shrink:0}
+.checkrow{display:flex;align-items:center;gap:9px;padding:9px 0;border-bottom:1px solid #eee}
+.checkrow:last-child{border:0}
+.checkrow input{accent-color:#6264a7}
+.info-grid{display:grid;grid-template-columns:110px 1fr;gap:10px;font-size:13px;line-height:1.5}
+.info-grid span:nth-child(odd){color:#777}
+.section-label{font-size:11px;color:#777;font-weight:700;margin:0 0 9px}
+.quick{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}
+.quick button{background:white;border:1px solid #ddd;border-radius:18px;padding:7px 11px;font-size:12px}
+.task-table{width:100%;border-collapse:collapse;font-size:12px}
+.task-table th,.task-table td{text-align:left;padding:10px 7px;border-bottom:1px solid #eee}
+.task-table th{color:#777;font-weight:600}
+.status{font-size:11px;color:#8a5b00;background:#fff4ce;border-radius:12px;padding:3px 7px}
+.status.ok{color:#107c41;background:#e7f5ec}
+.composer-wrap{border-top:1px solid var(--line);padding:14px 20px 16px;flex-shrink:0}
+.composer{max-width:720px;margin:auto;display:flex;gap:8px;align-items:center}
+.composer input{height:42px;flex:1}
+.send{width:42px;height:42px;border:0;border-radius:6px;background:#6264a7;color:white;font-size:17px}
+.composer-note{max-width:720px;margin:7px auto 0;color:#999;font-size:10px}
+.muted{color:#777}
+.small{font-size:11px}
+.hidden{display:none!important}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#292929;color:#fff;padding:10px 16px;border-radius:7px;z-index:50}
+@media(max-width:850px){.app{grid-template-columns:52px minmax(0,1fr)}.sidebar{display:none}.timeline{padding:18px 14px}.scenarios button{font-size:11px;padding:8px}}
+@media(max-width:520px){.scenarios{gap:4px}.scenarios button{padding:8px;font-size:10px}.app{height:calc(100vh - 54px);height:calc(100dvh - 54px);grid-template-columns:42px minmax(0,1fr)}.topbar{padding:0 12px}.timeline{padding:14px 10px}.card-body{padding:12px}}
+</style>
+</head>
+<body>
+<div class="scenarios">
+  <button id="tabA" class="active" onclick="switchScenario('A')">A · 등록된 팀 없음</button>
+  <button id="tabB" onclick="switchScenario('B')">B · 등록된 팀 있음</button>
+</div>
+
+<div class="app">
+  <aside class="rail">
+    <div class="logo">S</div><span>◫</span><span>▦</span><span>▤</span><span>⚙</span>
+  </aside>
+  <aside class="sidebar">
+    <div class="org">SEAM Workspace</div>
+    <div class="side-title">즐겨찾기</div>
+    <div class="nav active"><span>▣</span>채팅</div>
+    <div class="nav"><span>◷</span>활동</div>
+    <div class="nav"><span>▤</span>팀</div>
+    <div class="side-title">채팅</div>
+    <div class="nav active"><span>◉</span>SEAM PM Bot</div>
+    <div class="side-title">앱</div>
+    <div class="nav"><span>▦</span>대시보드</div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div><strong>SEAM PM Bot</strong><br><small>채팅 · 프로젝트 운영</small></div>
+      <small>•••　⌕　⚙</small>
+    </header>
+    <section class="timeline" id="timeline">
+      <div class="day">오늘</div>
+      <div id="conversation"></div>
+    </section>
+    <footer class="composer-wrap">
+      <div class="composer">
+        <input id="messageInput" placeholder="메시지를 입력하세요" onkeydown="if(event.key==='Enter')sendMessage()">
+        <button class="send" onclick="sendMessage()">➤</button>
+      </div>
+      <div class="composer-note">SEAM PM Bot은 채팅을 기본으로 사용하며, 입력·선택·승인 등 필요한 경우에만 작업 UI를 제공합니다.</div>
+    </footer>
+  </main>
+</div>
+<div id="toast" class="toast hidden"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+let scenario='A',setupStep=0,guideOpen=false,setupData={},verified={},teamRegistered=false;
+let activeTask=null,taskHistory=[],chatCount=0;
+
+const steps=[
+ {id:'github',title:'GitHub 연결',desc:'프로젝트 저장소에 접근할 GitHub 정보를 연결합니다.',fields:[
+  ['repo','GitHub 저장소 주소','https://github.com/owner/repository'],
+  ['githubToken','GitHub Personal Access Token',''],
+  ['adminGithubId','관리자 GitHub ID','github-username']]},
+ {id:'notion',title:'Notion 연결',desc:'Notion Integration과 팀 정보를 확인할 페이지를 지정합니다.',fields:[
+  ['notionToken','Notion Integration Token',''],
+  ['notionPage','팀 정보 페이지 링크','https://www.notion.so/team-page'],
+  ['meetingNotesPage','회의록 페이지 링크 (선택)','https://www.notion.so/meeting-notes']]},
+ {id:'review',title:'팀 정보 확인 및 확정',desc:'연결한 Notion 페이지에서 추출한 팀 정보를 확인하고 등록합니다.',fields:[]}
+];
+
+const guides={
+ github:{title:'GitHub 토큰 발급 가이드',items:[
+  '<a href="https://github.com/settings/tokens" target="_blank" rel="noopener">https://github.com/settings/tokens</a> 접속 <span class="muted">(GitHub 우측 상단 프로필 → <b>Settings</b> → 왼쪽 메뉴 맨 아래 <b>Developer settings</b> → <b>Personal access tokens</b>)</span>',
+  '<b>Generate new token (classic)</b> 선택 — Fine-grained 말고 꼭 <b>Classic</b>',
+  '<b>Note</b>에 이름 아무거나(예: teamsAgent), 만료일 설정',
+  '<b>Select scopes</b>에서 최상위 체크박스 딱 2개만 체크: <code>repo</code>, <code>project</code>',
+  '맨 아래 <b>Generate token</b> → 나오는 <code>ghp_...</code> 토큰을 복사해서 토큰 입력칸에 붙여넣어 주세요'],
+  outro:'토큰을 복사했다면 돌아가서 다시 입력해 주세요.'},
+ notion:{title:'Notion 토큰 발급 가이드',items:[
+  '<a href="https://app.notion.com/developers/connections" target="_blank" rel="noopener">https://app.notion.com/developers/connections</a> 접속',
+  '<b>신규 연결</b> 선택',
+  '이름 아무거나 입력하고, 아래 항목 체크<ul><li>콘텐츠 기능: 읽기, 업데이트, 삽입 (셋 다 체크)</li><li>이메일 주소를 포함한 사용자 정보 읽기</li></ul>',
+  '만들어진 <b>액세스 토큰</b> 복사',
+  '연결하려는 Notion 페이지로 가서 우측 상단 <b>···</b> → <b>Connections</b> → 방금 만든 integration 추가 <span class="muted">(이 연결을 안 해두면 페이지 검증 단계에서 계속 실패해요)</span>'],
+  outro:'토큰을 복사했다면 돌아가서 다시 입력해 주세요.'}
+};
+const tokenRules={
+ github:{field:'githubToken',re:/^(ghp_|github_pat_)\S+$/,format:'토큰 형식이 아니에요. ghp_로 시작하는 토큰을 공백 없이 다시 입력해 주세요.',auth:'이 토큰으로 GitHub 인증이 안 돼요. 토큰이 맞는지 다시 확인해 주세요.'},
+ notion:{field:'notionToken',re:/^(ntn_|secret_)\S+$/,format:'토큰 형식이 아니에요. ntn_으로 시작하는 토큰을 공백 없이 다시 입력해 주세요.',auth:'이 토큰으로 Notion 인증이 안 돼요. 토큰이 맞는지 다시 확인해 주세요.'}
+};
+let stepError=null;
+const roles=['기획·PM','프론트엔드','백엔드','디자인','데이터·AI','기타'];
+let myRole='';
+
+function switchScenario(s){
+ scenario=s;
+ $('tabA').classList.toggle('active',s==='A');
+ $('tabB').classList.toggle('active',s==='B');
+ setupStep=0;guideOpen=false;setupData={};verified={};activeTask=null;taskHistory=[];chatCount=0;
+ stepError=null;myRole='';teamRegistered=false;roleCardSeq=0;
+ renderInitial();
+}
+function addBot(html){$('conversation').insertAdjacentHTML('beforeend',`<div class="msg"><div class="avatar">S</div><div class="msg-content"><div class="msg-head">SEAM PM Bot</div>${html}</div></div>`);scrollBottom();}
+function addUser(text){$('conversation').insertAdjacentHTML('beforeend',`<div class="msg user"><div class="msg-content"><div class="msg-head">나</div><div class="bubble">${escapeHtml(text)}</div></div></div>`);scrollBottom();}
+function scrollBottom(){setTimeout(()=>$('timeline').scrollTop=$('timeline').scrollHeight,30);}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function toast(t){$('toast').textContent=t;$('toast').classList.remove('hidden');setTimeout(()=>$('toast').classList.add('hidden'),1800);}
+
+function renderInitial(){
+  $('conversation').innerHTML='';
+  if(scenario==='A'){
+   addBot(`<div class="bubble">안녕하세요. SEAM PM Bot입니다.<br>아직 등록된 팀 정보가 없습니다. GitHub와 Notion을 연결한 뒤, Notion에서 확인한 팀 정보를 확정하면 프로젝트 운영을 시작할 수 있습니다.</div>`);
+   addBot(menuCard());
+  }else{
+   addBot(`<div class="bubble">안녕하세요. SEAM PM Bot입니다.<br>팀 정보는 이미 등록되어 있어요. 시작하기 전에 내 역할만 알려주세요.</div>`);
+   renderRoleCard();
+  }
+}
+function menuCard(){
+  let help;
+  if(scenario==='A'&&!teamRegistered) help=`<div class="help-row"><span>팀 등록이 필요합니다.</span><button class="btn text" onclick="startSetup()">초기 설정 시작 →</button></div>`;
+  else help=`<div class="help-row"><span>개인 정보와 팀 공통 설정은 별도로 관리합니다.</span><span><button class="btn text" onclick="quickAsk('내 정보')">내 정보</button><button class="btn text" onclick="quickAsk('팀 설정')">팀 설정</button></span></div>`;
+  return `<div class="card"><div class="card-head"><strong>SEAM 시작하기</strong><p>필요한 기능을 선택하거나 채팅으로 요청하세요.</p></div><div class="card-body" style="min-height:0">
+  <div class="btn-row">
+  <button class="btn" onclick="quickAsk('팀 현황 알려줘')">팀 현황</button>
+  <button class="btn" onclick="quickAsk('내 업무 확인해줘')">업무 확인</button>
+  <button class="btn" onclick="quickAsk('PM Bot에게 질문할게')">PM Bot 질문</button>
+  <button class="btn" onclick="quickAsk('설정')">설정</button>
+  </div>${help}</div></div>`;
+}
+
+function startSetup(fromTypedMessage=false){
+  if(!fromTypedMessage)addUser('설정');
+  setupStep=0;guideOpen=false;setupData={};verified={};stepError=null;
+  addBot(`<div class="bubble">GitHub와 Notion 연결 정보를 차례로 확인하겠습니다. 마지막 단계에서 Notion에서 확인한 팀 정보를 검토하고 확정합니다.</div>`);
+  renderSetupCard();
+}
+function renderSetupCard(){
+  const step=steps[setupStep],isGuide=guideOpen&&!!guides[step.id];
+  let body='';
+  if(isGuide){
+   const g=guides[step.id];
+   body=`<div class="guide"><h4>${g.title}</h4><ol>${g.items.map(x=>`<li>${x}</li>`).join('')}</ol><div class="guide-outro">${g.outro}</div></div>`;
+  }else if(step.id==='review'){
+   body=`<div class="tag">Notion 추출 결과 · 시뮬레이션</div>
+   <p class="muted small">실제 연동 전 시안이므로 아래 값은 예시입니다. 실제 서비스에서는 지정한 Notion 페이지에서 읽어온 결과가 표시됩니다.</p>
+   <div class="section-label" style="margin-top:14px">확인된 정보</div>
+   <div class="info-grid">
+    <span>프로젝트명</span><b>${escapeHtml(setupData.extractedName||'Notion에서 추출된 프로젝트명')}</b>
+    <span>프로젝트 목표</span><b>${escapeHtml(setupData.extractedGoal||'Notion에서 추출된 목표')}</b>
+    <span>프로젝트 기간</span><b>${escapeHtml(setupData.extractedPeriod||'Notion에서 추출된 기간')}</b>
+    <span>팀 정보 페이지</span><b>${escapeHtml(setupData.notionPage||'지정되지 않음')}</b>
+    <span>회의록 페이지</span><b>${escapeHtml(setupData.meetingNotesPage||'별도 지정 없음')}</b>
+   </div>
+   <div class="section-label" style="margin-top:18px">확인 상태</div>
+   <div class="checkrow"><span class="success">✓</span><span>연결한 Notion 페이지에서 확인된 정보</span></div>
+   <div class="checkrow"><span class="status">미설정</span><span>자료에서 확인되지 않은 정보는 미설정으로 남깁니다.</span></div>
+   <div class="checkrow"><span class="status">추가 확인</span><span>의미를 확정할 수 없는 정보는 추가 확인 대상으로 남깁니다.</span></div>
+   <div class="field" style="margin-top:14px"><label>확인 의견 (선택)</label><textarea id="reviewNote" rows="2" placeholder="수정하거나 추가로 확인할 내용이 있으면 입력하세요" oninput="setupData.reviewNote=this.value">${escapeHtml(setupData.reviewNote||'')}</textarea></div>`;
+  }else{
+   body=step.fields.map(([id,label,placeholder])=>{
+    const err=stepError&&stepError.field===id;
+    const errHtml=err?`<div class="field-error">⚠ ${stepError.msg}${stepError.guide?`<button onclick="toggleGuide(true)">발급 가이드 보기</button>`:''}</div>`:'';
+    return `<div class="field"><label>${label}</label><input id="f_${id}" class="${err?'err':''}" type="${id.toLowerCase().includes('token')?'password':'text'}" placeholder="${placeholder||'입력하세요'}" value="${escapeHtml(setupData[id]||'')}" oninput="setupData['${id}']=this.value">${errHtml}</div>`;
+   }).join('');
+   if(step.id==='notion') body+=`<p class="muted small">팀 정보 페이지는 필수입니다. 회의록 페이지는 별도로 관리하는 경우에만 입력하세요.</p>`;
+  }
+  const done=!!verified[step.id];
+  const nextLabel=step.id==='review'?'팀 정보 확정':done?'다음 단계':'연결 정보 확인';
+  const action=step.id==='review'?'finishSetup()':`verifyStep('${step.id}')`;
+  const guideRow=guides[step.id]?`<div class="help-row"><span>입력 방법이 헷갈리나요?</span><button class="btn text" onclick="toggleGuide(true)">가이드 보기 →</button></div>`:'';
+  const card=`<div class="card" id="setupCard">
+  <div class="card-head"><div class="tag">팀 초기 설정 · ${setupStep+1}/${steps.length}</div><strong style="display:block;margin-top:9px">${isGuide?'도움말 · '+step.title:step.title}</strong><p>${isGuide?'토큰 발급 방법을 확인합니다.':step.desc}</p></div>
+  <div class="card-body"><div class="progress">${steps.map((x,i)=>`<i class="${i<=setupStep?'on':''}"></i>`).join('')}</div>${body}</div>
+  ${!isGuide?`<div class="card-foot">${done?'<div class="success" style="margin-bottom:9px">✓ 연결 정보 확인 완료</div>':''}
+  <button class="btn primary full" onclick="${action}">${nextLabel}</button>
+  ${guideRow}
+  ${setupStep>0?`<button class="btn text" onclick="prevSetup()">← 이전 단계</button>`:''}</div>`:
+  `<div class="card-foot"><button class="btn full" onclick="toggleGuide(false)">← 입력으로 돌아가기</button></div>`}
+  </div>`;
+  const existing=$('setupCard');
+  if(existing)existing.outerHTML=card;
+  else addBot(card);
+}
+function toggleGuide(open){
+  steps[setupStep].fields.forEach(([fieldId])=>{const el=$('f_'+fieldId);if(el)setupData[fieldId]=el.value;});
+  guideOpen=open;renderSetupCard();
+}
+function prevSetup(){if(setupStep>0){setupStep--;guideOpen=false;stepError=null;renderSetupCard();}}
+function verifyStep(id){
+  const step=steps[setupStep];
+  step.fields.forEach(([fieldId])=>{const el=$('f_'+fieldId);if(el)setupData[fieldId]=el.value.trim();});
+  stepError=null;
+  if(id==='github'&&!setupData.repo) stepError={field:'repo',msg:'저장소 주소를 입력해 주세요.'};
+  else if(id==='notion'&&!setupData.notionPage&&setupData.notionToken) stepError={field:'notionPage',msg:'팀 정보 페이지 링크를 입력해 주세요.'};
+  const rule=tokenRules[id];
+  if(!stepError&&rule){
+    const v=setupData[rule.field]||'';
+    if(!v) stepError={field:rule.field,msg:'토큰을 입력해 주세요.',guide:true};
+    else if(!rule.re.test(v)) stepError={field:rule.field,msg:rule.format,guide:true};
+    else if(v.length<20) stepError={field:rule.field,msg:rule.auth,guide:true};
+  }
+  if(!stepError&&id==='notion'&&!setupData.notionPage) stepError={field:'notionPage',msg:'팀 정보 페이지 링크를 입력해 주세요.'};
+  if(stepError){verified[id]=false;renderSetupCard();return;}
+  verified[id]=true;
+  toast(id==='github'?'GitHub 연결 정보를 확인했습니다. (시뮬레이션)':'Notion 연결 정보를 확인했습니다. (시뮬레이션)');
+  if(setupStep<steps.length-1){setupStep++;guideOpen=false;renderSetupCard();}
+}
+function finishSetup(){
+  const note=$('reviewNote');if(note)setupData.reviewNote=note.value;
+  if(teamRegistered)return;
+  teamRegistered=true;
+  addBot(`<div class="card"><div class="card-head"><strong class="done-title"><span class="done-ico"><svg viewBox="0 0 16 16" width="10" height="10"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>설정이 완료되었어요</strong><p>팀 정보가 등록되었습니다. 아래 항목은 운영 중에 팀 설정에서 보완할 수 있습니다.</p></div><div class="card-body" style="min-height:0"><div class="info-grid">
+   <span>GitHub</span><b class="success">연결됨</b>
+   <span>Notion</span><b class="success">연결됨</b>
+   <span>팀 정보</span><b>Notion 추출 결과 확정</b>
+   <span>미설정</span><b><span class="status">1건</span> 프로젝트 기간 <span class="muted small">(예시)</span></b>
+   <span>추가 확인</span><b><span class="status">1건</span> 프로젝트 목표 표현 <span class="muted small">(예시)</span></b>
+  </div></div><div class="card-foot"><button class="btn text" onclick="quickAsk('팀 설정')">팀 설정에서 보완하기 →</button></div></div>`);
+  addBot(menuCard());
+}
+
+let roleCardSeq=0;
+function renderRoleCard(){
+  const n=++roleCardSeq,isOther=myRole&&!roles.slice(0,-1).includes(myRole);
+  const sel=isOther?'기타':myRole;
+  addBot(`<div class="card" id="roleCard${n}"><div class="card-head"><div class="tag">개인 설정</div><strong style="display:block;margin-top:9px">내 정보를 설정해 주세요</strong><p>역할을 알려주시면 담당 업무와 협업 상황에 맞춰 안내하겠습니다.</p></div><div class="card-body" style="min-height:0">
+  <div class="field"><label>내 역할</label><select id="role${n}" onchange="onRoleChange(${n})"><option value="">선택하세요</option>${roles.map(r=>`<option ${r===sel?'selected':''}>${r}</option>`).join('')}</select></div>
+  <div class="field ${sel==='기타'?'':'hidden'}" id="roleOtherWrap${n}"><label>역할 직접 입력</label><input id="roleOther${n}" placeholder="내 역할을 입력해 주세요" value="${isOther?escapeHtml(myRole):''}" oninput="onRoleChange(${n})"></div>
+  </div><div class="card-foot"><div class="foot-meta"><span>설정은 언제든 변경할 수 있습니다.</span><span>1 / 1</span></div><button class="btn primary full" id="roleSave${n}" onclick="saveRole(${n})" disabled>저장하기</button></div></div>`);
+  onRoleChange(n);
+}
+function roleValue(n){const s=$('role'+n).value;return s==='기타'?$('roleOther'+n).value.trim():s;}
+function onRoleChange(n){
+  const s=$('role'+n).value;
+  $('roleOtherWrap'+n).classList.toggle('hidden',s!=='기타');
+  $('roleSave'+n).disabled=!roleValue(n);
+}
+function saveRole(n){
+  const v=roleValue(n);if(!v)return;
+  myRole=v;
+  $('roleSave'+n).disabled=true;$('roleSave'+n).textContent='저장됨';
+  $('role'+n).disabled=true;$('roleOther'+n).disabled=true;
+  addBot(`<div class="bubble"><span class="done-title"><span class="done-ico"><svg viewBox="0 0 16 16" width="10" height="10"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>설정이 완료되었어요</span><br><span class="muted small">내 역할: ${escapeHtml(v)}</span></div>`);
+  addBot(menuCard());
+}
+
+function quickAsk(q){$('messageInput').value=q;sendMessage();}
+function sendMessage(){
+ const input=$('messageInput'),q=input.value.trim();if(!q)return;input.value='';addUser(q);handleMessage(q);
+}
+function handleMessage(q){
+ const t=q.toLowerCase();
+ if(t==='설정'||t.includes('초기 설정')){if(scenario==='A'&&!teamRegistered)startSetup(true);else addBot(`<div class="bubble">등록된 팀 정보가 있습니다. 팀 공통 정보는 유지하고, 필요한 항목만 변경할 수 있습니다.<br>내 역할을 바꾸려면 <b>내 정보</b>, 팀 공통 정보는 <b>팀 설정</b>을 선택하세요.</div>`);return;}
+ if(t.includes('내 정보')){addBot(`<div class="bubble">${myRole?`현재 역할은 <b>${escapeHtml(myRole)}</b>입니다. 바꾸려면 아래에서 다시 선택하세요.`:'아직 역할이 설정되지 않았어요. 아래에서 선택해 주세요.'}</div>`);renderRoleCard();return;}
+ if(t.includes('팀 설정')){addBot(`<div class="bubble">팀 공통 설정을 확인합니다. 이미 등록된 프로젝트 정보는 유지하며 변경이 필요한 항목만 수정합니다.</div>`);renderTeamSettings();return;}
+ if(t.includes('팀 현황')||t.includes('진행 상황')||t.includes('업무 확인')||t.includes('담당자')||t.includes('지연')){
+  const answer=t.includes('지연')?'일정 확인이 필요한 업무가 1건 있습니다. API 인증 모듈의 담당자와 일정을 확인해야 합니다.':t.includes('담당자')?'담당자별 업무를 정리했습니다. 아래 요약에서 담당자별 상태를 확인할 수 있습니다.':'현재 프로젝트 진행 상황입니다. 전체 작업 15건 중 완료 8건, 진행 중 5건, 확인 필요 2건입니다.';
+  addBot(`<div class="bubble">${answer}</div>`);
+  if(t.includes('담당자')||t.includes('지연'))renderTaskCard(t);
+  return;
+ }
+ if(t.includes('회의')){addBot(`<div class="bubble">최근 회의 기록을 확인했습니다. 결정사항과 후속 작업을 요약했습니다.<br><br>결정사항 2건, 후속 작업 3건이 확인됩니다. 상세 항목이 필요하면 말씀해 주세요.</div>`);return;}
+ if(t.includes('질문')){addBot(`<div class="bubble">궁금한 내용을 자연어로 질문해 주세요. 프로젝트 문서와 업무 정보를 바탕으로 답변하겠습니다.</div>`);return;}
+ addBot(`<div class="bubble">요청하신 내용은 프로젝트 맥락을 기준으로 확인하겠습니다. 어떤 결과가 필요한지 구체적으로 말씀해 주시면 관련 정보를 찾아 정리하겠습니다.</div>`);
+}
+function renderTeamSettings(){
+ addBot(`<div class="card"><div class="card-head"><strong>팀 설정</strong><p>팀 공통 정보를 확인하고 필요한 항목만 변경합니다.</p></div><div class="card-body">
+ <div class="info-grid"><span>팀</span><b>SEAM 파일럿</b><span>GitHub</span><b class="success">연결됨</b><span>Notion</span><b class="success">연결됨</b><span>업무 관리</span><b>Notion 프로젝트 페이지</b></div>
+ </div><div class="card-foot"><button class="btn primary full" onclick="toast('팀 설정은 시안에서 조회만 지원합니다.')">확인</button></div></div>`);
+}
+function renderTaskCard(q){
+ addBot(`<div class="card"><div class="card-head"><strong>${q.includes('담당자')?'담당자별 업무':'일정 확인 필요 업무'}</strong><p>복수 항목을 비교하기 쉬운 경우에만 구조화된 UI를 제공합니다.</p></div><div class="card-body"><table class="task-table"><thead><tr><th>업무</th><th>담당자</th><th>상태</th></tr></thead><tbody><tr><td>API 인증 모듈</td><td>김민수</td><td><span class="status">확인 필요</span></td></tr><tr><td>로그 분석</td><td>이지원</td><td><span class="status ok">진행 중</span></td></tr><tr><td>화면 통합</td><td>박서연</td><td><span class="status ok">진행 중</span></td></tr></tbody></table></div><div class="card-foot"><button class="btn" onclick="quickAsk('API 인증 모듈 상세 내용 알려줘')">상세 내용 확인</button></div></div>`);
+}
+
+renderInitial();
+</script>
+</body>
+</html>

@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import worklog_bridge
-from worklog import people
+from worklog import people, teams
 
 SESSION_SECONDS = 600
 _GITHUB_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
@@ -68,7 +68,9 @@ async def _ask(turn: Any, step: str) -> None:
     if step == "github":
         await turn.send_buttons("GitHub 아이디를 알려 주세요. `thdwlndjs`처럼 아이디만 보내면 돼요.", [SKIP])
     else:
-        hint = f" (예: {turn.user_name}, 줄인 이름이나 영어 이름)" if turn.user_name else ""
+        # 표시 이름이 'User <번호>'(명단 번호)면 예시로 보이지 않는다: 번호가 채팅에 남지 않게
+        named = turn.user_name and teams.member_no(turn.user_name) is None
+        hint = f" (예: {turn.user_name}, 줄인 이름이나 영어 이름)" if named else " (예: 줄인 이름이나 영어 이름)"
         await turn.send_buttons(f"회의록에 이름이 어떻게 적히나요? 여러 개면 쉼표로{hint}", [SKIP])
 
 

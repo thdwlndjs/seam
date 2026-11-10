@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from microsoft_teams.api import ConversationUpdateActivity, MessageActivity, TypingActivityInput
+from microsoft_teams.api import ConversationUpdateActivity, MessageActivity, MessageActivityInput, TypingActivityInput
 from microsoft_teams.api.activities.invoke.adaptive_card.action import AdaptiveCardInvokeActivity
 from microsoft_teams.api.models.adaptive_card.adaptive_card_action_response import (
     AdaptiveCardActionMessageResponse,
@@ -146,9 +146,11 @@ def _form_card(event: dict) -> AdaptiveCard:
     for field in card["inputs"]:
         kind = field["type"]
         if kind == "text":
+            # style "Password": 토큰 입력칸(Adaptive Card 1.5). 화면에 가려 보이고, 제출 뒤에는 서버가 이 카드를 값 없는 카드로 바꾼다
             body.append(TextInput(id=field["id"], label=field.get("label"), value=field.get("value", ""),
                                   is_required=field.get("required", False), max_length=field.get("max_length"),
-                                  is_multiline=field.get("multiline", False), style="Text"))
+                                  is_multiline=field.get("multiline", False), placeholder=field.get("placeholder"),
+                                  style="Password" if field.get("style") == "Password" else "Text"))
         elif kind == "toggle":
             body.append(ToggleInput(id=field["id"], title=field.get("label") or field.get("title", ""),
                                     value=field.get("value", "false"), value_on=field.get("value_on", "true"),
@@ -212,6 +214,21 @@ async def api_board(request: Request, rest: str) -> Response:
     return await _forward(request, f"/api/board{rest}")
 
 
+async def _replace_submitted_card(ctx: ActivityContext, card: AdaptiveCard) -> None:
+    """방금 제출한 카드(Action.Submit)를 값 없는 카드로 바꾼다. 제출 활동의 replyToId가 그 카드 메시지다.
+    바꾸지 못하면(Playground·권한 등) 새 메시지로 보낸다. 입력값은 서버가 카드에 넣지 않으므로 어느 쪽이든 값은 남지 않는다."""
+    activity = ctx.activity
+    card_id = getattr(activity, "reply_to_id", None)
+    conversation_id = activity.conversation.id if activity.conversation else None
+    if card_id and conversation_id:
+        try:
+            await ctx.api.conversations.activities(conversation_id).update(card_id, MessageActivityInput().add_card(card))
+            return
+        except Exception:
+            logging.warning("카드 교체 실패 — 새 메시지로 보낸다")
+    await ctx.send(card)
+
+
 async def relay(ctx: ActivityContext, payload: dict) -> None:
     """서버에 한 턴을 보내고, 돌아오는 이벤트를 Teams 화면으로 옮긴다."""
     stream_open = False
@@ -270,6 +287,9 @@ async def relay(ctx: ActivityContext, payload: dict) -> None:
                 elif kind == "buttons":
                     await close_stream()
                     await ctx.send(_build_buttons_card(event))
+                elif kind == "replace":
+                    await close_stream()
+                    await _replace_submitted_card(ctx, _build_buttons_card(event))
                 elif kind == "done":
                     await close_stream()
     except Exception:

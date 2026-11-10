@@ -380,11 +380,11 @@ class MigrationTests(SearchTestCase):
         with closing(sqlite3.connect(self.store)) as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'knowledge_fts'").fetchone()[0], 0)
         result = db.initialize(self.store)
-        self.assertEqual(result["schema_version"], 9)
+        self.assertEqual(result["schema_version"], db.SCHEMA_VERSION)  # v8 → 최신(9 이후 마이그레이션 포함)
         with closing(sqlite3.connect(self.store)) as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM work_items").fetchone()[0], 3)  # 데이터 보존
             self.assertEqual(c.execute("SELECT COUNT(*) FROM knowledge_fts").fetchone()[0], 3)  # 기존 항목으로 채움
-            self.assertEqual(c.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0], "9")
+            self.assertEqual(c.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0], str(db.SCHEMA_VERSION))
         self.assertEqual(self.ids("미러"), ["old-0"])
         self.assertEqual(self.ids("김디자"), ["old-2"])  # 속성도 색인
         db.initialize(self.store)  # 한 번 더 해도 그대로

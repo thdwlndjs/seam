@@ -5,6 +5,7 @@ python -m worklog trace   <Task·결정·후보 ID>
 python -m worklog map     --scope team:<팀ID> [--json]   (섹션별 역할 보기)
 python -m worklog map-set --scope team:<팀ID> "<섹션 이름>" <진행|회의|보관|제외> --actor <이름>   (역할 바꾸기)
 python -m worklog extract-eval --scope team:<팀ID> [--prompt-version ...]   (정답지와 추출 비교)
+python -m worklog roster-load --file <명단.json>   (팀 명단 넣기: 번호→팀. 명단 파일은 커밋하지 않는다)
 python -m worklog reindex-fts [--scope team:<팀ID>]   (지식 검색 색인을 항목에서 다시 만든다. 색인은 파생 데이터)
 python -m worklog reprocess --scope team:<팀ID> [--error-kind contract|quote_mismatch|llm_failed]   (멈춘 해석·반영 오류를 다시 열어 다음 주기에 다시 처리)
 python -m worklog search --scope team:<팀ID> "<질문>" [--kind decision ...] [--limit 8] [--max-tokens 3000]   (색인 검색)
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from contextlib import closing
 
-from . import apply, core, db, runs, search, sections
+from . import apply, core, db, runs, search, sections, teams
 from .db import ConflictError, NotFoundError, WorklogError
 
 DEFAULT_STORE = Path(__file__).resolve().parents[2] / "worklog.sqlite3"
@@ -52,6 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     redo = sub.add_parser("reprocess", help="멈춘 처리 오류 다시 열기")
     redo.add_argument("--scope", required=True)
     redo.add_argument("--error-kind", choices=["contract", "quote_mismatch", "llm_failed", "busy"], help="이 종류만(기본: 전부)")
+    roster = sub.add_parser("roster-load", help="팀 명단(번호→팀) 넣기. 여러 번 넣어도 결과가 같다")
+    roster.add_argument("--file", required=True, help='JSON 목록: [{"member_no": "...", "team_code": "alpha", "team_name": "알파팀", "is_leader": false}]')
     find = sub.add_parser("search", help="지식 검색(색인)")
     find.add_argument("text", help="질문 또는 검색어")
     find.add_argument("--scope", required=True)
@@ -89,6 +92,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "reprocess":
             data = {"scope": args.scope, "stuck_before": len(runs.stuck(store, args.scope)),
                     "reopened": runs.reprocess(store, args.scope, args.error_kind)}
+        elif args.command == "roster-load":
+            rows = json.loads(Path(args.file).read_text(encoding="utf-8"))
+            data = teams.load_roster(store, rows)  # 개수만 보인다(번호는 출력하지 않는다)
         elif args.command == "reindex-fts":
             data = {"scope": args.scope, "indexed": search.rebuild(store, args.scope)}
         elif args.command == "search":
