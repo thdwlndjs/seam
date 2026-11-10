@@ -97,6 +97,47 @@ button{cursor:pointer}
 .small{font-size:11px}
 .hidden{display:none!important}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#292929;color:#fff;padding:10px 16px;border-radius:7px;z-index:50}
+/* v2 확장: 메뉴 결과·대기·시안 메모 */
+.scenarios .opt{display:flex;align-items:center;gap:6px;margin-left:14px;padding-left:14px;border-left:1px solid #555;font-size:12px;color:#bbb}
+.scenarios .opt button{padding:6px 10px;font-size:12px;font-weight:500}
+.note{margin-top:8px;border:1px dashed #d9b84a;background:#fffbe8;color:#6b5600;border-radius:7px;padding:8px 10px;font-size:11.5px;line-height:1.55;max-width:640px}
+.note b{color:#5a4700}
+body.hide-notes .note{display:none}
+.spin{width:14px;height:14px;border:2px solid #d6d6ea;border-top-color:#6264a7;border-radius:50%;display:inline-block;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:8px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.loading-card{border:1px solid #e3e3ef;border-radius:10px;background:#fafafe;padding:14px 16px;max-width:640px;color:#555;font-size:13px}
+.stats{display:flex;gap:8px;margin:2px 0 4px}
+.stat{flex:1;border:1px solid #eee;border-radius:8px;padding:9px 10px;text-align:center}
+.stat b{display:block;font-size:18px}
+.stat span{font-size:11px;color:#777}
+.src{margin:0;padding-left:16px;font-size:12px;line-height:1.8;color:#555}
+.src a{color:#4f52b2}
+.chip{display:inline-block;font-size:10.5px;border-radius:10px;padding:2px 7px;margin-left:6px;vertical-align:1px}
+.chip.agreed{background:#e7f5ec;color:#107c41}
+.chip.draft{background:#fff4ce;color:#8a5b00}
+.chip.guess{background:#f1f1f1;color:#666;border:1px dashed #bbb}
+.chip.gh{background:#eef3fb;color:#2a5aa8}
+.coord-item{border:1px solid #eee;border-radius:8px;padding:11px 12px;margin-bottom:9px}
+.coord-item .why{font-size:12px;color:#777;margin:4px 0 9px}
+.coord-item .btn{padding:6px 10px;font-size:12px}
+.coord-item.done{background:#fafafa;opacity:.75}
+.issue{border:1px solid #eee;border-radius:8px;padding:11px 12px;margin-bottom:9px}
+.issue.off{opacity:.45}
+.issue .field{margin-bottom:8px}
+.issue .field input,.issue .field select{padding:7px 9px}
+.nav-row{display:flex;justify-content:space-between;align-items:center;margin-top:10px;padding-top:10px;border-top:1px solid #eee;font-size:12px;color:#888}
+.pick{display:flex;gap:9px;align-items:flex-start;padding:9px 0;border-bottom:1px solid #eee;font-size:13px}
+.pick:last-child{border:0}
+.pick small{display:block;color:#888;font-size:11.5px}
+.drop{border:1.5px dashed #c9c9dd;border-radius:9px;background:#fafafe;padding:16px;text-align:center;color:#666;font-size:12.5px;line-height:1.6;cursor:pointer}
+.drop b{color:#45468a}
+.mem{display:grid;grid-template-columns:96px 1fr auto;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid #eee;font-size:12.5px}
+.mem:last-child{border:0}
+.mem .who b{display:block;font-size:13px}
+.mem .who span{color:#888;font-size:11.5px}
+.mem .what{line-height:1.55;color:#444}
+.mem .what small{display:block;color:#888}
+.file{display:flex;justify-content:space-between;align-items:center;border:1px solid #eee;border-radius:7px;padding:8px 10px;font-size:12.5px;margin-top:8px}
 @media(max-width:850px){.app{grid-template-columns:52px minmax(0,1fr)}.sidebar{display:none}.timeline{padding:18px 14px}.scenarios button{font-size:11px;padding:8px}}
 @media(max-width:520px){.scenarios{gap:4px}.scenarios button{padding:8px;font-size:10px}.app{height:calc(100vh - 54px);height:calc(100dvh - 54px);grid-template-columns:42px minmax(0,1fr)}.topbar{padding:0 12px}.timeline{padding:14px 10px}.card-body{padding:12px}}
 </style>
@@ -105,6 +146,8 @@ button{cursor:pointer}
 <div class="scenarios">
   <button id="tabA" class="active" onclick="switchScenario('A')">A · 등록된 팀 없음</button>
   <button id="tabB" onclick="switchScenario('B')">B · 등록된 팀 있음</button>
+  <button id="tabC" onclick="switchScenario('C')">C · 다시 접속</button>
+  <div class="opt"><button id="noteBtn" class="active" onclick="toggleNotes()">시안 메모</button></div>
 </div>
 
 <div class="app">
@@ -182,14 +225,24 @@ let stepError=null;
 const roles=['기획·PM','프론트엔드','백엔드','디자인','데이터·AI','기타'];
 let myRole='';
 
+let qaMode=false,seq=0,coordState={};
 function switchScenario(s){
  scenario=s;
- $('tabA').classList.toggle('active',s==='A');
- $('tabB').classList.toggle('active',s==='B');
+ ['A','B','C'].forEach(k=>$('tab'+k).classList.toggle('active',s===k));
  setupStep=0;guideOpen=false;setupData={};verified={};activeTask=null;taskHistory=[];chatCount=0;
- stepError=null;myRole='';teamRegistered=false;roleCardSeq=0;
+ stepError=null;myRole=s==='C'?'백엔드':'';teamRegistered=s==='C';roleCardSeq=0;qaMode=false;coordState={};
  renderInitial();
 }
+function toggleNotes(){document.body.classList.toggle('hide-notes');$('noteBtn').classList.toggle('active');}
+function note(html){return `<div class="note"><b>시안 메모</b> · ${html}</div>`;}
+function navRow(left=''){return `<div class="nav-row"><span>${left}</span><button class="btn text" onclick="quickAsk('메뉴')">☰ 메뉴로</button></div>`;}
+// 대기 화면: 짧은 대기(1~5초)는 '확인하는 중' 카드를 띄웠다가 결과 카드로 바꿔 끼운다
+function withLoading(label,ms,render){
+ const id='ld'+(++seq);
+ addBot(`<div class="loading-card" id="${id}"><span class="spin"></span>${label}</div>`);
+ setTimeout(()=>{const el=$(id);if(!el)return;el.outerHTML=render();scrollBottom();},ms);
+}
+function now(){const d=new Date();return d.getHours()+':'+String(d.getMinutes()).padStart(2,'0');}
 function addBot(html){$('conversation').insertAdjacentHTML('beforeend',`<div class="msg"><div class="avatar">S</div><div class="msg-content"><div class="msg-head">SEAM PM Bot</div>${html}</div></div>`);scrollBottom();}
 function addUser(text){$('conversation').insertAdjacentHTML('beforeend',`<div class="msg user"><div class="msg-content"><div class="msg-head">나</div><div class="bubble">${escapeHtml(text)}</div></div></div>`);scrollBottom();}
 function scrollBottom(){setTimeout(()=>$('timeline').scrollTop=$('timeline').scrollHeight,30);}
@@ -199,11 +252,14 @@ function toast(t){$('toast').textContent=t;$('toast').classList.remove('hidden')
 function renderInitial(){
   $('conversation').innerHTML='';
   if(scenario==='A'){
-   addBot(`<div class="bubble">안녕하세요. SEAM PM Bot입니다.<br>아직 팀이 연결되지 않았어요. 노션만 연결하면 바로 시작할 수 있어요. GitHub는 선택이에요.</div>`);
+   addBot(`<div class="bubble">SEAM 파일럿팀이시네요 👋<br>아직 팀이 연결되지 않았어요. 노션만 연결하면 바로 시작할 수 있어요. GitHub는 선택이에요.</div>${note('<b>결정:</b> 명단(번호→팀)으로 팀 이름을 찾아 인사. 명단에 없는 사람은 "팀을 찾지 못했어요" 안내만.')}`);
    addBot(menuCard());
-  }else{
+  }else if(scenario==='B'){
    addBot(`<div class="bubble">안녕하세요. SEAM PM Bot입니다.<br>팀 정보는 이미 등록되어 있어요. 시작하기 전에 내 역할만 알려주세요.</div>`);
    renderRoleCard();
+  }else{
+   addBot(`<div class="bubble">다시 오셨네요. 무엇을 도와드릴까요?</div>${note('등록을 마친 사람이 대화를 다시 열면 설정 없이 <b>같은 초기 메뉴</b>로 시작해요. <b>결정:</b> 이번엔 메뉴만. 지난 접속 이후 변경 요약은 나중 파트 후보 (PRD DEC-06, CAP S-09)')}`);
+   addBot(menuCard());
   }
 }
 function menuCard(){
@@ -216,7 +272,7 @@ function menuCard(){
   <button class="btn" onclick="quickAsk('내 업무 확인해줘')">업무 확인</button>
   <button class="btn" onclick="quickAsk('PM Bot에게 질문할게')">PM Bot 질문</button>
   <button class="btn" onclick="quickAsk('설정')">설정</button>
-  </div>${help}</div></div>`;
+  </div>${help}</div></div>${(scenario==='A'&&!teamRegistered)?'':note('<b>초기 메뉴 = 모든 흐름의 중심.</b> 설정 완료 직후 · 역할 저장 직후 · 다시 접속할 때 · 각 결과의 [☰ 메뉴로] · 채팅에 "메뉴" 입력 → 모두 이 카드로 돌아와요.')}`;
 }
 
 function startSetup(fromTypedMessage=false){
@@ -295,7 +351,9 @@ function finishSetup(github,board){
    <span>GitHub</span>${github?'<b class="success">연결됨</b>':'<b>나중에 <span class="muted small">(팀 설정에서 연결할 수 있어요)</span></b>'}
    ${github?`<span>작업 보드</span>${board?'<b class="success">연결됨</b>':'<b>없음</b>'}`:''}
   </div></div><div class="card-foot"><button class="btn text" onclick="quickAsk('팀 현황 알려줘')">팀 현황 먼저 보기 →</button></div></div>`);
+  addBot(`<div class="bubble"><span class="spin"></span>팀 노션 자료를 처음 읽고 있어요. 2분쯤 걸려요.<br><span class="muted small">그동안 메뉴는 쓸 수 있어요. 팀 현황은 읽은 만큼만 보이고, 다 읽으면 알려드릴게요.</span></div>${note('<b>대기 화면 · 5초 이상</b>: 기다리게 하지 않고 백그라운드로 돌린 뒤 끝나면 알림. 첫 노션 수집 실측 약 120초 (report-2026-11-03). 시안에서는 8초 뒤 완료 알림.')}`);
   addBot(menuCard());
+  setTimeout(()=>{addBot(`<div class="bubble"><span class="done-title"><span class="done-ico"><svg viewBox="0 0 16 16" width="10" height="10"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>팀 자료를 다 읽었어요</span><br><span class="muted small">이제 팀 현황에 전체 내용이 보여요.</span><div class="quick"><button onclick="quickAsk('팀 현황 알려줘')">팀 현황 보기</button></div></div>`);},8000);
 }
 
 let roleCardSeq=0;
@@ -328,27 +386,220 @@ function sendMessage(){
  const input=$('messageInput'),q=input.value.trim();if(!q)return;input.value='';addUser(q);handleMessage(q);
 }
 function handleMessage(q){
- const t=q.toLowerCase();
- if(t==='설정'||t.includes('초기 설정')){if(scenario==='A'&&!teamRegistered)startSetup(true);else addBot(`<div class="bubble">등록된 팀 정보가 있습니다. 팀 공통 정보는 유지하고, 필요한 항목만 변경할 수 있습니다.<br>내 역할을 바꾸려면 <b>내 정보</b>, 팀 공통 정보는 <b>팀 설정</b>을 선택하세요.</div>`);return;}
- if(t.includes('내 정보')){addBot(`<div class="bubble">${myRole?`현재 역할은 <b>${escapeHtml(myRole)}</b>입니다. 바꾸려면 아래에서 다시 선택하세요.`:'아직 역할이 설정되지 않았어요. 아래에서 선택해 주세요.'}</div>`);renderRoleCard();return;}
- if(t.includes('팀 설정')){addBot(`<div class="bubble">팀 공통 설정을 확인합니다. 이미 등록된 프로젝트 정보는 유지하며 변경이 필요한 항목만 수정합니다.</div>`);renderTeamSettings();return;}
- if(t.includes('팀 현황')||t.includes('진행 상황')||t.includes('업무 확인')||t.includes('담당자')||t.includes('지연')){
-  const answer=t.includes('지연')?'일정 확인이 필요한 업무가 1건 있습니다. API 인증 모듈의 담당자와 일정을 확인해야 합니다.':t.includes('담당자')?'담당자별 업무를 정리했습니다. 아래 요약에서 담당자별 상태를 확인할 수 있습니다.':'현재 프로젝트 진행 상황입니다. 전체 작업 15건 중 완료 8건, 진행 중 5건, 확인 필요 2건입니다.';
-  addBot(`<div class="bubble">${answer}</div>`);
-  if(t.includes('담당자')||t.includes('지연'))renderTaskCard(t);
+ const t=q.toLowerCase().trim();
+ // 공통: 메뉴로 돌아오기
+ if(t==='메뉴'||t==='처음으로'||t==='☰ 메뉴로'){qaMode=false;addBot(menuCard());return;}
+ if(t==='설정'||t.includes('초기 설정')){
+  qaMode=false;
+  if(scenario==='A'&&!teamRegistered)startSetup(true);
+  else addBot(`<div class="bubble">무엇을 바꿀까요? 내 역할은 <b>내 정보</b>, 팀 공통 연결은 <b>팀 설정</b>에서 바꿀 수 있어요.</div><div class="quick"><button onclick="quickAsk('내 정보')">내 정보</button><button onclick="quickAsk('팀 설정')">팀 설정</button><button onclick="quickAsk('메뉴')">☰ 메뉴로</button></div>`);
   return;
  }
- if(t.includes('회의')){addBot(`<div class="bubble">최근 회의 기록을 확인했습니다. 결정사항과 후속 작업을 요약했습니다.<br><br>결정사항 2건, 후속 작업 3건이 확인됩니다. 상세 항목이 필요하면 말씀해 주세요.</div>`);return;}
- if(t.includes('질문')){addBot(`<div class="bubble">궁금한 내용을 자연어로 질문해 주세요. 프로젝트 문서와 업무 정보를 바탕으로 답변하겠습니다.</div>`);return;}
- addBot(`<div class="bubble">요청하신 내용은 프로젝트 맥락을 기준으로 확인하겠습니다. 어떤 결과가 필요한지 구체적으로 말씀해 주시면 관련 정보를 찾아 정리하겠습니다.</div>`);
+ // 팀 연결 전에는 기능 메뉴를 막고 설정으로 안내
+ if(scenario==='A'&&!teamRegistered&&/팀 현황|업무 확인|질문/.test(t)){
+  addBot(`<div class="bubble">먼저 팀을 연결해야 쓸 수 있어요. 노션만 연결하면 바로 시작할 수 있어요.</div><div class="quick"><button onclick="startSetup()">초기 설정 시작</button></div>`);return;
+ }
+ if(t.includes('내 정보')){qaMode=false;addBot(`<div class="bubble">${myRole?`현재 역할은 <b>${escapeHtml(myRole)}</b>이에요. 바꾸려면 아래에서 다시 선택하세요.`:'아직 역할이 설정되지 않았어요. 아래에서 선택해 주세요.'}</div>`);renderRoleCard();return;}
+ if(t.includes('팀 설정')){qaMode=false;renderTeamSettings();return;}
+ if(t.includes('노션 페이지 바꾸기')){renderNotionChange();return;}
+ if(t.includes('팀 현황')){qaMode=false;showTeamStatus();return;}
+ if(t.includes('조율')){showCoordination();return;}
+ if(t.includes('팀원별')){showMembers();return;}
+ if(t.includes('이슈 제안')){showIssueProposal();return;}
+ if(t.includes('업무 확인')){qaMode=false;showMyWork();return;}
+ if(t.includes('작업물 공유')){showShareSelect();return;}
+ if(t.includes('자료 올리기')){showUpload();return;}
+ if(t.includes('pm bot에게 질문')||t==='질문'||t.includes('질문할게')){qaMode=true;showAskPrompt();return;}
+ if(qaMode){answerQuestion(q);return;}
+ addBot(`<div class="bubble">이렇게 물어보시면 바로 찾아볼게요. 아니면 메뉴에서 골라 주세요.</div><div class="quick"><button onclick="quickAsk('PM Bot에게 질문할게')">질문으로 물어보기</button><button onclick="quickAsk('메뉴')">☰ 메뉴로</button></div>${note('<b>결정:</b> 메뉴 밖 자유 입력은 안내만 하고 질문하기로 자동으로 넘기지 않음.')}`);
 }
+
+/* ── 팀 현황 (기존 메뉴 1·2) ─────────────────────── */
+function showTeamStatus(){
+ withLoading('팀 현황을 확인하는 중이에요…',1300,()=>`<div class="card">
+ <div class="card-head"><strong>팀 현황</strong><p>오늘 ${now()} 기준 · Notion 문서와 GitHub에서 확인했어요.</p></div>
+ <div class="card-body" style="min-height:0">
+  <div class="section-label">프로젝트</div>
+  <div class="info-grid" style="margin-bottom:16px"><span>프로젝트</span><b>SEAM 파일럿</b><span>목적</span><b>팀 프로젝트 운영 흐름 지원</b><span>지금 단계</span><b>기능 개발</b></div>
+  <div class="section-label">진행 상황</div>
+  <div class="stats"><div class="stat"><b>4</b><span>정해진 것</span></div><div class="stat"><b>5</b><span>진행 중</span></div><div class="stat"><b>2</b><span>아직 불명확</span></div></div>
+  <p class="muted small" style="margin:4px 0 16px">GitHub 이슈 15건 중 8건 완료 <span class="chip gh">GitHub 기준</span> · GitHub 완료는 기능 검증과 달라요.</p>
+  <div class="section-label">누가 뭐 하고 있나</div>
+  <div class="mem"><div class="who"><b>김민수</b><span>백엔드</span></div><div class="what">API 인증 모듈 <small>최근: 커밋 2건 · 어제</small></div><span class="status">일정 확인</span></div>
+  <div class="mem"><div class="who"><b>이지원</b><span>백엔드</span></div><div class="what">로그 분석 <small>최근: PR #21 병합 · 오늘</small></div><span class="status ok">진행 중</span></div>
+  <div class="mem"><div class="who"><b>박서연</b><span>프론트엔드</span></div><div class="what">화면 통합 <small>최근: 회의 후속 1건 맡음 · 11/7</small></div><span class="status ok">진행 중</span></div>
+  <p class="muted small" style="margin:6px 0 16px">외 3명 · [팀원별 보기]에서 전체</p>
+  <div class="section-label">확인이 필요한 것</div>
+  <div class="checkrow"><span class="status">불명확</span><span>로그인 방식: 소셜 로그인과 이메일 가입 중 아직 안 정해졌어요.</span></div>
+  <div class="checkrow"><span class="status">일정</span><span>API 인증 모듈 담당자 일정 확인이 필요해요.</span></div>
+  <div class="section-label" style="margin-top:16px">근거</div>
+  <ul class="src"><li><a href="#" onclick="return false">11/7 회의록</a> (Notion) <span class="chip agreed">합의</span></li><li><a href="#" onclick="return false">요구사항 정리</a> (Notion) <span class="chip draft">가안</span></li><li><a href="#" onclick="return false">GitHub 이슈 15건</a></li></ul>
+  <p class="muted small" style="margin-top:8px">조회하지 않은 범위: 디자인 폴더 (연결 안 됨)</p>
+ </div>
+ <div class="card-foot"><div class="btn-row"><button class="btn primary" onclick="quickAsk('조율 보기')">조율 보기</button><button class="btn" onclick="quickAsk('팀원별 보기')">팀원별 보기</button><button class="btn" onclick="toast('Teams 탭(구조 보기)이 열려요 · 시안에서는 생략')">전체 구조 보기 ↗</button><button class="btn" onclick="quickAsk('자료 올리기')">자료 추가</button></div>${navRow()}</div>
+ </div>${note('기존 메뉴 1(팀·프로젝트 정보)+메뉴 2(진행상황)를 <b>팀 현황</b> 하나로 합침. 구조 보기 탭은 메뉴가 아니라 여기 링크로. 근거에 빠진 회의록 등은 [자료 추가]로 바로 반영. <b>대기 화면 · 1~5초</b>: "확인하는 중" 카드 → 결과 카드로 교체 (메뉴 1 실측 1.6초).')}`);
+}
+
+/* ── 조율 보기 → 안건/보류/결정 기록 → 이슈 제안 ─── */
+const coordItems=[
+ {id:'c1',group:'지금 논의',title:'로그인 방식: 소셜 로그인 vs 이메일 가입',why:'11/7 회의록에 두 안이 가안으로 남아 있어요. API 설계가 이 결정을 기다려요.'},
+ {id:'c2',group:'역할 간 조율',title:'API 응답 형식 — 프론트·백엔드 확인',why:'요구사항 문서와 이슈 #12의 응답 형식이 달라요.'},
+ {id:'c3',group:'병렬 진행 가능',title:'화면 통합은 API 확정 전에도 시작 가능',why:'목업 데이터로 먼저 진행할 수 있어 보여요.',guess:true},
+ {id:'c4',group:'나중에 논의',title:'배포 환경 선택',why:'지금 결정하지 않아도 이번 주 작업에 영향이 없어요.'}
+];
+function coordItemHtml(c){
+ const st=coordState[c.id];
+ const stLabel=st==='agenda'?'다음 회의 안건에 넣었어요':st==='hold'?'보류했어요 · 메뉴 > 팀 현황 > 조율에서 다시 열 수 있어요':st==='decided'?'결정을 기록했어요':'';
+ return `<div class="coord-item ${st?'done':''}" id="ci_${c.id}"><b>${c.title}</b>${c.guess?'<span class="chip guess">추정</span>':''}<div class="why">${c.why}</div>
+ ${st?`<div class="success">✓ ${stLabel}</div>`:`<div class="btn-row"><button class="btn" onclick="coordAct('${c.id}','agenda')">다음 회의 안건으로</button><button class="btn" onclick="coordAct('${c.id}','hold')">보류</button><button class="btn" onclick="coordAct('${c.id}','decide')">결정 기록하기</button></div>`}</div>`;
+}
+function showCoordination(){
+ withLoading('지금 정할 것과 나눠 할 일을 정리하는 중이에요…',1800,()=>{
+  const groups=[...new Set(coordItems.map(c=>c.group))];
+  return `<div class="card"><div class="card-head"><strong>조율 보기</strong><p>AI가 정리한 제안이에요. 버튼을 누르기 전에는 아무것도 저장되지 않아요.</p></div>
+  <div class="card-body" style="min-height:0">${groups.map(g=>`<div class="section-label" style="margin-top:4px">${g}</div>${coordItems.filter(c=>c.group===g).map(coordItemHtml).join('')}`).join('')}</div>
+  <div class="card-foot">${navRow('근거: 11/7 회의록 · 요구사항 정리 · 이슈 #12')}</div></div>${note('조율·결정은 <b>팀 현황 아래</b>에 배치 (PRD: 진행상황 → 조율 보기). "추정"은 확인된 의존 사실이 아님을 표시. <b>대기 · 1~5초</b>.')}`;
+ });
+}
+function coordAct(id,act){
+ const c=coordItems.find(x=>x.id===id);
+ if(act==='decide'){renderDecisionInput(c);return;}
+ coordState[id]=act;
+ const el=$('ci_'+id);if(el)el.outerHTML=coordItemHtml(c);
+ toast(act==='agenda'?'다음 회의 안건에 넣었어요':'보류했어요');
+}
+function renderDecisionInput(c){
+ const n=++seq;
+ addBot(`<div class="card" id="dec${n}"><div class="card-head"><div class="tag">결정 기록</div><strong style="display:block;margin-top:9px">${c.title}</strong><p>정해진 내용을 직접 적어 주세요. AI 문장은 결정으로 저장되지 않아요.</p></div>
+ <div class="card-body" style="min-height:0"><div class="field"><label>결정 내용</label><textarea id="decText${n}" placeholder="예: 1차는 이메일 가입만, 소셜 로그인은 2차에" style="width:100%;min-height:80px;border:1px solid #c9c9c9;border-radius:5px;padding:10px"></textarea></div></div>
+ <div class="card-foot"><button class="btn primary full" onclick="saveDecision(${n},'${c.id}')">기록하기</button><button class="btn text" onclick="this.closest('.card').querySelector('.card-foot').innerHTML='<div class=muted>기록하지 않았어요.</div>'">취소</button></div></div>`);
+}
+function saveDecision(n,cid){
+ const v=$('decText'+n).value.trim();if(!v){toast('결정 내용을 적어 주세요.');return;}
+ coordState[cid]='decided';const el=$('ci_'+cid);if(el)el.outerHTML=coordItemHtml(coordItems.find(x=>x.id===cid));
+ $('dec'+n).querySelector('.card-foot').innerHTML=`<div class="success">✓ 결정을 기록했어요 · 작성: 나 · ${now()}</div>`;
+ $('decText'+n).disabled=true;
+ addBot(`<div class="bubble">이 결정으로 개발 이슈를 만들까요?</div><div class="quick"><button onclick="quickAsk('이슈 제안')">이슈 제안 받기</button><button onclick="quickAsk('메뉴')">☰ 메뉴로</button></div>`);
+}
+const issueDraft=[
+ {title:'이메일 가입 API 구현',done:'가입·로그인·토큰 재발급 엔드포인트 동작',who:'이지원'},
+ {title:'소셜 로그인 2차 범위 정리',done:'2차 범위 문서화 후 이슈 분리',who:'김민수'}
+];
+function showIssueProposal(){
+ withLoading('결정 내용을 개발 이슈로 나누는 중이에요…',1600,()=>`<div class="card" id="issueCard"><div class="card-head"><div class="tag">GitHub 이슈 제안</div><strong style="display:block;margin-top:9px">이렇게 나눠 봤어요</strong><p>고치거나 빼고 [등록]을 눌러야 GitHub에 만들어져요.</p></div>
+ <div class="card-body" style="min-height:0">${issueDraft.map((x,i)=>`<div class="issue" id="iss${i}"><label style="display:flex;gap:8px;align-items:center;font-size:12px;margin-bottom:8px"><input type="checkbox" checked onchange="$('iss${i}').classList.toggle('off',!this.checked);updIssueBtn()"> 포함</label>
+ <div class="field"><label>제목</label><input value="${x.title}"></div><div class="field"><label>완료 기준</label><input value="${x.done}"></div><div class="field" style="margin:0"><label>담당 후보</label><select><option>${x.who}</option><option>김민수</option><option>이지원</option><option>박서연</option><option>나중에 정하기</option></select></div></div>`).join('')}
+ <p class="muted small">근거: 방금 기록한 결정 · 11/7 회의록</p></div>
+ <div class="card-foot"><button class="btn primary full" id="issueBtn" onclick="registerIssues()">2건 등록</button><button class="btn text" onclick="$('issueCard').querySelector('.card-foot').innerHTML='<div class=muted>등록하지 않았어요. GitHub에는 아무것도 만들어지지 않았어요.</div>'">취소</button><p class="muted small" style="margin:6px 0 0">등록은 승인 권한이 있는 사람만 할 수 있어요.</p></div></div>`);
+}
+function updIssueBtn(){const n=[...document.querySelectorAll('#issueCard .issue')].filter(e=>!e.classList.contains('off')).length;const b=$('issueBtn');b.textContent=n+'건 등록';b.disabled=!n;}
+function registerIssues(){
+ $('issueCard').querySelector('.card-foot').innerHTML='<div class="muted"><span class="spin"></span>GitHub에 등록하는 중…</div>';
+ setTimeout(()=>{
+  $('issueCard').querySelector('.card-foot').innerHTML='<div class="muted">아래 결과를 확인하세요.</div>';
+  addBot(`<div class="card"><div class="card-head"><strong>등록 결과</strong><p>1건 등록 · 1건 실패</p></div><div class="card-body" style="min-height:0">
+  <div class="checkrow"><span class="status ok">등록</span><span>이메일 가입 API 구현 → <a href="#" onclick="return false">#24</a> · 담당 이지원</span></div>
+  <div class="checkrow"><span class="status" style="background:#fde7e9;color:#a4262c">실패</span><span>소셜 로그인 2차 범위 정리 — 저장소 쓰기 권한이 없어요.</span></div></div>
+  <div class="card-foot"><button class="btn" onclick="toast('실패한 1건만 다시 시도해요 · 시안')">실패한 것만 다시</button>${navRow()}</div></div>${note('부분 성공은 성공 항목만 연결하고 실패 이유를 그대로 보여줌 (PRD FR-16). 다시 눌러도 이미 만든 #24는 중복 생성되지 않아야 함.')}`);
+ },1500);
+}
+
+/* ── 업무 확인 (기존 메뉴 3) → 작업물 공유 (기존 메뉴 4) ─ */
+function showMyWork(){
+ withLoading('내 업무를 확인하는 중이에요…',900,()=>`<div class="card"><div class="card-head"><strong>내 업무</strong><p>내 역할: ${escapeHtml(myRole||'미설정')} · GitHub 기준 · 오늘 ${now()}</p></div>
+ <div class="card-body" style="min-height:0"><table class="task-table"><thead><tr><th>업무</th><th>GitHub 상태</th><th></th></tr></thead><tbody>
+ <tr><td>API 인증 모듈</td><td><span class="status">진행 중</span></td><td><a href="#" onclick="return false">#12</a></td></tr>
+ <tr><td>로그 분석</td><td><span class="status">할 일</span></td><td><a href="#" onclick="return false">#15</a></td></tr>
+ <tr><td>배포 스크립트</td><td><span class="status ok">GitHub 완료</span></td><td><a href="#" onclick="return false">#9</a></td></tr></tbody></table>
+ <p class="muted small" style="margin-top:10px">GitHub 완료는 이슈가 닫혔다는 뜻이에요. 기능 검증과는 달라요.</p></div>
+ <div class="card-foot"><div class="btn-row"><button class="btn primary" onclick="quickAsk('작업물 공유하기')">작업물 공유하기</button></div>${navRow()}</div></div>${note('기존 메뉴 3(내 역할) = <b>업무 확인</b>. 기존 메뉴 4(작업물 공유)는 내 작업을 공유하는 것이라 여기 아래로. GitHub 미연결 팀이면 표 대신 "GitHub를 연결하면 보여요 [팀 설정]" 안내.')}`);
+}
+function showShareSelect(){
+ withLoading('최근 PR·커밋을 불러오는 중이에요…',1100,()=>`<div class="card" id="shareCard"><div class="card-head"><strong>무엇을 공유할까요?</strong><p>고른 것만 팀에 공유돼요.</p></div>
+ <div class="card-body" style="min-height:0">
+ <label class="pick"><input type="checkbox" checked> <span>PR #21 로그인 API 추가 <span class="chip gh">병합됨</span><small>오늘 11:20 · 파일 6개</small></span></label>
+ <label class="pick"><input type="checkbox"> <span>커밋 a1b2c3d 토큰 검증 수정<small>어제 18:05</small></span></label>
+ <label class="pick"><input type="checkbox"> <span>PR #19 로그 수집 정리 <span class="chip draft">열림</span><small>11/8</small></span></label></div>
+ <div class="card-foot"><button class="btn primary full" onclick="showSharePreview()">미리보기</button><button class="btn text" onclick="cancelShare()">취소</button></div></div>`);
+}
+function cancelShare(){const c=$('shareCard');if(c)c.querySelector('.card-foot').innerHTML='<div class="muted">공유하지 않았어요. 아무것도 저장되지 않았어요.</div>';addBot(menuCard());}
+function showSharePreview(){
+ $('shareCard').querySelector('.card-foot').innerHTML='<div class="muted">미리보기를 확인하세요.</div>';
+ withLoading('공유 요약을 만드는 중이에요…',1400,()=>`<div class="card" id="previewCard"><div class="card-head"><div class="tag">공유 미리보기</div><strong style="display:block;margin-top:9px">로그인 API를 추가했어요</strong><p>팀 채널에 이렇게 올라가요.</p></div>
+ <div class="card-body" style="min-height:0"><div class="guide" style="line-height:1.6">이메일 가입·로그인 엔드포인트를 추가했어요. 토큰 재발급은 다음 PR에서 이어서 해요.<br><span class="muted small">관련 결정: 1차는 이메일 가입만 (11/10) · 원문: <a href="#" onclick="return false">PR #21</a></span></div></div>
+ <div class="card-foot"><div class="btn-row"><button class="btn primary" onclick="doShare()">공유</button><button class="btn" onclick="$('previewCard').querySelector('.card-foot').innerHTML='<div class=muted>공유하지 않았어요.</div>';addBot(menuCard())">취소</button></div></div></div>${note('[공유]를 누르기 전에는 팀 메시지도, 지식 기록도 남지 않음 (PRD FR-17). 취소·무응답도 동일.')}`);
+}
+function doShare(){
+ $('previewCard').querySelector('.card-foot').innerHTML=`<div class="success">✓ 팀 채널에 공유했어요 · 원문 링크 포함 · ${now()}</div>`;
+ addBot(`<div class="bubble">공유를 마쳤어요.</div><div class="quick"><button onclick="quickAsk('업무 확인')">업무 확인으로</button><button onclick="quickAsk('메뉴')">☰ 메뉴로</button></div>`);
+}
+
+/* ── 팀원별 보기 (팀 현황 아래) ───────────────── */
+const members=[
+ ['김민수','백엔드','API 인증 모듈 #12','커밋 2건 · 어제 18:05','일정 확인','담당 일정이 요구사항 문서 마감과 겹쳐요'],
+ ['이지원','백엔드','로그 분석 #15 · 이메일 가입 API #24','PR #21 병합 · 오늘 11:20','진행 중',''],
+ ['박서연','프론트엔드','화면 통합','회의 후속 1건 맡음 · 11/7','진행 중',''],
+ ['정우진','기획·PM','요구사항 정리','노션 문서 수정 · 오늘 10:02','진행 중',''],
+ ['최하늘','디자인','디자인 시안','기록 없음','미확인','디자인 폴더가 연결되지 않아 확인하지 못했어요'],
+ ['한도윤','데이터·AI','배정된 작업 없음','—','배정 없음','']
+];
+function showMembers(){
+ withLoading('팀원별 작업을 모으는 중이에요…',1200,()=>`<div class="card"><div class="card-head"><strong>팀원별 보기</strong><p>오늘 ${now()} 기준 · GitHub 담당자와 회의 후속 작업 기준이에요.</p></div>
+ <div class="card-body" style="min-height:0">${members.map(([n,r,w,last,st,warn])=>`<div class="mem"><div class="who"><b>${n}</b><span>${r}</span></div><div class="what">${w}<small>최근: ${last}</small>${warn?`<small style="color:#8a5b00">${warn}</small>`:''}</div><span class="status ${st==='진행 중'?'ok':''}">${st}</span></div>`).join('')}
+ <p class="muted small" style="margin-top:10px">근거: GitHub 이슈 담당자 · 11/7 회의록 후속 작업 · 조회하지 않은 범위: 디자인 폴더</p></div>
+ <div class="card-foot"><div class="btn-row"><button class="btn" onclick="quickAsk('팀 현황 알려줘')">← 팀 현황으로</button></div>${navRow()}</div></div>${note('팀원이 <b>지금 뭘 맡았고 최근 뭘 했는지</b>만 보여줌. 점수·순위·활동량 비교는 하지 않음 (CAP 비목표: 개인 성과 감시). "기록 없음"은 "안 했다"가 아니라 "연결된 곳에서 못 찾음".')}`);
+}
+
+/* ── 자료 반영: 회의록 등 자유 업로드 (팀 현황 > 자료 추가) ─ */
+function showUpload(){
+ const n=++seq;
+ addBot(`<div class="card" id="up${n}"><div class="card-head"><div class="tag">자료 추가</div><strong style="display:block;margin-top:9px">회의록이나 자료를 올려 주세요</strong><p>파일을 올리거나, 내용을 그대로 붙여 넣어도 돼요.</p></div>
+ <div class="card-body" style="min-height:0">
+  <div class="drop" onclick="fakeFile(${n})"><b>파일 올리기</b><br>txt · md · docx · pdf · 채팅창에 끌어다 놓아도 돼요</div>
+  <div id="upFile${n}"></div>
+  <div class="field" style="margin-top:12px"><label>또는 내용 붙여넣기</label><textarea id="upText${n}" placeholder="회의 메모를 그대로 붙여 넣으세요" style="width:100%;min-height:70px;border:1px solid #c9c9c9;border-radius:5px;padding:10px"></textarea></div>
+  <div class="field" style="margin:0"><label>노션 페이지 링크 (선택)</label><input placeholder="https://www.notion.so/..."></div>
+  <div class="section-label" style="margin-top:14px">최근 반영</div><div class="checkrow"><span class="status ok">반영</span><span>11/7 회의록.txt · 11/7 19:02</span></div><div class="checkrow"><span class="status">읽는 중</span><span>디자인 리뷰 메모 · 몇 분 걸려요</span></div></div>
+ <div class="card-foot"><button class="btn primary full" onclick="doUpload(${n})">반영하기</button><div class="nav-row"><button class="btn text" onclick="quickAsk('팀 현황 알려줘')">← 팀 현황으로</button><button class="btn text" onclick="quickAsk('메뉴')">☰ 메뉴로</button></div></div></div>${note('<b>결정:</b> 팀 현황 근거 옆 [자료 추가]에서 들어옴. 회의록은 노션에 없어도 되게 <b>파일(txt·md·docx·pdf)이나 붙여넣기</b>로 받음. 올린 자료는 SEAM 지식에만 저장하고 노션 원본은 건드리지 않음. Teams에서 봇이 파일을 받으려면 앱 설정(supportsFiles)이 필요.')}`);
+}
+function fakeFile(n){$('upFile'+n).innerHTML=`<div class="file"><span>📄 11-10 주간회의.txt · 4KB</span><button class="btn text" onclick="this.closest('.file').remove()">빼기</button></div>`;}
+function doUpload(n){
+ const has=$('upFile'+n).innerHTML.trim()||$('upText'+n).value.trim();
+ if(!has){toast('파일을 올리거나 내용을 붙여 넣어 주세요.');return;}
+ $('up'+n).querySelector('.card-foot').innerHTML='<div class="success">✓ 받았어요. 읽고 정리하는 중이에요 · 다 되면 알려드릴게요</div>';
+ setTimeout(()=>addBot(`<div class="bubble"><span class="done-title"><span class="done-ico"><svg viewBox="0 0 16 16" width="10" height="10"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>회의록을 반영했어요</span><br><span class="muted small">결정 1건 · 후속 작업 2건 · 아직 정해지지 않은 것 1건을 찾았어요.</span><div class="quick"><button onclick="quickAsk('팀 현황 알려줘')">팀 현황에서 보기</button><button onclick="quickAsk('조율 보기')">조율 보기</button></div></div>`),2500);
+}
+
+/* ── PM Bot 질문 ────────────────────────────────── */
+function showAskPrompt(){
+ addBot(`<div class="bubble">무엇이든 물어보세요. 팀 문서와 GitHub 기록에서 찾아서 근거와 함께 답할게요.</div><div class="quick"><button onclick="quickAsk('지난 회의에서 로그인 방식 정해졌어?')">지난 회의에서 로그인 방식 정해졌어?</button><button onclick="quickAsk('API 인증 모듈 구현됐어? 어디 있어?')">API 인증 모듈 구현됐어?</button><button onclick="quickAsk('메뉴')">☰ 메뉴로</button></div>${note('질문 모드는 [☰ 메뉴로] 또는 다른 메뉴를 고를 때까지 유지. 질문할 때마다 노션 전체를 다시 읽지 않음 (PRD FR-11).')}`);
+}
+function answerQuestion(q){
+ const impl=/구현|어디/.test(q);
+ withLoading('관련 기록을 찾는 중이에요…',1500,()=>`<div class="card"><div class="card-head"><strong>답변</strong><p>${escapeHtml(q)}</p></div>
+ <div class="card-body" style="min-height:0"><p style="margin:0 0 14px;line-height:1.65">${impl?'API 인증 모듈은 <b>진행 중</b>이에요. 이슈 #12가 열려 있고, 관련 코드는 <code>src/auth/</code>에 있어요. 병합된 PR은 아직 없어요.':'<b>아직 정해지지 않았어요.</b> 11/7 회의에서 소셜 로그인과 이메일 가입 두 안이 논의됐지만 합의 기록은 없어요.'}</p>
+ <div class="section-label">근거</div><ul class="src">${impl?'<li><a href="#" onclick="return false">이슈 #12</a> <span class="chip gh">GitHub</span></li><li><a href="#" onclick="return false">src/auth/token.py</a> <span class="chip guess">추정 연결</span></li>':'<li><a href="#" onclick="return false">11/7 회의록 · 3번째 안건</a> <span class="chip draft">논의</span></li><li><a href="#" onclick="return false">요구사항 정리 · 로그인</a> <span class="chip draft">가안</span></li>'}</ul>
+ <p class="muted small" style="margin-top:8px">찾아본 범위: Notion 문서 12개, GitHub 이슈·PR · 보지 못한 것: 디자인 폴더 (연결 안 됨)</p></div>
+ <div class="card-foot"><div class="btn-row"><button class="btn" onclick="toast('다음 회의 안건에 넣었어요')">다음 회의 안건으로</button><button class="btn" onclick="$('messageInput').focus()">이어서 질문</button></div>${navRow()}</div></div>${note('답 · 근거 · 찾아본 범위 · 보지 못한 것을 항상 함께 (PRD FR-09). "기록 없음"은 "없었다"가 아님. <b>대기 · 1~5초</b> (실측 미측정).')}`);
+}
+
+/* ── 설정 > 팀 설정 ─────────────────────────────── */
 function renderTeamSettings(){
- addBot(`<div class="card"><div class="card-head"><strong>팀 설정</strong><p>팀 공통 정보를 확인하고 필요한 항목만 변경합니다.</p></div><div class="card-body">
- <div class="info-grid"><span>팀</span><b>SEAM 파일럿</b><span>GitHub</span><b class="success">연결됨</b><span>Notion</span><b class="success">연결됨</b><span>업무 관리</span><b>Notion 프로젝트 페이지</b></div>
- </div><div class="card-foot"><button class="btn primary full" onclick="toast('팀 설정은 시안에서 조회만 지원합니다.')">확인</button></div></div>`);
+ addBot(`<div class="card"><div class="card-head"><strong>팀 설정</strong><p>팀 공통 연결이에요. 바꾸면 팀원 모두에게 적용돼요.</p></div><div class="card-body" style="min-height:0">
+ <div class="info-grid"><span>팀</span><b>SEAM 파일럿</b><span>Notion</span><b class="success">연결됨 · 팀 정보 페이지</b><span>GitHub</span><b class="success">연결됨</b><span>작업 보드</span><b class="success">연결됨</b></div></div>
+ <div class="card-foot"><div class="btn-row"><button class="btn" onclick="quickAsk('노션 페이지 바꾸기')">노션 페이지 바꾸기</button><button class="btn" onclick="toast('GitHub 저장소·토큰 변경 · 시안 생략')">GitHub 바꾸기</button></div>${navRow()}</div></div>${note('01-setup에서 남긴 "잘못 넣은 노션 페이지를 바꾸는 경로"를 여기 둠.')}`);
 }
-function renderTaskCard(q){
- addBot(`<div class="card"><div class="card-head"><strong>${q.includes('담당자')?'담당자별 업무':'일정 확인 필요 업무'}</strong><p>복수 항목을 비교하기 쉬운 경우에만 구조화된 UI를 제공합니다.</p></div><div class="card-body"><table class="task-table"><thead><tr><th>업무</th><th>담당자</th><th>상태</th></tr></thead><tbody><tr><td>API 인증 모듈</td><td>김민수</td><td><span class="status">확인 필요</span></td></tr><tr><td>로그 분석</td><td>이지원</td><td><span class="status ok">진행 중</span></td></tr><tr><td>화면 통합</td><td>박서연</td><td><span class="status ok">진행 중</span></td></tr></tbody></table></div><div class="card-foot"><button class="btn" onclick="quickAsk('API 인증 모듈 상세 내용 알려줘')">상세 내용 확인</button></div></div>`);
+function renderNotionChange(){
+ const n=++seq;
+ addBot(`<div class="card" id="nc${n}"><div class="card-head"><div class="tag">팀 설정 · Notion</div><strong style="display:block;margin-top:9px">새 노션 페이지를 알려 주세요</strong><p>연결 토큰은 그대로 써요.</p></div>
+ <div class="card-body" style="min-height:0"><div class="field"><label>페이지 링크</label><input id="ncLink${n}" placeholder="https://www.notion.so/team-page"></div></div>
+ <div class="card-foot"><button class="btn primary full" onclick="doNotionChange(${n})">바꾸기</button></div></div>`);
+}
+function doNotionChange(n){
+ if(!$('ncLink'+n).value.trim()){toast('페이지 링크를 입력해 주세요.');return;}
+ $('nc'+n).querySelector('.card-foot').innerHTML='<div class="muted"><span class="spin"></span>페이지에 들어갈 수 있는지 확인하는 중…</div>';
+ setTimeout(()=>{$('nc'+n).querySelector('.card-foot').innerHTML=`<div class="success">✓ 페이지를 바꿨어요 · ‘SEAM 파일럿 팀 정보’</div>`;
+  addBot(`<div class="bubble"><span class="spin"></span>새 페이지를 읽고 있어요. 몇 분 걸려요. 다 되면 알려드릴게요.</div><div class="quick"><button onclick="quickAsk('메뉴')">☰ 메뉴로</button></div>`);},1200);
 }
 
 renderInitial();
