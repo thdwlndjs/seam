@@ -20,3 +20,9 @@ docs/refactor/evidence/**/*.png
 docs/refactor/evidence/**/*.html
 # DB·설정 백업(개인정보·토큰이 들어 있음)
 backups/
+# 실행 DB와 그 백업(개인정보·토큰이 들어 있음)
+src/worklog.sqlite3*
+# 로컬 도구·실행 로그(저장소 밖 프로젝트 포함)
+devtunnel.exe
+logs/
+oracle-free-tier-instance-*
