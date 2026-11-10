@@ -1,9 +1,8 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
   "manifestVersion": "1.17",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "id": "788a6e10-f61a-42f6-900e-37f8834543e0",
-  "packageName": "com.seam.teamsagent",
   "developer": {
     "name": "Seam",
     "websiteUrl": "https://example.com",
@@ -46,10 +45,10 @@
     {
       "entityId": "board",
       "name": "구조 보기·고치기",
-      "contentUrl": "https://your-domain.example.com/tab/board",
+      "contentUrl": "https://seam.axworks.site/tab/board",
       "scopes": ["personal"]
     }
   ],
   "permissions": ["identity", "messageTeamMembers"],
-  "validDomains": ["your-domain.example.com"]
+  "validDomains": ["seam.axworks.site"]
 }
