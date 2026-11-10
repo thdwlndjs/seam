@@ -530,8 +530,11 @@ def _render(result: dict[str, Any], unknowns: list[str], note: str | None, ctx: 
     topic = (asks or agendas or [{"text": f"질문 확인: {ctx['question'][:60]}"}])[0]["text"]
     buttons.append({"title": "👤 담당자에게 확인 요청 안건으로", "data": {"action": "qa_agenda", "mode": "ask", "text": (asks or [{"text": topic}])[0]["text"]}})
     buttons.append({"title": "📅 다음 회의 안건으로", "data": {"action": "qa_agenda", "mode": "meeting", "text": (agendas or [{"text": topic}])[0]["text"]}})
+    issue_items = list(dict.fromkeys(ctx["items"][alias]["item_id"] for alias, item in decision_items.items()
+                                    if item["kind"] in ("decision", "requirement")))
     return {"status": "ok", "text": "\n".join(lines), "calls": len(calls), "usage": [c["usage"] for c in calls], "buttons": buttons,
-            "view_item": first, "links": links, "scope": scope, "result": result, "unknowns": unknown_lines}
+            "view_item": first, "issue_items": issue_items, "links": links, "scope": scope, "result": result,
+            "unknowns": unknown_lines}
 
 
 def _ref_to_id(ref: str, facts: dict[str, dict[str, Any]]) -> str | None:

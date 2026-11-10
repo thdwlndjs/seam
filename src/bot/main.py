@@ -26,7 +26,7 @@ from microsoft_teams.api.models.adaptive_card.adaptive_card_action_response impo
 )
 from microsoft_teams.apps import ActivityContext, App, FastAPIAdapter
 from microsoft_teams.cards import (AdaptiveCard, Choice, ChoiceSetInput, Image, OpenUrlAction, SubmitAction, TextBlock,
-                                   ThemedUrl)
+                                   TextInput, ToggleInput, ThemedUrl)
 
 # ── 설정 ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -139,7 +139,36 @@ def _choice_card(event: dict) -> AdaptiveCard:
         actions=[SubmitAction(title=b["title"][:40], data=b["data"], style="positive") for b in event["buttons"]])
 
 
+def _form_card(event: dict) -> AdaptiveCard:
+    card = event["card"]
+    body = [TextBlock(text=card["heading"], weight="Bolder", size="Large", wrap=True),
+            TextBlock(text=card["text"], wrap=True, spacing="Small")]
+    for field in card["inputs"]:
+        kind = field["type"]
+        if kind == "text":
+            body.append(TextInput(id=field["id"], label=field.get("label"), value=field.get("value", ""),
+                                  is_required=field.get("required", False), max_length=field.get("max_length"),
+                                  is_multiline=field.get("multiline", False), style="Text"))
+        elif kind == "toggle":
+            body.append(ToggleInput(id=field["id"], title=field.get("label") or field.get("title", ""),
+                                    value=field.get("value", "false"), value_on=field.get("value_on", "true"),
+                                    value_off=field.get("value_off", "false")))
+        elif kind == "choice":
+            body.append(ChoiceSetInput(id=field["id"], label=field.get("label"), style="compact",
+                                       is_required=field.get("required", False), value=field.get("value", ""),
+                                       placeholder=field.get("placeholder", "담당자 선택"),
+                                       choices=[Choice(title=c["title"], value=c["value"]) for c in field["choices"]]))
+        else:
+            raise ValueError(f"unsupported card input: {kind}")
+    return AdaptiveCard(body=body,
+                        actions=[SubmitAction(title=b["title"][:40], data=b["data"],
+                                              **({"style": "positive"} if n == 0 else {}))
+                                 for n, b in enumerate(event["buttons"])])
+
+
 def _build_buttons_card(event: dict) -> AdaptiveCard:
+    if event.get("card") and event["card"].get("inputs"):
+        return _form_card(event)
     if event.get("card") and event["card"].get("choices"):
         return _choice_card(event)
     if event.get("card"):

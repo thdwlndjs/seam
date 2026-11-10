@@ -64,12 +64,14 @@ import worklog_bridge  # noqa: E402
 from worklog import apply as wapply  # noqa: E402
 from worklog import coordination as wcoord  # noqa: E402
 from worklog import explore as wexplore  # noqa: E402
+from worklog import github as wgithub  # noqa: E402
 from worklog import leading as wleading  # noqa: E402
 from worklog import lineage as wlineage  # noqa: E402
 from worklog import parts as wparts  # noqa: E402
 from worklog import people  # noqa: E402
 from worklog import qa as wqa  # noqa: E402
 from worklog import runs as wruns  # noqa: E402
+from worklog import search as wsearch  # noqa: E402
 from worklog import stages as wstages  # noqa: E402
 from worklog.db import ConflictError, NotFoundError, ValidationError  # noqa: E402
 from worklog_bridge import usage_of as _usage_of  # noqa: E402
@@ -246,6 +248,7 @@ def _load_team_configs() -> dict:
 def _save_team_configs(data: dict) -> None:
     with open(TEAM_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 
 def _load_member_profiles() -> dict:
@@ -525,6 +528,12 @@ async def _dispatch_value(turn: "Turn", value: dict) -> bool:
         await turn.send("알겠어요, 넘어갈게요.")
     elif action == "take_task" and value.get("item_id"):
         await _handle_take_task(turn, str(value["item_id"]))
+    elif action == "issue_propose" and value.get("item_id"):
+        await _start_issue_proposal(turn, str(value["item_id"]))
+    elif action in ("issue_register", "issue_cancel"):
+        await _handle_issue_proposal_action(turn, action, value)
+    elif action in ("work_share_select", "work_share_publish", "work_share_edit", "work_share_cancel"):
+        await _handle_work_share_action(turn, action, value)
     elif action == "qa_start":
         await _start_qa(turn)
     elif action == "qa_agenda":
@@ -575,6 +584,20 @@ async def _handle_text(turn: "Turn", config: dict | None, raw_text: str, aad_id:
 
     if aad_id in source_add_sessions and config is not None:  # 4번 ⑤ 소스 추가 다음 메시지
         await _handle_source_add(turn, config, raw_text)
+        return
+
+    share_session = github_share_sessions.get(aad_id)
+    if share_session and share_session.get("mode") == "edit":
+        if (share_session["team_key"] != turn.team_key or time.monotonic() - share_session["at"] > QA_SESSION_SECONDS):
+            github_share_sessions.pop(aad_id, None)
+            await turn.send("작업물 공유 세션이 만료됐어요. 4번에서 다시 시작해 주세요.")
+        elif not raw_text.strip() or len(raw_text) > 4000:
+            await turn.send("공유 문장을 1~4000자로 입력해 주세요. 취소하려면 '취소'라고 입력하세요.")
+        else:
+            share_session["summary"] = raw_text.strip()
+            share_session["mode"] = "preview"
+            share_session["at"] = time.monotonic()
+            await _show_work_share_preview(turn, share_session)
         return
 
     if confirm_flow.has_upload_session(aad_id):  # 4번 ④ 회의록 올리기 다음 메시지
@@ -641,6 +664,10 @@ def _cancel_pending_sessions(aad_id: str) -> bool:
     if member_flow.sessions.pop(aad_id, None) is not None:
         cancelled = True
     if source_add_sessions.pop(aad_id, None) is not None:
+        cancelled = True
+    if github_issue_sessions.pop(aad_id, None) is not None:
+        cancelled = True
+    if github_share_sessions.pop(aad_id, None) is not None:
         cancelled = True
     if qa_sessions.pop(aad_id, None) is not None:
         cancelled = True
@@ -791,7 +818,11 @@ async def _run_menu(turn: Turn, raw_text: str) -> None:
             return
         elif raw_text == "4-1":
             turn.status("🔍 완료된 작업을 확인하는 중...")
-            reply_text = await share_completed_work(config, github_id)
+            reply_text = await share_completed_work(config, github_id, turn.team_key, turn.user_name or turn.aad_id)
+        elif raw_text == "4-2":
+            turn.status("🔍 최근 GitHub 작업물을 가져오는 중...")
+            await _show_work_share_list(turn, config)
+            return
         else:
             reply_text = "올바른 값을 입력하세요. (1~4, 연결 설정 변경은 '설정')"
     except Exception as exc:
@@ -978,6 +1009,15 @@ async def _github_patch(repo: str, path: str, token: str, json_body: dict) -> di
     url = f"https://api.github.com/repos/{repo}{path}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     resp = await _get_github_http_client().patch(url, headers=headers, json=json_body)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _github_post(repo: str, path: str, token: str, json_body: dict) -> dict:
+    """Create a repository resource after the user has confirmed its content."""
+    url = f"https://api.github.com/repos/{repo}{path}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    resp = await _get_github_http_client().post(url, headers=headers, json=json_body)
     resp.raise_for_status()
     return resp.json()
 
@@ -1299,6 +1339,9 @@ QA_SESSION_SECONDS = 600
 qa_sessions: dict[str, dict] = {}
 # aad_id → 다음 채팅으로 사람이 결정 문장을 직접 입력할 대상
 coord_sessions: dict[str, dict] = {}
+# Phase 7 승인 카드. 실제 GitHub 쓰기 전까지 제안은 세션 메모리에만 보관한다.
+github_issue_sessions: dict[str, dict] = {}
+github_share_sessions: dict[str, dict] = {}
 _QA_INTRO = ("💬 무엇이 궁금한가요? 저장된 회의·문서 지식으로 찾아 답해요. 구현·작업 상태를 물으면 GitHub 이슈·PR도 같이 봐요.\n"
              "(10분 동안 이어서 물어볼 수 있어요. 끝내려면 '취소')")
 
@@ -1327,6 +1370,56 @@ async def _github_prs(repo: str, token: str) -> list[dict]:
     data = await _github_get_cached(repo, "/pulls", token, {"state": "all", "per_page": 30})
     return [{"number": pr["number"], "title": pr.get("title"), "body": (pr.get("body") or "")[:600], "state": pr.get("state"),
              "merged_at": pr.get("merged_at")} for pr in data]
+
+
+async def _github_commits(repo: str, token: str, limit: int = 10) -> list[dict]:
+    commits = await _github_get_cached(repo, "/commits", token, {"per_page": limit})
+    out = []
+    for commit in commits[:limit]:
+        sha = str(commit.get("sha") or "")
+        message = str((commit.get("commit") or {}).get("message") or "")
+        if not sha or not message.strip():
+            continue
+        out.append({"sha": sha, "title": message.splitlines()[0][:160], "message": message[:600],
+                    "url": commit.get("html_url") or f"https://github.com/{repo}/commit/{sha}"})
+    return out
+
+
+async def _show_work_share_list(turn: Turn, config: dict) -> None:
+    """Read recent pull requests and commits when the user opens the work-share menu; no LLM call."""
+    repo, token = config.get("github_repo"), config.get("github_token")
+    if not repo or not token:
+        await turn.send("GitHub 저장소 연결이 없어 작업물 목록을 가져오지 못했어요.")
+        return
+    pulls_result, commits_result = await asyncio.gather(
+        _github_prs(repo, token), _github_commits(repo, token, 10), return_exceptions=True)
+    if isinstance(pulls_result, Exception) and isinstance(commits_result, Exception):
+        statuses = [getattr(getattr(e, "response", None), "status_code", None) for e in (pulls_result, commits_result)]
+        status = next((s for s in statuses if s), None)
+        await turn.send(f"GitHub 작업물 목록을 가져오지 못했어요{f' (HTTP {status})' if status else ''}. 4번 ④ 자료 올리기를 이용할 수 있어요.")
+        return
+    pulls = [] if isinstance(pulls_result, Exception) else pulls_result[:10]
+    commits = [] if isinstance(commits_result, Exception) else commits_result[:10]
+    entries: dict[str, dict] = {}
+    buttons = []
+    session_id = secrets.token_urlsafe(12)
+    for pull in pulls:
+        key = f"pr:{pull['number']}"
+        entries[key] = {"type": "pr", **pull}
+        buttons.append({"title": f"PR #{pull['number']} {pull['title'] or ''}"[:40],
+                        "data": {"action": "work_share_select", "session_id": session_id, "item_key": key}})
+    for commit in commits:
+        key = f"commit:{commit['sha']}"
+        entries[key] = {"type": "commit", **commit}
+        buttons.append({"title": f"커밋 {commit['sha'][:7]} {commit['title']}"[:40],
+                        "data": {"action": "work_share_select", "session_id": session_id, "item_key": key}})
+    if not entries:
+        await turn.send("최근 PR이나 커밋이 없어요. 필요하면 4번 ④에서 자료를 올려 주세요.")
+        return
+    github_share_sessions[turn.aad_id] = {"session_id": session_id, "team_key": turn.team_key,
+                                           "user_id": turn.aad_id, "repo": repo, "entries": entries,
+                                           "mode": "select", "at": time.monotonic()}
+    await turn.send_buttons("공유할 PR 또는 커밋을 골라 주세요. 아직 Teams나 지식에 공유되지 않았어요.", buttons)
 
 
 async def _github_pr_files(repo: str, token: str, number: int) -> list[str]:
@@ -1401,8 +1494,272 @@ async def _handle_qa(turn: Turn, config: dict, question: str) -> None:
     if outcome["buttons"]:
         view = f"item:{outcome['view_item']}" if outcome["view_item"] else ""
         await turn.send_buttons("다음에 할 수 있는 것", [*outcome["buttons"], _board_button(turn, view)])
+    if outcome.get("issue_items") and _is_approver(turn, config):
+        issue_buttons = [{"title": "➕ 이슈 제안: " + str(item_id)[:20],
+                          "data": {"action": "issue_propose", "item_id": item_id}}
+                         for item_id in outcome["issue_items"][:3]]
+        await turn.send_buttons("인용된 결정·요구사항에서 이슈 초안을 만들 수 있어요. 초안을 검토한 뒤에만 등록됩니다.",
+                                issue_buttons)
     if outcome.get("coordination"):
         await _coordination_buttons(turn, outcome["coordination"])
+
+
+def _issue_review_card(session: dict) -> dict:
+    inputs = []
+    assignees = [{"title": "담당 미정", "value": ""},
+                 *[{"title": f"{name} ({login})", "value": login}
+                   for login, name in session["assignees"].items()]]
+    for index, issue in enumerate(session["issues"]):
+        prefix = f"issue_{index}_"
+        inputs.extend([
+            {"type": "toggle", "id": prefix + "include", "label": f"이 이슈 포함 ({index + 1})",
+             "value": "true", "title": "등록", "value_on": "true", "value_off": "false"},
+            {"type": "text", "id": prefix + "title", "label": f"{index + 1}. 제목", "value": issue["title"],
+             "required": True, "max_length": 160},
+            {"type": "text", "id": prefix + "body", "label": "본문", "value": issue["body"],
+             "multiline": True, "required": True, "max_length": 6000},
+            {"type": "text", "id": prefix + "criteria", "label": "완료 기준 (한 줄에 하나)",
+             "value": "\n".join(issue["acceptance_criteria"]), "multiline": True,
+             "required": True, "max_length": 3000},
+            {"type": "choice", "id": prefix + "assignee", "label": "담당자 후보",
+             "value": issue.get("assignee") or "", "choices": assignees},
+        ])
+    return {"heading": "GitHub 이슈 초안 검토", "text": "수정하거나 제외한 뒤 [등록]을 누르면 선택한 이슈만 GitHub에 생성돼요.",
+            "inputs": inputs}
+
+
+async def _start_issue_proposal(turn: Turn, item_id: str) -> None:
+    config = _get_config(turn.team_key)
+    if not config or not config.get("github_repo") or not config.get("github_token"):
+        await turn.send("GitHub 저장소 연결이 없어요. 설정을 확인해 주세요.")
+        return
+    if not _is_approver(turn, config):
+        await turn.send("이슈 제안과 등록은 권한자만 할 수 있어요.")
+        return
+    try:
+        source = await asyncio.to_thread(wgithub.issue_source, worklog_bridge.WORKLOG_STORE, turn.team_key, item_id)
+        members = await asyncio.to_thread(people.team, worklog_bridge.WORKLOG_STORE, turn.team_key)
+        assignees = {m["github_login"]: (m.get("display_name") or m["github_login"])
+                     for m in members if m.get("github_login")}
+        payload = {"saved_item": source, "related_tasks": source.get("related_tasks", []),
+                   "team_members": [{"github_login": login, "display_name": name}
+                                    for login, name in assignees.items()]}
+        raw, usage, model = await asyncio.to_thread(worklog_bridge.lead_call, "issue-breakdown", payload)
+        issues = wgithub.validate_issue_proposals(raw, assignees)
+    except (ValidationError, NotFoundError, wgithub.ContractError) as error:
+        await turn.send(f"이슈 초안을 만들지 못했어요: {error}")
+        return
+    except Exception as error:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        reason = f"GitHub HTTP {status}" if status else type(error).__name__
+        await turn.send(f"이슈 초안을 만들지 못했어요. {reason}")
+        return
+    session = {"session_id": secrets.token_urlsafe(12), "team_key": turn.team_key, "user_id": turn.aad_id,
+               "source_item_id": item_id, "repo": config["github_repo"], "issues": issues,
+               "assignees": assignees, "mode": "preview", "at": time.monotonic(), "usage": usage, "model": model}
+    github_issue_sessions[turn.aad_id] = session
+    buttons = [{"title": "등록", "data": {"action": "issue_register", "session_id": session["session_id"]}},
+               {"title": "취소", "data": {"action": "issue_cancel", "session_id": session["session_id"]}}]
+    await turn.send_buttons("GitHub 이슈 제안을 확인해 주세요.", buttons, card=_issue_review_card(session))
+
+
+def _submitted_issue(session: dict, index: int, value: dict) -> dict | None:
+    prefix = f"issue_{index}_"
+    include = value.get(prefix + "include", "true")
+    if include is False or str(include).lower() in ("false", "0", "off"):
+        return None
+    title = str(value.get(prefix + "title") or "").strip()
+    body = str(value.get(prefix + "body") or "").strip()
+    criteria_text = str(value.get(prefix + "criteria") or "")
+    criteria = [line.strip().removeprefix("- ").strip() for line in criteria_text.splitlines() if line.strip()]
+    assignee = str(value.get(prefix + "assignee") or "") or None
+    if not title or len(title) > wgithub.MAX_TITLE or not body or len(body) > wgithub.MAX_BODY:
+        raise ValidationError(f"{index + 1}번 이슈의 제목·본문 길이를 확인해 주세요")
+    if not criteria or len(criteria) > wgithub.MAX_CRITERIA or any(len(line) > wgithub.MAX_CRITERION for line in criteria):
+        raise ValidationError(f"{index + 1}번 이슈의 완료 기준은 1~8개, 각 500자 이하여야 해요")
+    if assignee and assignee not in session["assignees"]:
+        raise ValidationError(f"{index + 1}번 이슈 담당자가 등록된 후보가 아니에요")
+    return {"title": title, "body": body, "acceptance_criteria": criteria, "assignee": assignee,
+            "assignee_name": session["assignees"].get(assignee) if assignee else None}
+
+
+async def _handle_issue_proposal_action(turn: Turn, action: str, value: dict) -> None:
+    session = github_issue_sessions.get(turn.aad_id)
+    if (session is None or session["team_key"] != turn.team_key or session["user_id"] != turn.aad_id
+            or session["session_id"] != value.get("session_id")
+            or time.monotonic() - session["at"] > QA_SESSION_SECONDS):
+        github_issue_sessions.pop(turn.aad_id, None)
+        await turn.send("이슈 제안 세션이 만료됐어요. 질문에서 다시 시작해 주세요.")
+        return
+    if action == "issue_cancel":
+        github_issue_sessions.pop(turn.aad_id, None)
+        await turn.send("이슈 등록을 취소했어요. 아무것도 만들지 않았어요.")
+        return
+    config = _get_config(turn.team_key)
+    if not config or config.get("github_repo") != session["repo"] or not _is_approver(turn, config):
+        await turn.send("저장소 설정이 바뀌었거나 등록 권한이 없어요. 이슈를 만들지 않았어요.")
+        return
+    if session.get("mode") == "posting":
+        await turn.send("이슈 등록을 이미 처리하고 있어요.")
+        return
+    try:
+        selected = [issue for index in range(len(session["issues"]))
+                    if (issue := _submitted_issue(session, index, value)) is not None]
+    except ValidationError as error:
+        await turn.send(str(error))
+        return
+    if not selected:
+        github_issue_sessions.pop(turn.aad_id, None)
+        await turn.send("선택한 이슈가 없어 등록하지 않았어요.")
+        return
+    session["mode"] = "posting"  # 중복 제출에 의한 중복 Issue 생성 방지
+    created, failed = [], []
+    for issue in selected:
+        body = issue["body"].rstrip() + "\n\n완료 기준:\n" + "\n".join(f"- {line}" for line in issue["acceptance_criteria"])
+        payload = {"title": issue["title"], "body": body}
+        if issue.get("assignee"):
+            payload["assignees"] = [issue["assignee"]]
+        try:
+            result = await _github_post(session["repo"], "/issues", config["github_token"], payload)
+        except Exception as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            failed.append(f"'{issue['title']}': GitHub HTTP {status}" if status else f"'{issue['title']}': {type(error).__name__}")
+            continue
+        try:
+            item_id = await asyncio.to_thread(wgithub.record_created_task, worklog_bridge.WORKLOG_STORE,
+                                              turn.team_key, issue, {"number": result.get("number"),
+                                              "url": result.get("html_url")}, turn.user_name or turn.aad_id,
+                                              session["source_item_id"])
+            created.append({"title": issue["title"], "number": result["number"],
+                            "url": result["html_url"], "item_id": item_id})
+        except Exception as error:
+            created.append({"title": issue["title"], "number": result.get("number"),
+                            "url": result.get("html_url"), "item_id": None})
+            failed.append(f"'{issue['title']}': GitHub에는 생성됐지만 저장된 할 일 연결 실패 ({type(error).__name__})")
+    github_issue_sessions.pop(turn.aad_id, None)
+    lines = [f"GitHub 이슈 등록 결과: {len(created)}건 생성, {len(failed)}건 실패"]
+    lines.extend(f"- #{entry['number']} {entry['title']}: {entry['url']}" for entry in created)
+    lines.extend(f"- 실패: {message}" for message in failed)
+    if created:
+        lines.append("GitHub 생성이 확인된 이슈만 저장된 할 일과 명시 연결했어요. 상태 동기화는 검증 완료를 뜻하지 않아요.")
+    await turn.send_buttons("\n".join(lines), [], emphasis=True)
+
+
+async def _show_work_share_preview(turn: Turn, session: dict) -> None:
+    text = (f"{session['title']}\n\n{session['summary']}\n\n"
+            f"출처: {session['url']}\n검증 여부: 확인하지 않았어요.")
+    session["preview_text"] = text
+    buttons = [
+        {"title": "공유", "data": {"action": "work_share_publish", "session_id": session["session_id"]}},
+        {"title": "고치기", "data": {"action": "work_share_edit", "session_id": session["session_id"]}},
+        {"title": "취소", "data": {"action": "work_share_cancel", "session_id": session["session_id"]}},
+    ]
+    await turn.send_buttons("공유할 내용을 확인해 주세요.", buttons)
+    await turn.send(text)
+
+
+async def _prepare_work_share(turn: Turn, config: dict, session: dict, selected: dict) -> None:
+    repo, token = session["repo"], config["github_token"]
+    source_type = selected["type"]
+    if source_type == "pr":
+        number = int(selected["number"])
+        detail = await _github_get_cached(repo, f"/pulls/{number}", token)
+        files = await _github_pr_files(repo, token, number)
+        title = str(detail.get("title") or selected.get("title") or f"PR #{number}")
+        description = str(detail.get("body") or "")[:2000]
+        linked_text = f"{title}\n{description}"
+        url = f"https://github.com/{repo}/pull/{number}"
+    elif source_type == "commit":
+        sha = str(selected["sha"])
+        detail = await _github_get_cached(repo, f"/commits/{sha}", token)
+        message = str((detail.get("commit") or {}).get("message") or selected.get("message") or "")
+        title = message.splitlines()[0][:160] if message else selected["title"]
+        description = message[:2000]
+        files = [str(f.get("filename") or "") for f in detail.get("files") or [] if f.get("filename")][:8]
+        linked_text = f"{title}\n{description}"
+        url = f"https://github.com/{repo}/commit/{sha}"
+    else:
+        raise ValidationError("알 수 없는 GitHub 작업물 종류예요")
+    issue_numbers = sorted({int(match.group(1)) for match in _ISSUE_REF_RE.finditer(linked_text)})[:5]
+    linked_issues = []
+    for number in issue_numbers:
+        try:
+            issue = await _github_get_cached(repo, f"/issues/{number}", token)
+            linked_issues.append({"number": number, "title": issue.get("title"), "body": (issue.get("body") or "")[:600],
+                                  "state": issue.get("state"), "url": f"https://github.com/{repo}/issues/{number}"})
+        except Exception as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            linked_issues.append({"number": number, "lookup": f"HTTP {status}" if status else "unavailable"})
+    context_query = " ".join([title, description, *files, *(f"#{n}" for n in issue_numbers)])
+    knowledge = await asyncio.to_thread(wgithub.share_context, worklog_bridge.WORKLOG_STORE,
+                                        turn.team_key, context_query, 6)
+    payload = {"selected_work": {"type": source_type, "title": title, "description": description,
+                                 "changed_files": files[:8], "linked_issues": linked_issues},
+               "related_saved_knowledge": knowledge}
+    raw, usage, model = await asyncio.to_thread(worklog_bridge.lead_call, "work-share", payload)
+    draft = wgithub.validate_work_share(raw)
+    session.update({"mode": "preview", "source_type": source_type, "title": draft["title"],
+                    "summary": draft["summary"], "url": url, "usage": usage, "model": model,
+                    "at": time.monotonic()})
+
+
+async def _handle_work_share_action(turn: Turn, action: str, value: dict) -> None:
+    session = github_share_sessions.get(turn.aad_id)
+    if (session is None or session["team_key"] != turn.team_key or session["user_id"] != turn.aad_id
+            or session["session_id"] != value.get("session_id")
+            or time.monotonic() - session["at"] > QA_SESSION_SECONDS):
+        github_share_sessions.pop(turn.aad_id, None)
+        await turn.send("작업물 공유 세션이 만료됐어요. 4번에서 다시 시작해 주세요.")
+        return
+    config = _get_config(turn.team_key)
+    if not config or config.get("github_repo") != session["repo"] or not config.get("github_token"):
+        github_share_sessions.pop(turn.aad_id, None)
+        await turn.send("GitHub 저장소 설정이 바뀌었어요. 공유하지 않았습니다.")
+        return
+    if action == "work_share_cancel":
+        github_share_sessions.pop(turn.aad_id, None)
+        await turn.send("작업물 공유를 취소했어요. 지식이나 메시지를 남기지 않았어요.")
+        return
+    if action == "work_share_select":
+        if session.get("mode") != "select":
+            await turn.send("작업물 선택 단계가 아니에요. 4번에서 다시 시작해 주세요.")
+            return
+        selected = session["entries"].get(str(value.get("item_key") or ""))
+        if not selected:
+            await turn.send("목록에 없는 작업물이에요. 4번에서 다시 시작해 주세요.")
+            return
+        session["mode"] = "preparing"
+        turn.status("🧾 선택한 작업물과 저장된 맥락을 정리하는 중...")
+        try:
+            await _prepare_work_share(turn, config, session, selected)
+        except Exception as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            github_share_sessions.pop(turn.aad_id, None)
+            await turn.send(f"공유 미리보기를 만들지 못했어요. {f'GitHub HTTP {status}' if status else type(error).__name__}")
+            return
+        await _show_work_share_preview(turn, session)
+        return
+    if action == "work_share_edit":
+        if session.get("mode") != "preview":
+            await turn.send("수정할 미리보기가 없어요.")
+            return
+        session["mode"] = "edit"
+        session["at"] = time.monotonic()
+        await turn.send("공유 문장을 새로 입력해 주세요(최대 4000자). 다시 취소하려면 '취소'라고 입력하세요.")
+        return
+    if action == "work_share_publish":
+        if session.get("mode") != "preview":
+            await turn.send("공유할 미리보기가 없어요.")
+            return
+        try:
+            await asyncio.to_thread(wgithub.record_shared_artifact, worklog_bridge.WORKLOG_STORE, turn.team_key,
+                                     session["title"], session["summary"], session["url"], session["source_type"],
+                                     turn.user_name or turn.aad_id)
+        except Exception as error:
+            await turn.send(f"작업물 지식 기록에 실패해 공유하지 않았어요: {type(error).__name__}")
+            return
+        github_share_sessions.pop(turn.aad_id, None)
+        await turn.send(session["preview_text"])
 
 
 async def _coordination_buttons(turn: Turn, proposal: dict) -> None:
@@ -1676,6 +2033,11 @@ async def fetch_team_status(config: dict, team_key: str,
         return await _github_get_cached(repo, "/issues", github_token, {"state": "all", "per_page": 30})
 
     notes, issues = await asyncio.gather(_stored_notes(config, team_key, on_stage), _fetch_issues())
+    completed_items = await asyncio.to_thread(wgithub.completed_tasks, worklog_bridge.WORKLOG_STORE, team_key)
+    completed_lines = (["", "✅ GitHub 완료 (동작 검증은 확인하지 않음)"]
+                       + [f"- {item['assignee'] + ': ' if item.get('assignee') else ''}{item['title']} "
+                          f"({', '.join('#' + str(n) for n in item['numbers'])})" for item in completed_items]
+                       if completed_items else [])
     note_lines = [text.strip() for text in notes["texts"] if text.strip()]
     footer = _note_footer(notes)
     issue_state_by_number: dict[int, str] = {i["number"]: i["state"] for i in issues if "pull_request" not in i}
@@ -1695,7 +2057,7 @@ async def fetch_team_status(config: dict, team_key: str,
                 by_assignee.setdefault(a["login"], []).append(f"{i['title']} [{i['state']}]")
         lines = [f"{name}: {', '.join(tasks)}" for name, tasks in by_assignee.items()]
         result = ["👥 팀 진행상황", "\n".join(lines) if lines else "(회의록도 없고 등록된 이슈도 없어요)"]
-        return "\n".join(result + unassigned_hint + footer), unassigned_open
+        return "\n".join(result + completed_lines + unassigned_hint + footer), unassigned_open
 
     # 회의 메모는 사람이 확인해 worklog에 반영된 항목만 보인다(docs/v1.1/spec.md P1-9). 메뉴를 누를 때 LLM을 부르지 않는다.
     stored = await asyncio.to_thread(_stored_items, team_key)
@@ -1710,7 +2072,7 @@ async def fetch_team_status(config: dict, team_key: str,
     if not shown_any and not stored["board"]["candidate"]:
         header = "👥 팀 진행상황 (아직 확인된 회의록이 없어요, 원문)"
         text = header + "\n" + "\n".join(f"- {_brief(t)}" for t in note_lines[-10:])
-        return "\n".join([text] + unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer), unassigned_open
+        return "\n".join([text] + completed_lines + unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer), unassigned_open
 
     commit_touched = await _get_commit_touched_issues(repo, github_token)
     tasks = _classify_tasks_by_github_state(confirmed, issue_state_by_number, commit_touched)
@@ -1724,7 +2086,8 @@ async def fetch_team_status(config: dict, team_key: str,
             stage_line = (f"확정 {wstages.label(board_['stage'])}" if board_["approved"]
                           else f"AI 추정 {wstages.label(board_['candidate'])} (확정 전)")
             head += ["", f"🧭 현재 단계(참고): {stage_line}"]
-        return chr(10).join(head + ["", briefing] + unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer), unassigned_open
+        return chr(10).join(head + ["", briefing] + completed_lines + unassigned_hint
+                             + ([""] + pending_hint if pending_hint else []) + footer), unassigned_open
 
     # 6개 분류(spec P2-7): 현재 단계 / 확정된 흐름 / 지금 진행 중 / 이전 단계에서 남은 것 / 추가 논의 필요 / 천천히 정해도 되는 것
     board = stored["board"]
@@ -1747,6 +2110,7 @@ async def fetch_team_status(config: dict, team_key: str,
         result += ["", "🐢 천천히 정해도 되는 것", *[f"- {t}" for t in undecided[:10]]]
     if stored["feedback"]:
         result += ["", "💬 멘토링 피드백", *[f"- {t}" for t in stored["feedback"]]]
+    result += completed_lines
     result += unassigned_hint + ([""] + pending_hint if pending_hint else []) + footer
 
     return "\n".join(result), unassigned_open
@@ -1967,11 +2331,16 @@ async def fetch_my_role(github_id: str | None, display_name: str | None, config:
     names = {n for n in [display_name, *(aliases or [])] if n}
     live = await asyncio.to_thread(wapply.live_items, worklog_bridge.WORKLOG_STORE, team_key)
     mine = [t for t in live.get("task", []) if t.get("assignee") in names]
+    completed = await asyncio.to_thread(wgithub.completed_tasks, worklog_bridge.WORKLOG_STORE, team_key)
+    my_completed = [t for t in completed if t.get("assignee") in names]
     result = ["👤 내 역할", "📌 GitHub 담당 이슈", *github_lines]
     if mine:
         result += ["📝 회의록에서 맡은 일", *[f"- {t['title']}" + (f" (~{t['due']})" if t.get("due") else "") for t in mine]]
     if meeting_lines:
         result += ["📝 회의록 언급", *meeting_lines]
+    if my_completed:
+        result += ["✅ GitHub 완료 (동작 검증은 확인하지 않음)",
+                   *[f"- {t['title']} ({', '.join('#' + str(n) for n in t['numbers'])})" for t in my_completed]]
     return "\n".join(result + _note_footer(notes))
 
 
@@ -2059,7 +2428,8 @@ async def _set_project_item_status(project_id: str, field_id: str, option_id: st
     )
 
 
-async def share_completed_work(config: dict, github_id: str) -> str:
+async def share_completed_work(config: dict, github_id: str, team_key: str | None = None,
+                               actor: str = "GitHub 완료 동기화") -> str:
     repo = config["github_repo"]
     owner, repo_name = repo.split("/", 1)
     project_number = config["github_project_number"]
@@ -2107,6 +2477,15 @@ async def share_completed_work(config: dict, github_id: str) -> str:
         updated.append(f"#{number}")
 
     lines = ["✅ 완료된 작업으로 반영됨", ", ".join(updated) if updated else "(변경된 항목 없음)"]
+    completed_numbers = {int(number.removeprefix("#")) for number in updated}
+    if completed_numbers and team_key:
+        try:
+            synchronized = await asyncio.to_thread(wgithub.complete_linked_tasks, worklog_bridge.WORKLOG_STORE,
+                                                   team_key, completed_numbers, config["github_repo"], actor)
+            if synchronized:
+                lines.append(f"저장된 할 일 {len(synchronized)}건을 GitHub 완료로 동기화했어요. 동작 검증을 뜻하지 않아요.")
+        except Exception as error:
+            lines.append(f"Project 완료는 반영됐지만 저장된 할 일 동기화에 실패했어요 ({type(error).__name__}).")
     if skipped:
         lines.append(f"⏭️ Project에 없어서 건너뜀: {', '.join(skipped)}")
     return "\n".join(lines)

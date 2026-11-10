@@ -89,6 +89,11 @@ class QuestionTests(Base):
         self.assertEqual(result["scope"], qa.scope_lines(self.ctx, self.github))
         self.assertTrue(result["links"][0]["url"].startswith("https://www.notion.so/"))
 
+    def test_issue_proposal_targets_only_cited_decisions_and_requirements(self):
+        result, _ = self.run_answer(answer(findings=[
+            {"claim": "이메일 방식을 합의했어요", "evidence_ids": [self.alias], "location": "문서", "link_basis": "explicit"}]))
+        self.assertEqual(result["issue_items"], [self.item])
+
     def test_need_allows_known_quote_only_and_stops_after_second_call(self):
         first = answer(need=[{"type": "item_source", "id": self.alias}, {"type": "item_source", "id": "k999"}])
         second = answer(intent="coordination", need=[{"type": "unknown", "id": "ignored"}] * 6)

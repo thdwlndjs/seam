@@ -56,6 +56,7 @@ def _day(iso: str | None) -> str:
 
 SUBMENU = [
     {"title": "✅ 완료한 작업 공유", "data": {"action": "menu", "choice": "4-1"}},
+    {"title": "🧾 작업물 공유하기", "data": {"action": "menu", "choice": "4-2"}},
     {"title": "📝 Notion 변경 반영", "data": {"action": "apply_list"}},
     {"title": "↩️ 최근 반영 내역", "data": {"action": "applied_list"}},
     {"title": "📤 회의록 올리기", "data": {"action": "upload_notes"}},

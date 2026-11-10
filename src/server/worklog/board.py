@@ -86,15 +86,32 @@ def _quotes(c: Any, item_id: str) -> list[str]:
 
 
 def _human_sources(c: Any, item_id: str) -> list[dict[str, Any]]:
-    """사람이 조율에서 직접 남긴 문장도 읽을 수 있는 출처로 조립한다."""
-    rows = c.execute("""SELECT DISTINCT s.id, s.captured_at FROM object_evidence oe
+    """사람이 직접 입력한 근거와 GitHub 산출물 출처를 항목에 조립한다."""
+    rows = c.execute("""SELECT DISTINCT s.id, s.captured_at, s.kind, s.locator, s.metadata_json, s.accessible_excerpt
+                        FROM object_evidence oe
                         JOIN evidence e ON e.id = oe.evidence_id JOIN sources s ON s.id = e.source_id
-                        WHERE oe.object_type = 'work_item' AND oe.object_id = ? AND e.section_locator = 'human_input'""",
+                        WHERE oe.object_type = 'work_item' AND oe.object_id = ?
+                        AND e.section_locator IN ('human_input', 'github_artifact')""",
                      (item_id,)).fetchall()
-    return [{"part_id": f"human:{r['id']}", "page_id": None, "origin": "human",
-             "path": "사람이 직접 기록", "page_path": "사람이 직접 기록", "title": "사람이 직접 기록",
-             "part_kind": "human", "date": (r["captured_at"] or "")[:10] or None,
-             "url": None, "section_url": None, "section": None} for r in rows]
+    out = []
+    for row in rows:
+        if row["kind"] == "github":
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            title = metadata.get("title") or row["accessible_excerpt"] or "GitHub 작업물"
+            url = metadata.get("url") or row["locator"]
+            out.append({"part_id": f"github:{row['id']}", "page_id": None, "origin": "github",
+                        "path": title, "page_path": title, "title": title, "part_kind": "github",
+                        "date": (row["captured_at"] or "")[:10] or None,
+                        "url": url, "section_url": url, "section": metadata.get("github_type")})
+        else:
+            out.append({"part_id": f"human:{row['id']}", "page_id": None, "origin": "human",
+                        "path": "사람이 직접 기록", "page_path": "사람이 직접 기록", "title": "사람이 직접 기록",
+                        "part_kind": "human", "date": (row["captured_at"] or "")[:10] or None,
+                        "url": None, "section_url": None, "section": None})
+    return out
 
 
 def _history(c: Any, item_id: str) -> list[dict[str, Any]]:
